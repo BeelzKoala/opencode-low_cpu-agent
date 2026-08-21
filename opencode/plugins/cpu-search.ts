@@ -3,8 +3,15 @@ import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 
 const MAX_QUERIES = 4
-const SCAN_CAP_PER_QUERY = 100
+const DISCOVERY_CAP_PER_QUERY = 1000
 const CONTEXT_RADIUS = 2
+
+const QUERY_CACHE_MAX_ENTRIES_PER_TURN = 16
+const QUERY_CACHE_MAX_MATCHES_PER_TURN = 4000
+
+const INDEX_BODY_BUDGET_BYTES = 1400
+const INDEX_MAX_FILES_PER_QUERY = 5
+const INDEX_MAX_STRUCTURAL_GROUPS = 6
 
 const MAX_OUTPUT_BYTES = 6500
 const BODY_BUDGET_BYTES = 5000
@@ -20,7 +27,7 @@ const HYBRID_MIN_SAVINGS_RATIO = 0.75
 const HYBRID_CONTEXT_RADIUS = 1
 const HYBRID_CONTEXT_SAMPLES_PER_GROUP = 3
 
-const SEARCH_PROTOCOL = "search-v2.5.0-global"
+const SEARCH_PROTOCOL = "search-v2.6.0-global"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -128,6 +135,8 @@ function getSessionState(sessionID) {
       executedSearches: 0,
       evidenceBytes: 0,
       signatures: new Set(),
+      queryCache: new Map(),
+      queryCacheMatches: 0,
       seenUsageMessages: new Set(),
       lastSeen: now,
     }
@@ -147,6 +156,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.executedSearches = 0
   state.evidenceBytes = 0
   state.signatures.clear()
+  state.queryCache.clear()
+  state.queryCacheMatches = 0
   state.seenUsageMessages.clear()
   state.lastSeen = nowMs()
 }
@@ -203,6 +214,63 @@ function searchSignature(queries, target, glob) {
     path: target,
     glob: glob ?? null,
   })
+}
+
+function queryCacheKey(root, query, target, glob) {
+  return JSON.stringify({
+    root,
+    query,
+    path: target,
+    glob: glob ?? null,
+  })
+}
+
+function reindexQueryResult(result, queryIndex, reused = false) {
+  return {
+    ...result,
+    queryIndex,
+    reused,
+    matches: Array.isArray(result?.matches)
+      ? result.matches.map((match) => ({
+          ...match,
+          queryIndex,
+          exactSpans: Array.isArray(match?.exactSpans)
+            ? match.exactSpans.map((span) => ({
+                ...span,
+                queryIndex,
+              }))
+            : [],
+        }))
+      : [],
+  }
+}
+
+function cacheableQueryResult(result) {
+  return (
+    result &&
+    !result.timedOut &&
+    !result.error &&
+    (result.scanComplete || result.scanCapped) &&
+    Array.isArray(result.matches)
+  )
+}
+
+function rememberQueryResult(state, key, result) {
+  if (!state || !cacheableQueryResult(result)) return false
+  if (state.queryCache.has(key)) return true
+  if (state.queryCache.size >= QUERY_CACHE_MAX_ENTRIES_PER_TURN) return false
+
+  const matchCount = result.matches.length
+  if (
+    state.queryCacheMatches + matchCount >
+    QUERY_CACHE_MAX_MATCHES_PER_TURN
+  ) {
+    return false
+  }
+
+  state.queryCache.set(key, reindexQueryResult(result, 0, false))
+  state.queryCacheMatches += matchCount
+  return true
 }
 
 async function safeTarget(root, raw = ".") {
@@ -321,8 +389,8 @@ function runQuery(root, query, queryIndex, target, glob) {
       const lineNo = event.data?.line_number
       if (typeof file !== "string" || !Number.isInteger(lineNo)) return
 
-      // Exactly 100 hits are complete; the 101st proves truncation.
-      if (matches.length >= SCAN_CAP_PER_QUERY) {
+      // Exactly DISCOVERY_CAP_PER_QUERY hits are complete; the next hit proves truncation.
+      if (matches.length >= DISCOVERY_CAP_PER_QUERY) {
         scanCapped = true
         child.kill("SIGTERM")
         return
@@ -1017,7 +1085,7 @@ async function renderEvidence(root, hits, bodyBudgetBytes) {
 function querySummaryFor(results) {
   return results.map((result) => {
     let count = String(result.matches.length)
-    if (result.scanCapped) count = `>=${SCAN_CAP_PER_QUERY}`
+    if (result.scanCapped) count = `>=${DISCOVERY_CAP_PER_QUERY}`
 
     let state = "complete"
     if (result.timedOut) state = "timeout"
@@ -1030,6 +1098,152 @@ function querySummaryFor(results) {
 
     return `Q${result.queryIndex + 1} hits=${count} state=${state}${errorDetail}`
   })
+}
+
+function exactSpansInResult(result) {
+  return Array.isArray(result?.matches)
+    ? result.matches.reduce(
+        (total, match) =>
+          total + (Array.isArray(match?.exactSpans) ? match.exactSpans.length : 0),
+        0,
+      )
+    : 0
+}
+
+function renderSearchIndex(results, groups, bodyBudgetBytes) {
+  const budget = Math.min(INDEX_BODY_BUDGET_BYTES, bodyBudgetBytes)
+  const body = []
+  let bodyBytes = 0
+  let complete = true
+  let sampleCount = 0
+  let structuralGroupsShown = 0
+  const uniqueFiles = new Set()
+
+  function push(line) {
+    const cost = bytes(line + "\n")
+    if (bodyBytes + cost > budget) {
+      complete = false
+      return false
+    }
+
+    body.push(line)
+    bodyBytes += cost
+    return true
+  }
+
+  outer:
+  for (const result of results) {
+    const byFile = new Map()
+
+    for (const match of result.matches ?? []) {
+      const file = match?.file
+      if (typeof file !== "string") continue
+
+      uniqueFiles.add(file)
+
+      let entry = byFile.get(file)
+      if (!entry) {
+        entry = {
+          file,
+          lineHits: 0,
+          exactMatches: 0,
+          firstLine: match.line,
+          sample: clipLine(match.text, 160),
+        }
+        byFile.set(file, entry)
+      }
+
+      entry.lineHits += 1
+      entry.exactMatches += Array.isArray(match.exactSpans)
+        ? match.exactSpans.length
+        : 0
+
+      if (
+        Number.isInteger(match.line) &&
+        (!Number.isInteger(entry.firstLine) || match.line < entry.firstLine)
+      ) {
+        entry.firstLine = match.line
+        entry.sample = clipLine(match.text, 160)
+      }
+    }
+
+    const exactMatches = exactSpansInResult(result)
+    if (
+      !push(
+        `Q${result.queryIndex + 1} index files=${byFile.size} ` +
+          `collected_lines=${result.matches.length} exact_matches=${exactMatches}`,
+      )
+    ) {
+      break
+    }
+
+    const ranked = [...byFile.values()].sort(
+      (a, b) =>
+        b.exactMatches - a.exactMatches ||
+        b.lineHits - a.lineHits ||
+        a.file.localeCompare(b.file),
+    )
+
+    const shown = ranked.slice(0, INDEX_MAX_FILES_PER_QUERY)
+
+    for (const entry of shown) {
+      const line =
+        `  ${entry.file} lines=${entry.lineHits} exact=${entry.exactMatches}` +
+        (Number.isInteger(entry.firstLine)
+          ? ` sample_line=${entry.firstLine}`
+          : "") +
+        (entry.sample
+          ? ` sample=${JSON.stringify(entry.sample)}`
+          : "")
+
+      if (!push(line)) break outer
+      sampleCount += entry.sample ? 1 : 0
+    }
+
+    if (ranked.length > shown.length) {
+      if (!push(`  … +${ranked.length - shown.length} files`)) break
+    }
+  }
+
+  if (complete && Array.isArray(groups) && groups.length > 0) {
+    if (push(`STRUCTURAL_MAP groups=${groups.length}`)) {
+      const rankedGroups = [...groups].sort(
+        (a, b) =>
+          (b?.hit_count ?? 0) - (a?.hit_count ?? 0) ||
+          String(a?.file ?? "").localeCompare(String(b?.file ?? "")) ||
+          (a?.start_line ?? 0) - (b?.start_line ?? 0),
+      )
+
+      const shown = rankedGroups.slice(0, INDEX_MAX_STRUCTURAL_GROUPS)
+
+      for (const group of shown) {
+        const q = queryLabels(group?.queries)
+        if (!q) continue
+
+        const line =
+          `  ${group.file}:${group.start_line}-${group.end_line} [${q}] ` +
+          `symbol=${JSON.stringify(group.symbol_name)} ` +
+          `role=${group.role} anchor=${JSON.stringify(group.anchor)} ` +
+          `hits=${group.hit_count} variants=${group.variants?.length ?? 0}`
+
+        if (!push(line)) break
+        structuralGroupsShown += 1
+      }
+
+      if (complete && rankedGroups.length > shown.length) {
+        push(`  … +${rankedGroups.length - shown.length} structural groups`)
+      }
+    }
+  }
+
+  return {
+    body,
+    bodyBytes,
+    complete,
+    fileCount: uniqueFiles.size,
+    sampleCount,
+    structuralGroupsShown,
+  }
 }
 
 function worstCaseHeaderBytes(scanComplete, querySummary, uniqueHits) {
@@ -1379,12 +1593,37 @@ export default {
             })
           }
 
-          if (state && state.executedSearches >= MAX_EXECUTED_SEARCHES_PER_TURN) {
+          const queryPlan = queries.map((query, index) => {
+            const cacheKey = queryCacheKey(root, query, target, glob)
+            const cached = state?.queryCache?.get(cacheKey) ?? null
+
+            return {
+              query,
+              index,
+              cacheKey,
+              cached,
+            }
+          })
+
+          const freshPlan = queryPlan.filter((item) => !item.cached)
+          const reusedQueryCount = queryPlan.length - freshPlan.length
+          const executedQueryCount = freshPlan.length
+
+          // `executedSearches` counts tool executions that actually start rg.
+          // A fully reused exact-query subset consumes an attempt/evidence
+          // budget, but not an executed-search slot.
+          if (
+            state &&
+            freshPlan.length > 0 &&
+            state.executedSearches >= MAX_EXECUTED_SEARCHES_PER_TURN
+          ) {
             return await blockSearch("executed_search_budget", {
               limit: MAX_EXECUTED_SEARCHES_PER_TURN,
               queries,
               path: target,
               glob: glob ?? null,
+              reused_query_count: reusedQueryCount,
+              executed_query_count: executedQueryCount,
             })
           }
 
@@ -1400,12 +1639,37 @@ export default {
 
           if (state) {
             state.signatures.add(signature)
-            state.executedSearches += 1
+            if (freshPlan.length > 0) state.executedSearches += 1
           }
 
-          const results = await Promise.all(
-            queries.map((query, index) => runQuery(root, query, index, target, glob)),
+          const freshResults = await Promise.all(
+            freshPlan.map((item) =>
+              runQuery(root, item.query, item.index, target, glob),
+            ),
           )
+
+          const freshByIndex = new Map(
+            freshResults.map((result) => [result.queryIndex, result]),
+          )
+
+          if (state) {
+            for (const item of freshPlan) {
+              const result = freshByIndex.get(item.index)
+              if (result) rememberQueryResult(state, item.cacheKey, result)
+            }
+          }
+
+          const results = queryPlan
+            .map((item) => {
+              if (item.cached) {
+                return reindexQueryResult(item.cached, item.index, true)
+              }
+
+              const result = freshByIndex.get(item.index)
+              return result ? reindexQueryResult(result, item.index, false) : null
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.queryIndex - b.queryIndex)
 
           const hits = mergeHits(results)
           const exactSpanHits = [...hits.values()].reduce(
@@ -1483,6 +1747,14 @@ export default {
           let hybridContextSamples = null
           let hybridRatio = null
           let variantDiversity = null
+          let distillGroupsForIndex = null
+
+          let indexReason = null
+          let indexRenderComplete = null
+          let indexFiles = null
+          let indexSamples = null
+          let indexStructuralGroups = null
+          let refinementRequired = false
 
           if (!scanComplete) distillReason = "scan_incomplete"
           else if (!pressure.active) distillReason = "not_needed"
@@ -1503,6 +1775,7 @@ export default {
               distillIrComplete = true
               distillWitnessComplete = true
               v2GroupingPreserved = true
+              distillGroupsForIndex = distill.response.groups
               variantDiversity = Number.isFinite(distill.response?.variant_diversity)
                 ? distill.response.variant_diversity
                 : null
@@ -1566,6 +1839,63 @@ export default {
             }
           }
 
+          // INDEX is not a compressed substitute for code evidence. It is a
+          // bounded routing map used only when the normal evidence cannot be
+          // complete. It tells the model where to refine and explicitly
+          // forbids absence conclusions from an incomplete discovery.
+          if (
+            representation === "raw" &&
+            (!scanComplete || !rawEvidenceComplete)
+          ) {
+            const indexRendered = renderSearchIndex(
+              results,
+              distillGroupsForIndex,
+              bodyBudget,
+            )
+
+            const discoveryComplete = scanComplete
+            const absenceNotProven = !discoveryComplete
+            const indexHeader = [
+              `SEARCH representation=index complete=false scan_complete=${scanComplete} evidence_complete=false index_render_complete=${indexRendered.complete} refinement_required=true absence_not_proven=${absenceNotProven} collected_line_hits=${hits.size} exact_matches=${exactSpanHits} indexed_files=${indexRendered.fileCount}`,
+              ...querySummary,
+              `REFINE_REQUIRED action=search_narrower_by_file_or_api`,
+            ]
+
+            if (absenceNotProven) {
+              indexHeader.push(
+                "ABSENCE_NOT_PROVEN reason=discovery_incomplete do_not_conclude_no_other_matches",
+              )
+              indexReason = "discovery_incomplete"
+            } else {
+              indexHeader.push(
+                "EVIDENCE_SUMMARIZED reason=raw_output_budget inspect_focused_evidence_before_code_level_conclusions",
+              )
+              indexReason = "raw_output_budget"
+            }
+
+            const indexContent = [
+              ...indexHeader,
+              "",
+              ...indexRendered.body,
+            ].join("\n")
+            const indexResultBytes = bytes(indexContent)
+
+            if (indexResultBytes <= callBudgetBytes) {
+              representation = "index"
+              content = indexContent
+              resultBytes = indexResultBytes
+              bodyBytes = indexRendered.bodyBytes
+              shownHits = indexRendered.sampleCount
+              evidenceComplete = false
+              complete = false
+              refinementRequired = true
+              indexRenderComplete = indexRendered.complete
+              indexFiles = indexRendered.fileCount
+              indexSamples = indexRendered.sampleCount
+              indexStructuralGroups = indexRendered.structuralGroupsShown
+            }
+          }
+
           if (state) {
             state.evidenceBytes += resultBytes
             state.lastSeen = nowMs()
@@ -1584,6 +1914,14 @@ export default {
             queries,
             path: target,
             glob: glob ?? null,
+            discovery_cap_per_query: DISCOVERY_CAP_PER_QUERY,
+            reused_query_count: reusedQueryCount,
+            executed_query_count: executedQueryCount,
+            reused_queries: queryPlan
+              .filter((item) => item.cached)
+              .map((item) => item.query),
+            query_cache_entries: state?.queryCache?.size ?? null,
+            query_cache_matches: state?.queryCacheMatches ?? null,
             representation,
             unique_hits: hits.size,
             exact_span_hits: exactSpanHits,
@@ -1616,6 +1954,12 @@ export default {
             hybrid_context_samples: hybridContextSamples,
             hybrid_ratio: hybridRatio,
             variant_diversity: variantDiversity,
+            index_reason: indexReason,
+            index_render_complete: indexRenderComplete,
+            index_files: indexFiles,
+            index_samples: indexSamples,
+            index_structural_groups: indexStructuralGroups,
+            refinement_required: refinementRequired,
             turn_model_calls: state?.modelCalls ?? null,
             turn_search_attempts: state?.searchAttempts ?? null,
             turn_executed_searches: state?.executedSearches ?? null,
@@ -1636,6 +1980,10 @@ export default {
               unique_hits: hits.size,
               shown_hits: shownHits,
               scan_complete: scanComplete,
+              reused_query_count: reusedQueryCount,
+              executed_query_count: executedQueryCount,
+              refinement_required: refinementRequired,
+              index_reason: indexReason,
               evidence_complete: evidenceComplete,
               complete,
               distill_attempted: distillAttempted,
