@@ -9,8 +9,11 @@ Experimental low-CPU local coding-agent runtime for OpenCode.
 - turn-scoped search/model governor
 - dynamic per-session project root
 - ripgrep file-level lexical discovery (`--files-with-matches`)
-- deterministic candidate ranking by multi-query coverage + path affinity + query rarity
+- deterministic candidate relevance ranking by multi-query coverage + path affinity
+- query rarity used for fairness reservation/telemetry, not semantic relevance
 - same-call auto-refinement of up to four lexical candidate files
+- budgeted region routing for dense evidence before model-facing INDEX fallback
+- focused-context cost guard and compact model-visible route metadata
 - separate routing and evidence novelty ledgers
 - Rust structural evidence distiller
 - ast-grep/tree-sitter structural backend
@@ -36,11 +39,13 @@ Proven:
 - Rust evidence-distiller standalone smoke test
 - pressure-based structural evidence distillation inside `search`
 
-In progress:
+Roadmap:
 
-- persistent incremental symbol/file graph
-- graph-based task priors (Aider-style repo-map ideas) fused with lexical routing,
-  never used as a hard filter
+- v2.12-A budgeted region router (current)
+- v2.12-B probe-more / emit-less after A passes runtime gates
+- v2.13 incremental symbol/file graph only if benchmark misses justify it
+
+See `docs/ARCHITECTURE_PLAN.md` and `benchmarks/v2.12-a-gates.json`.
 
 ## Layout
 

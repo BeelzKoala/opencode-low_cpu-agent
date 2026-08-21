@@ -1,0 +1,12 @@
+{
+  "protocol": "search-v2.12.0-budgeted-region-router",
+  "baseline": "search-v2.11.0-ranked-routing",
+  "gates": [
+    "broad sparse chooses ranked_raw when focused exceeds its cost premium",
+    "fairness retains a rare direct lexical file without rarity driving relevance order",
+    "dense complete single-function evidence chooses region with refinement_required=false",
+    "low-diversity repeated evidence still chooses hybrid",
+    "line-scan incomplete evidence still chooses index with line_scan_incomplete",
+    "narrow complete evidence remains complete=true"
+  ]
+}

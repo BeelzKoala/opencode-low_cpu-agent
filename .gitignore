@@ -18,3 +18,6 @@ opencode-evidence-distiller
 
 # OS/editor
 .DS_Store
+
+# Local patch backups
+*.backup.*

@@ -1,0 +1,104 @@
+{
+  "verdict": "PASS",
+  "protocol": "search-v2.12.0-budgeted-region-router",
+  "baseline": {
+    "protocol": "search-v2.11.0-ranked-routing",
+    "broad_sparse_output_bytes": 1807,
+    "broad_sparse_representation": "ranked_focused",
+    "dense_representation": "index",
+    "dense_refinement_required": true
+  },
+  "wins": {
+    "broad_sparse_output_bytes": 1200,
+    "broad_sparse_saved_bytes": 607,
+    "broad_sparse_saved_pct": 33.6,
+    "dense_representation": "region",
+    "dense_refinement_required": false,
+    "dense_forced_refine_eliminated": true
+  },
+  "cases": {
+    "broad_sparse": {
+      "representation": "ranked_raw",
+      "candidate_files": 10,
+      "retained_unread_files": 6,
+      "output_bytes": 1200,
+      "raw_output_bytes": 1133,
+      "focused_reason": "cost_guard",
+      "elapsed_ms": 30.83
+    },
+    "fairness_vs_relevance": {
+      "route_strategy": "query_fair_coverage_path",
+      "selected_files": [
+        {
+          "file": "./src/alpha_router.py",
+          "queries": [
+            0
+          ],
+          "path_affinity": 8,
+          "rarity": 0.14285714285714285
+        },
+        {
+          "file": "./src/broad_1.py",
+          "queries": [
+            0
+          ],
+          "path_affinity": 0,
+          "rarity": 0.14285714285714285
+        },
+        {
+          "file": "./src/broad_2.py",
+          "queries": [
+            0
+          ],
+          "path_affinity": 0,
+          "rarity": 0.14285714285714285
+        },
+        {
+          "file": "./src/zz_rare.py",
+          "queries": [
+            1
+          ],
+          "path_affinity": 0,
+          "rarity": 1
+        }
+      ]
+    },
+    "narrow_complete": {
+      "representation": "raw",
+      "scan_complete": true,
+      "evidence_complete": true,
+      "complete": true,
+      "output_bytes": 502,
+      "elapsed_ms": 8.65
+    },
+    "dense_region": {
+      "representation": "region",
+      "refinement_required": false,
+      "index_reason": null,
+      "region_reason": "selected",
+      "region_sampled_scopes": 1,
+      "region_sampled_hits": 8,
+      "region_retained_hits": 142,
+      "output_bytes": 1083,
+      "raw_output_bytes": 5329,
+      "elapsed_ms": 25.43
+    },
+    "hybrid_regression": {
+      "representation": "hybrid",
+      "hybrid_variants": 1,
+      "output_bytes": 836,
+      "raw_output_bytes": 1329,
+      "elapsed_ms": 8.34
+    },
+    "line_cap_safety": {
+      "representation": "index",
+      "selected_scan_complete": false,
+      "scan_complete": false,
+      "index_reason": "line_scan_incomplete",
+      "refinement_required": true,
+      "output_bytes": 630,
+      "elapsed_ms": 13.04
+    }
+  },
+  "wall_seconds": 175
+}

@@ -6,7 +6,7 @@ const MAX_QUERIES = 4
 const LINE_HIT_CAP_PER_QUERY = 1000
 const FILE_DISCOVERY_CAP_PER_QUERY = 5000
 const AUTO_REFINE_MAX_FILES = 4
-const ROUTE_BODY_BUDGET_BYTES = 1200
+const ROUTE_BODY_BUDGET_BYTES = 700
 const CONTEXT_RADIUS = 2
 
 const QUERY_CACHE_MAX_ENTRIES_PER_TURN = 16
@@ -40,13 +40,20 @@ const FOCUSED_FULL_SCOPE_MAX_LINES = 96
 const FOCUSED_SCOPE_HEADER_LINES = 3
 const FOCUSED_WINDOW_RADII = [20, 12, 6, 2]
 const FOCUSED_MIN_SUPPLEMENT_BYTES = 128
+const FOCUSED_MAX_OVERHEAD_BYTES = 256
+const FOCUSED_MAX_OVERHEAD_RATIO = 1.12
+
+const REGION_MAX_SCOPES = 3
+const REGION_BODY_BUDGET_BYTES = 2200
+const REGION_SAMPLE_HITS_PER_SCOPE = 3
+const REGION_SAMPLE_RADIUS = 1
 
 const EVIDENCE_LEDGER_MAX_FACTS_PER_TURN = 12000
 const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.11.0-ranked-routing"
+const SEARCH_PROTOCOL = "search-v2.12.0-budgeted-region-router"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -937,14 +944,14 @@ function rankDiscoveredFiles(discoveryResults) {
     }, 0)
   }
 
-  // Routing-only rank: direct lexical candidates are never filtered out.
-  // Query coverage is strongest, path affinity is a cheap task-local prior,
-  // and query rarity breaks broad-query ties without using raw line counts.
+  // Relevance rank is deliberately separate from fairness. Direct lexical
+  // candidates are never filtered out. Query rarity is retained for telemetry
+  // and fairness reservation only; it must not make a semantically weak rare
+  // query outrank a stronger multi-query/path match.
   return [...byFile.values()].sort(
     (a, b) =>
       b.coverage - a.coverage ||
       b.pathAffinity - a.pathAffinity ||
-      b.rarity - a.rarity ||
       a.file.localeCompare(b.file),
   )
 }
@@ -1024,26 +1031,19 @@ function renderRouteMap(rankedFiles, selectedFiles, bodyBudgetBytes) {
   const retained = Math.max(0, rankedFiles.length - selectedSet.size)
 
   push(
-    `ROUTE strategy=query_coverage_path_rarity candidate_files=${rankedFiles.length} selected_files=${selectedSet.size}`,
+    `ROUTE selected=${selectedSet.size} retained=${retained}`,
   )
 
-  let rank = 0
   for (const entry of selectedFiles) {
-    rank += 1
-
     const q = [...entry.queries]
       .sort((a, b) => a - b)
       .map((value) => `Q${value + 1}`)
       .join(",")
 
-    if (!push(
-      `  ${rank}. ${entry.file} [${q}] coverage=${entry.coverage} path=${entry.pathAffinity} rarity=${entry.rarity.toFixed(4)}`,
-    )) break
+    if (!push(`  ${entry.file} [${q}]`)) break
   }
 
-  if (retained > 0) {
-    push(`  +${retained} lexical candidates retained_unread`)
-  }
+  if (retained > 0) push(`  +${retained} lexical candidates retained_unread`)
 
   return { body, bodyBytes, retained }
 }
@@ -2126,12 +2126,18 @@ function focusedScopesFromGroups(groups) {
         hitLines: new Set(),
         anchors: new Set(),
         roles: new Set(),
+        queries: new Set(),
+        hitCount: 0,
         roleScore: 0,
       }
       scopes.set(key, scope)
     }
 
     if (group.anchor) scope.anchors.add(group.anchor)
+    for (const query of group.queries ?? []) {
+      if (Number.isInteger(query) && query > 0) scope.queries.add(query)
+    }
+    scope.hitCount += Number.isInteger(group.hit_count) ? group.hit_count : 0
     if (group.role) {
       scope.roles.add(group.role)
       scope.roleScore = Math.max(scope.roleScore, focusedRoleScore(group.role))
@@ -2146,6 +2152,8 @@ function focusedScopesFromGroups(groups) {
     .sort(
       (a, b) =>
         b.roleScore - a.roleScore ||
+        b.queries.size - a.queries.size ||
+        b.hitCount - a.hitCount ||
         b.hitLines.size - a.hitLines.size ||
         a.file.localeCompare(b.file) ||
         a.start - b.start ||
@@ -2404,6 +2412,161 @@ async function renderFocusedSupplement(
     contextualizedHitLines: fallback?.contextualizedHitLines ?? new Set(),
     emittedLines: fallback?.emittedLines ?? 0,
     reason: fallback?.reason ?? "supplement_budget",
+  }
+}
+
+
+function sampleScopeHitLines(scope, limit = REGION_SAMPLE_HITS_PER_SCOPE) {
+  const lines = [...(scope?.hitLines ?? [])]
+    .filter((line) => Number.isInteger(line) && line > 0)
+    .sort((a, b) => a - b)
+
+  if (lines.length <= limit) return lines
+
+  const picks = [lines[0]]
+  if (limit >= 3) picks.push(lines[Math.floor((lines.length - 1) / 2)])
+  if (limit >= 2) picks.push(lines[lines.length - 1])
+
+  return [...new Set(picks)].slice(0, limit).sort((a, b) => a - b)
+}
+
+async function renderRegionEvidence(root, groups, maxBytes, hits) {
+  const budget = Math.min(REGION_BODY_BUDGET_BYTES, Math.max(0, maxBytes))
+  const scopes = focusedScopesFromGroups(groups).slice(0, REGION_MAX_SCOPES)
+
+  if (budget < FOCUSED_MIN_SUPPLEMENT_BYTES || scopes.length < 1) {
+    return {
+      body: [],
+      facts: new Set(),
+      bodyBytes: 0,
+      complete: false,
+      scopeCount: scopes.length,
+      sampledScopes: 0,
+      sampledHits: 0,
+      retainedHits: hits?.size ?? 0,
+      reason: scopes.length < 1 ? "no_behavior_scope" : "region_budget",
+    }
+  }
+
+  const body = []
+  const facts = new Set()
+  const cache = new Map()
+  const hitLookup = hitLookupByFileLine(hits)
+  let bodyBytes = 0
+  let sampledScopes = 0
+  let sampledHits = 0
+  const sampledHitKeys = new Set()
+
+  function push(line) {
+    const cost = bytes(line + "\n")
+    if (bodyBytes + cost > budget) return false
+    body.push(line)
+    bodyBytes += cost
+    return true
+  }
+
+  for (const scope of scopes) {
+    const lines = await loadLines(root, scope.file, cache)
+    if (!lines || lines.length < 1) continue
+
+    const start = Math.max(1, Math.min(scope.start, lines.length))
+    const end = Math.max(start, Math.min(scope.end, lines.length))
+    const samples = sampleScopeHitLines(scope)
+    const q = [...scope.queries]
+      .sort((a, b) => a - b)
+      .map((value) => `Q${value}`)
+      .join(",")
+    const anchors = [...scope.anchors].slice(0, 4)
+
+    const header =
+      `REGION_CONTEXT ${scope.file}:${start}-${end} [${q}] ` +
+      `symbol=${JSON.stringify(scope.symbolName)} kind=${scope.symbolKind} ` +
+      `hits=${scope.hitCount} sampled_hit_lines=${samples.length}` +
+      (anchors.length > 0 ? ` anchors=${JSON.stringify(anchors)}` : "")
+
+    if (!push(header)) break
+    facts.add(scopeFact(scope))
+
+    const ranges = mergeLineRanges([
+      { start, end: Math.min(end, start + FOCUSED_SCOPE_HEADER_LINES - 1) },
+      ...samples.map((line) => ({
+        start: Math.max(start, line - REGION_SAMPLE_RADIUS),
+        end: Math.min(end, line + REGION_SAMPLE_RADIUS),
+      })),
+    ])
+
+    const byLine = hitLookup.get(evidenceFileKey(scope.file)) ?? new Map()
+    let previousEnd = null
+
+    for (const range of ranges) {
+      if (previousEnd !== null && range.start > previousEnd + 1) {
+        if (!push(`  … sampled region context omitted ${range.start - previousEnd - 1} lines …`)) {
+          return {
+            body,
+            facts,
+            bodyBytes,
+            complete: sampledScopes > 0,
+            scopeCount: scopes.length,
+            sampledScopes,
+            sampledHits,
+            retainedHits: Math.max(0, (hits?.size ?? 0) - sampledHitKeys.size),
+            reason: sampledScopes > 0 ? null : "region_budget",
+          }
+        }
+      }
+
+      for (let n = range.start; n <= range.end; n++) {
+        const hit = byLine.get(n)
+        let prefix = " "
+
+        if (hit) {
+          const labels = [...hit.queries]
+            .sort((a, b) => a - b)
+            .map((value) => `Q${value + 1}`)
+            .join(",")
+          prefix = `>[${labels}]`
+        }
+
+        if (!push(
+          `  ${prefix.padEnd(9)} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`,
+        )) {
+          return {
+            body,
+            facts,
+            bodyBytes,
+            complete: sampledScopes > 0,
+            scopeCount: scopes.length,
+            sampledScopes,
+            sampledHits,
+            retainedHits: Math.max(0, (hits?.size ?? 0) - sampledHitKeys.size),
+            reason: sampledScopes > 0 ? null : "region_budget",
+          }
+        }
+
+        facts.add(sourceLineFact(scope.file, n))
+        if (hit && !sampledHitKeys.has(hit.key)) {
+          sampledHitKeys.add(hit.key)
+          sampledHits += 1
+          for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+        }
+      }
+
+      previousEnd = range.end
+    }
+
+    sampledScopes += 1
+  }
+
+  return {
+    body,
+    facts,
+    bodyBytes,
+    complete: sampledScopes > 0,
+    scopeCount: scopes.length,
+    sampledScopes,
+    sampledHits,
+    retainedHits: Math.max(0, (hits?.size ?? 0) - sampledHitKeys.size),
+    reason: sampledScopes > 0 ? null : "no_renderable_scope",
   }
 }
 
@@ -2942,7 +3105,7 @@ export default {
         name: "search",
         description:
           "Search the active project with 1 to 4 regular expressions in one call. " +
-          "Search first performs repository-wide file discovery, ranks lexical candidate files, " +
+          "Search first performs repository-wide file discovery, ranks lexical candidate files with fairness separated from relevance, " +
           "and automatically refines up to four candidates in the same tool call. " +
           "Returns bounded line-numbered evidence and explicit completeness metadata. " +
           "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
@@ -3314,6 +3477,14 @@ export default {
           let indexFacts = new Set()
           let refinementRequired = false
 
+          let regionAttempted = false
+          let regionReason = "not_needed"
+          let regionScopes = null
+          let regionSampledScopes = null
+          let regionSampledHits = null
+          let regionRetainedHits = null
+          let regionFacts = new Set()
+
           let focusedCandidate = false
           let focusedAttempted = false
           let focusedReason = "not_needed"
@@ -3544,8 +3715,17 @@ export default {
                     ].join("\n")
                     const focusedResultBytes = bytes(focusedContent)
 
+                    const focusedCostLimit = Math.min(
+                      rawResultBytes + FOCUSED_MAX_OVERHEAD_BYTES,
+                      Math.ceil(rawResultBytes * FOCUSED_MAX_OVERHEAD_RATIO),
+                    )
+                    const focusedCostAccepted =
+                      focusedResultBytes <= focusedCostLimit
+
                     if (focusedResultBytes > callBudgetBytes) {
                       focusedReason = "focused_output_budget"
+                    } else if (!focusedCostAccepted) {
+                      focusedReason = "cost_guard"
                     } else {
                       representation = "focused"
                       content = focusedContent
@@ -3572,6 +3752,77 @@ export default {
                     }
                   }
                 }
+              }
+            }
+          }
+
+
+          // Dense evidence that cannot fit RAW is routed one level deeper
+          // inside the selected file(s). This is intentionally sampled and
+          // marked incomplete, but it gives the model concrete function/scope
+          // context without forcing an INDEX -> model -> narrower-search loop.
+          if (
+            representation === "raw" &&
+            selectedScanComplete &&
+            !selectedEvidenceComplete &&
+            Array.isArray(distillGroupsForIndex) &&
+            distillGroupsForIndex.length > 0
+          ) {
+            regionAttempted = true
+            const regionRendered = await renderRegionEvidence(
+              root,
+              distillGroupsForIndex,
+              bodyBudget,
+              hits,
+            )
+
+            regionReason = regionRendered.reason ?? "selected"
+            regionScopes = regionRendered.scopeCount
+            regionSampledScopes = regionRendered.sampledScopes
+            regionSampledHits = regionRendered.sampledHits
+            regionRetainedHits = regionRendered.retainedHits
+
+            if (regionRendered.complete) {
+              const publicRegionRepresentation = routingActive
+                ? "ranked_region"
+                : "region"
+              const regionHeader = [
+                `SEARCH representation=${publicRegionRepresentation} complete=false scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=false selected_evidence_complete=false matches_complete=${scanComplete} region_sampled=true refinement_required=false candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} sampled_hits=${regionRendered.sampledHits} retained_hits=${regionRendered.retainedHits} scopes=${regionRendered.sampledScopes}`,
+                ...querySummary,
+                `EVIDENCE_SAMPLED reason=dense_region_router exact_match_locations_preserved=true`,
+              ]
+
+              if (routingActive) {
+                regionHeader.push(
+                  `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset,region_sampled" : "lexical_discovery_incomplete,region_sampled"}`,
+                )
+              } else {
+                regionHeader.push("INCOMPLETE reasons=region_sampled")
+              }
+
+              const regionContent = [
+                ...regionHeader,
+                ...(routeRendered.body.length > 0
+                  ? ["", ...routeRendered.body]
+                  : []),
+                "",
+                ...regionRendered.body,
+              ].join("\n")
+              const regionResultBytes = bytes(regionContent)
+
+              if (regionResultBytes <= callBudgetBytes) {
+                representation = "region"
+                content = regionContent
+                resultBytes = regionResultBytes
+                bodyBytes = regionRendered.bodyBytes
+                shownHits = regionRendered.sampledHits
+                evidenceComplete = false
+                complete = false
+                refinementRequired = false
+                regionReason = "selected"
+                regionFacts = regionRendered.facts ?? new Set()
+              } else {
+                regionReason = "region_output_budget"
               }
             }
           }
@@ -3739,6 +3990,9 @@ export default {
           } else if (representation === "hybrid") {
             for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
             for (const fact of hybridFacts) finalFacts.add(fact)
+          } else if (representation === "region") {
+            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
+            for (const fact of regionFacts) finalFacts.add(fact)
           } else if (representation === "index") {
             for (const fact of indexFacts) finalFacts.add(fact)
           }
@@ -3769,11 +4023,7 @@ export default {
           let noProgress = false
           let noProgressBlocked = false
 
-          if (
-            state &&
-            novelty.novel.size < 1 &&
-            !meaningfulRouteProgress
-          ) {
+          if (state && novelty.novel.size < 1) {
             state.consecutiveNoProgress += 1
             noProgress = true
             noProgressBlocked =
@@ -3817,7 +4067,8 @@ export default {
             routingActive &&
             (representation === "raw" ||
               representation === "focused" ||
-              representation === "hybrid")
+              representation === "hybrid" ||
+              representation === "region")
           ) {
             representation = `ranked_${representation}`
           }
@@ -3845,7 +4096,7 @@ export default {
             lexical_discovery_complete: discoveryComplete,
             selected_scan_complete: selectedScanComplete,
             routing_active: routingActive,
-            route_strategy: "query_coverage_path_rarity",
+            route_strategy: "query_fair_coverage_path",
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
@@ -3904,6 +4155,19 @@ export default {
             focused_partial_scopes: focusedPartialScopes,
             focused_radius: focusedRadius,
             focused_canonical_saved_bytes: focusedCanonicalSavedBytes,
+            focused_cost_limit_bytes:
+              rawResultBytes > 0
+                ? Math.min(
+                    rawResultBytes + FOCUSED_MAX_OVERHEAD_BYTES,
+                    Math.ceil(rawResultBytes * FOCUSED_MAX_OVERHEAD_RATIO),
+                  )
+                : null,
+            region_attempted: regionAttempted,
+            region_reason: regionReason,
+            region_scopes: regionScopes,
+            region_sampled_scopes: regionSampledScopes,
+            region_sampled_hits: regionSampledHits,
+            region_retained_hits: regionRetainedHits,
             pressure_active: pressure.active,
             pressure_reasons: pressure.reasons,
             max_hits_per_file: pressure.maxHitsPerFile,
@@ -3973,7 +4237,7 @@ export default {
               lexical_discovery_complete: discoveryComplete,
               selected_scan_complete: selectedScanComplete,
               routing_active: routingActive,
-              route_strategy: "query_coverage_path_rarity",
+              route_strategy: "query_fair_coverage_path",
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
@@ -3984,6 +4248,7 @@ export default {
               refinement_required: refinementRequired,
               index_reason: indexReason,
               focused_reason: focusedReason,
+              region_reason: regionReason,
               evidence_complete: evidenceComplete,
               complete,
               ledger_new_facts: novelty.novel.size,
