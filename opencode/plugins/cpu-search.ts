@@ -213,6 +213,57 @@ async function safeTarget(root, raw = ".") {
   return path.relative(root, resolved) || "."
 }
 
+function exactSpansFromRgMatch(data, queryIndex) {
+  const absoluteOffset = data?.absolute_offset
+  const submatches = data?.submatches
+  const lineText = data?.lines?.text
+
+  if (
+    !Number.isSafeInteger(absoluteOffset) ||
+    absoluteOffset < 0 ||
+    !Array.isArray(submatches) ||
+    typeof lineText !== "string"
+  ) {
+    return []
+  }
+
+  // ripgrep JSON offsets are byte offsets. submatch start/end are relative to
+  // data.lines, while absolute_offset is the byte offset of that data block
+  // in the searched file. Keep these as bytes all the way into Rust.
+  const lineBytes = bytes(lineText)
+  const spans = []
+
+  for (const submatch of submatches) {
+    const start = submatch?.start
+    const end = submatch?.end
+
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      end <= start ||
+      end > lineBytes
+    ) {
+      continue
+    }
+
+    const startByte = absoluteOffset + start
+    const endByte = absoluteOffset + end
+
+    if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte)) {
+      continue
+    }
+
+    spans.push({
+      queryIndex,
+      startByte,
+      endByte,
+    })
+  }
+
+  return spans
+}
+
 function runQuery(root, query, queryIndex, target, glob) {
   return new Promise((resolve) => {
     const args = [
@@ -273,6 +324,7 @@ function runQuery(root, query, queryIndex, target, glob) {
         line: lineNo,
         text: event.data?.lines?.text ?? "",
         queryIndex,
+        exactSpans: exactSpansFromRgMatch(event.data, queryIndex),
       })
     }
 
@@ -394,11 +446,13 @@ function mergeHits(results) {
           line: match.line,
           text: match.text,
           queries: new Set(),
+          exactSpans: [],
         }
         hits.set(key, item)
       }
 
       item.queries.add(result.queryIndex)
+      if (Array.isArray(match.exactSpans)) item.exactSpans.push(...match.exactSpans)
     }
   }
 
@@ -869,6 +923,10 @@ export default {
           )
 
           const hits = mergeHits(results)
+          const exactSpanHits = [...hits.values()].reduce(
+            (total, hit) => total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
+            0,
+          )
           const scanComplete = results.every((result) => result.scanComplete)
           const querySummary = querySummaryFor(results)
           const callBudgetBytes = Math.min(MAX_OUTPUT_BYTES, remainingEvidenceBytes)
@@ -931,6 +989,7 @@ export default {
             path: target,
             glob: glob ?? null,
             unique_hits: hits.size,
+            exact_span_hits: exactSpanHits,
             shown_hits: rendered.shown.size,
             scan_complete: scanComplete,
             evidence_complete: evidenceComplete,
