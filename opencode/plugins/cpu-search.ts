@@ -3,7 +3,10 @@ import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 
 const MAX_QUERIES = 4
-const DISCOVERY_CAP_PER_QUERY = 1000
+const LINE_HIT_CAP_PER_QUERY = 1000
+const FILE_DISCOVERY_CAP_PER_QUERY = 5000
+const AUTO_REFINE_MAX_FILES = 4
+const ROUTE_BODY_BUDGET_BYTES = 1200
 const CONTEXT_RADIUS = 2
 
 const QUERY_CACHE_MAX_ENTRIES_PER_TURN = 16
@@ -12,6 +15,7 @@ const QUERY_CACHE_MAX_MATCHES_PER_TURN = 4000
 const INDEX_BODY_BUDGET_BYTES = 1400
 const INDEX_MAX_FILES_PER_QUERY = 5
 const INDEX_MAX_STRUCTURAL_GROUPS = 6
+const INDEX_FACET_TEXT_MAX = 80
 
 const MAX_OUTPUT_BYTES = 6500
 const BODY_BUDGET_BYTES = 5000
@@ -27,7 +31,22 @@ const HYBRID_MIN_SAVINGS_RATIO = 0.75
 const HYBRID_CONTEXT_RADIUS = 1
 const HYBRID_CONTEXT_SAMPLES_PER_GROUP = 3
 
-const SEARCH_PROTOCOL = "search-v2.6.0-global"
+const FOCUSED_PROBE_MAX_LINE_HITS = 24
+const FOCUSED_PROBE_MAX_EXACT_MATCHES = 32
+const FOCUSED_PROBE_MAX_HITS_PER_FILE = 8
+const FOCUSED_MAX_SCOPES = 3
+const FOCUSED_SUPPLEMENT_MAX_BYTES = 2600
+const FOCUSED_FULL_SCOPE_MAX_LINES = 96
+const FOCUSED_SCOPE_HEADER_LINES = 3
+const FOCUSED_WINDOW_RADII = [20, 12, 6, 2]
+const FOCUSED_MIN_SUPPLEMENT_BYTES = 128
+
+const EVIDENCE_LEDGER_MAX_FACTS_PER_TURN = 12000
+const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
+const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
+const MAX_CONSECUTIVE_NO_PROGRESS = 2
+
+const SEARCH_PROTOCOL = "search-v2.11.0-ranked-routing"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -136,6 +155,11 @@ function getSessionState(sessionID) {
       evidenceBytes: 0,
       signatures: new Set(),
       queryCache: new Map(),
+      evidenceLedger: new Set(),
+      routeLedger: new Set(),
+      contextualizedHitLines: new Set(),
+      consecutiveNoProgress: 0,
+      ledgerSaturated: false,
       queryCacheMatches: 0,
       seenUsageMessages: new Set(),
       lastSeen: now,
@@ -157,6 +181,11 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.evidenceBytes = 0
   state.signatures.clear()
   state.queryCache.clear()
+  state.evidenceLedger.clear()
+  state.routeLedger.clear()
+  state.contextualizedHitLines.clear()
+  state.consecutiveNoProgress = 0
+  state.ledgerSaturated = false
   state.queryCacheMatches = 0
   state.seenUsageMessages.clear()
   state.lastSeen = nowMs()
@@ -216,12 +245,13 @@ function searchSignature(queries, target, glob) {
   })
 }
 
-function queryCacheKey(root, query, target, glob) {
+function queryCacheKey(root, query, target, glob, files = null) {
   return JSON.stringify({
     root,
     query,
     path: target,
     glob: glob ?? null,
+    files: Array.isArray(files) ? [...files].sort() : null,
   })
 }
 
@@ -271,6 +301,376 @@ function rememberQueryResult(state, key, result) {
   state.queryCache.set(key, reindexQueryResult(result, 0, false))
   state.queryCacheMatches += matchCount
   return true
+}
+
+
+function evidenceFileKey(file) {
+  const normalized = path.posix.normalize(
+    String(file ?? "").replace(/\\/g, "/"),
+  )
+
+  return normalized.startsWith("./") ? normalized.slice(2) : normalized
+}
+
+function evidenceFact(kind, parts) {
+  return `${kind}\0${JSON.stringify(parts)}`
+}
+
+function sourceLineFact(file, line) {
+  return evidenceFact("line", [evidenceFileKey(file), line])
+}
+
+function hitLineFact(file, line) {
+  return evidenceFact("hit", [evidenceFileKey(file), line])
+}
+
+function exactSpanFact(file, startByte, endByte) {
+  return evidenceFact("span", [evidenceFileKey(file), startByte, endByte])
+}
+
+function scopeFact(scope) {
+  return evidenceFact("scope", [
+    evidenceFileKey(scope?.file),
+    scope?.start,
+    scope?.end,
+    scope?.symbolKind,
+    scope?.symbolName,
+  ])
+}
+
+function groupFact(group) {
+  return evidenceFact("group", [
+    evidenceFileKey(group?.file),
+    group?.start_line,
+    group?.end_line,
+    group?.symbol_kind,
+    group?.symbol_name,
+    group?.role,
+    group?.anchor,
+    group?.match_text,
+  ])
+}
+
+function witnessFact(group, variant) {
+  return evidenceFact("witness", [
+    evidenceFileKey(group?.file),
+    group?.start_line,
+    group?.end_line,
+    group?.symbol_kind,
+    group?.symbol_name,
+    group?.role,
+    group?.anchor,
+    variant?.subject_text,
+    variant?.statement_text,
+    integerList(variant?.hit_lines) ?? [],
+  ])
+}
+
+function negativeQueryFact(result, target, glob) {
+  return evidenceFact("negative", [
+    result?.query,
+    target,
+    glob ?? null,
+  ])
+}
+
+function indexSummaryFact(result, fileCount, exactMatches) {
+  return evidenceFact("index_summary", [
+    result?.scanComplete === true,
+    result?.scanCapped === true,
+    fileCount,
+    result?.matches?.length ?? 0,
+    exactMatches,
+  ])
+}
+
+function indexFileFact(entry) {
+  return evidenceFact("index_file", [
+    evidenceFileKey(entry?.file),
+    entry?.lineHits,
+    entry?.exactMatches,
+    entry?.firstLine ?? null,
+    entry?.sample ?? null,
+  ])
+}
+
+function indexFacetFact(kind, entry) {
+  return evidenceFact("index_facet", [
+    kind,
+    entry?.text ?? null,
+    entry?.exactMatches ?? 0,
+    entry?.files?.size ?? 0,
+    evidenceFileKey(entry?.firstFile),
+    entry?.firstLine ?? null,
+  ])
+}
+
+function routeCandidateFact(entry, selected, target, glob) {
+  return evidenceFact("route_candidate", [
+    evidenceFileKey(entry?.file),
+    [...(entry?.queries ?? [])].sort((a, b) => a - b),
+    selected === true,
+    target,
+    glob ?? null,
+  ])
+}
+
+function routeSummaryFact(discoveryComplete, candidateCount, selectedCount) {
+  return evidenceFact("route_summary", [
+    discoveryComplete === true,
+    candidateCount,
+    selectedCount,
+  ])
+}
+
+function routeFactsForRanking(
+  rankedFiles,
+  selectedFileSet,
+  discoveryComplete,
+  target,
+  glob,
+) {
+  const facts = new Set([
+    routeSummaryFact(
+      discoveryComplete,
+      rankedFiles?.length ?? 0,
+      selectedFileSet?.size ?? 0,
+    ),
+  ])
+
+  for (const entry of rankedFiles ?? []) {
+    if (!(selectedFileSet instanceof Set) || !selectedFileSet.has(entry.file)) {
+      continue
+    }
+
+    facts.add(
+      routeCandidateFact(
+        entry,
+        true,
+        target,
+        glob,
+      ),
+    )
+  }
+
+  return facts
+}
+
+function contextualizedHitLineKey(file, line) {
+  return `${evidenceFileKey(file)}\0${line}`
+}
+
+function positiveFactsForHit(hit) {
+  const facts = new Set()
+
+  if (typeof hit?.file !== "string" || !Number.isInteger(hit?.line)) {
+    return facts
+  }
+
+  facts.add(hitLineFact(hit.file, hit.line))
+
+  for (const span of hit.exactSpans ?? []) {
+    if (
+      Number.isSafeInteger(span?.startByte) &&
+      Number.isSafeInteger(span?.endByte) &&
+      span.startByte >= 0 &&
+      span.endByte > span.startByte
+    ) {
+      facts.add(exactSpanFact(hit.file, span.startByte, span.endByte))
+    }
+  }
+
+  return facts
+}
+
+function positiveFactsForHits(hits) {
+  const facts = new Set()
+
+  for (const hit of hits?.values?.() ?? []) {
+    for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+  }
+
+  return facts
+}
+
+function negativeFactsForResults(results, target, glob) {
+  const facts = new Set()
+
+  for (const result of results ?? []) {
+    if (
+      result?.scanComplete === true &&
+      !result?.error &&
+      !result?.timedOut &&
+      Array.isArray(result?.matches) &&
+      result.matches.length === 0
+    ) {
+      facts.add(negativeQueryFact(result, target, glob))
+    }
+  }
+
+  return facts
+}
+
+function negativeFactsForDiscoveryResults(results, target, glob) {
+  const facts = new Set()
+
+  for (const result of results ?? []) {
+    if (
+      result?.scanComplete === true &&
+      !result?.error &&
+      !result?.timedOut &&
+      Array.isArray(result?.files) &&
+      result.files.length === 0
+    ) {
+      facts.add(negativeQueryFact(result, target, glob))
+    }
+  }
+
+  return facts
+}
+
+function factSeen(seenFacts, fact) {
+  return seenFacts instanceof Set && seenFacts.has(fact)
+}
+
+function hitHasNovelPositiveFact(hit, seenFacts) {
+  for (const fact of positiveFactsForHit(hit)) {
+    if (!factSeen(seenFacts, fact)) return true
+  }
+
+  return false
+}
+
+function hitFactsAlreadySeen(hit, seenFacts) {
+  const facts = positiveFactsForHit(hit)
+  if (facts.size < 1) return false
+
+  for (const fact of facts) {
+    if (!factSeen(seenFacts, fact)) return false
+  }
+
+  return true
+}
+
+function countHitsAlreadySeen(hits, seenFacts) {
+  let count = 0
+
+  for (const hit of hits?.values?.() ?? []) {
+    if (hitFactsAlreadySeen(hit, seenFacts)) count += 1
+  }
+
+  return count
+}
+
+function novelEvidenceFacts(state, facts) {
+  const novel = new Set()
+  let prior = 0
+
+  for (const fact of facts ?? []) {
+    if (state?.evidenceLedger?.has(fact)) prior += 1
+    else novel.add(fact)
+  }
+
+  return { novel, prior }
+}
+
+function novelRouteFacts(state, facts) {
+  const novel = new Set()
+  let prior = 0
+
+  for (const fact of facts ?? []) {
+    if (state?.routeLedger?.has(fact)) prior += 1
+    else novel.add(fact)
+  }
+
+  return { novel, prior }
+}
+
+function rememberEvidenceFacts(state, facts) {
+  if (!state?.evidenceLedger) return { added: 0, saturated: false }
+
+  let added = 0
+
+  for (const fact of facts ?? []) {
+    if (state.evidenceLedger.has(fact)) continue
+
+    if (state.evidenceLedger.size >= EVIDENCE_LEDGER_MAX_FACTS_PER_TURN) {
+      state.ledgerSaturated = true
+      return { added, saturated: true }
+    }
+
+    state.evidenceLedger.add(fact)
+    added += 1
+  }
+
+  return {
+    added,
+    saturated: state.ledgerSaturated === true,
+  }
+}
+
+function rememberRouteFacts(state, facts) {
+  if (!state?.routeLedger) return { added: 0, saturated: false }
+
+  let added = 0
+
+  for (const fact of facts ?? []) {
+    if (state.routeLedger.has(fact)) continue
+    if (state.routeLedger.size >= ROUTE_LEDGER_MAX_FACTS_PER_TURN) {
+      return { added, saturated: true }
+    }
+
+    state.routeLedger.add(fact)
+    added += 1
+  }
+
+  return { added, saturated: false }
+}
+
+function rememberContextualizedHitLines(state, keys) {
+  if (!state?.contextualizedHitLines) return
+
+  for (const key of keys ?? []) {
+    if (state.contextualizedHitLines.size >= CONTEXTUALIZED_HITS_MAX_PER_TURN) {
+      return
+    }
+
+    state.contextualizedHitLines.add(key)
+  }
+}
+
+function evidenceFactKind(fact) {
+  if (typeof fact !== "string") return "other"
+  const pos = fact.indexOf("\0")
+  return pos >= 0 ? fact.slice(0, pos) : fact
+}
+
+function summarizeEvidenceFacts(facts) {
+  const result = {
+    positive: 0,
+    context: 0,
+    negative: 0,
+    structural: 0,
+    routing: 0,
+    other: 0,
+  }
+
+  for (const fact of facts ?? []) {
+    const kind = evidenceFactKind(fact)
+
+    if (kind === "hit" || kind === "span") result.positive += 1
+    else if (kind === "line") result.context += 1
+    else if (kind === "negative") result.negative += 1
+    else if (kind === "scope" || kind === "group" || kind === "witness") {
+      result.structural += 1
+    } else if (kind === "index_summary" || kind === "index_file") {
+      result.routing += 1
+    } else {
+      result.other += 1
+    }
+  }
+
+  return result
 }
 
 async function safeTarget(root, raw = ".") {
@@ -341,8 +741,330 @@ function exactSpansFromRgMatch(data, queryIndex) {
   return spans
 }
 
-function runQuery(root, query, queryIndex, target, glob) {
+function exactMatchTextsFromRgMatch(data) {
+  const submatches = data?.submatches
+  if (!Array.isArray(submatches)) return []
+
+  const texts = []
+  for (const submatch of submatches) {
+    const text = submatch?.match?.text
+    if (typeof text === "string" && text.length > 0) texts.push(text)
+  }
+
+  return texts
+}
+
+function runFileDiscovery(root, query, queryIndex, target, glob) {
   return new Promise((resolve) => {
+    const args = [
+      "--files-with-matches",
+      "--null",
+      "--color",
+      "never",
+    ]
+
+    for (const pattern of EXCLUDES) args.push("-g", pattern)
+    if (glob) args.push("-g", glob)
+    args.push("--", query, target)
+
+    const child = spawn("rg", args, {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    const files = []
+    let stdout = ""
+    let stderr = ""
+    let timedOut = false
+    let scanCapped = false
+    let settled = false
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, QUERY_TIMEOUT_MS)
+
+    function consume(file) {
+      if (!file || scanCapped) return
+
+      // Exactly FILE_DISCOVERY_CAP_PER_QUERY files are complete; observing
+      // one more file proves that lexical file discovery is truncated.
+      if (files.length >= FILE_DISCOVERY_CAP_PER_QUERY) {
+        scanCapped = true
+        child.kill("SIGTERM")
+        return
+      }
+
+      files.push(file)
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8")
+
+      while (true) {
+        const pos = stdout.indexOf("\0")
+        if (pos < 0) break
+        consume(stdout.slice(0, pos))
+        stdout = stdout.slice(pos + 1)
+      }
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 3000) stderr += chunk.toString("utf8")
+    })
+
+    child.on("error", (error) => {
+      clearTimeout(timer)
+      if (settled) return
+      settled = true
+
+      resolve({
+        query,
+        queryIndex,
+        files,
+        timedOut,
+        scanCapped,
+        error: String(error?.message ?? error),
+        scanComplete: false,
+      })
+    })
+
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      if (!scanCapped && stdout.length > 0) consume(stdout.replace(/\0+$/, ""))
+      if (settled) return
+      settled = true
+
+      let error = null
+      if (!timedOut && !scanCapped && code !== 0 && code !== 1) {
+        error = stderr.trim() || `rg exited with status ${code}`
+      }
+
+      resolve({
+        query,
+        queryIndex,
+        files,
+        timedOut,
+        scanCapped,
+        error,
+        scanComplete: !timedOut && !scanCapped && !error,
+      })
+    })
+  })
+}
+
+function queryPathTokens(query) {
+  const chunks = String(query ?? "").match(/[A-Za-z_][A-Za-z0-9_-]{2,}/g)
+  if (!chunks) return []
+
+  const tokens = new Set()
+
+  for (const chunk of chunks) {
+    const whole = chunk.toLowerCase()
+    if (whole.length >= 3) tokens.add(whole)
+
+    const split = chunk
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[_\-\s]+/)
+
+    for (const part of split) {
+      if (part.length >= 3) tokens.add(part.toLowerCase())
+    }
+  }
+
+  return [...tokens].slice(0, 8)
+}
+
+function pathAffinity(file, queryIndices, queryTokensByIndex) {
+  const normalized = evidenceFileKey(file).toLowerCase()
+  const base = path.posix.basename(normalized)
+  const stem = base.replace(/\.[^.]+$/, "")
+  let score = 0
+
+  for (const queryIndex of queryIndices ?? []) {
+    for (const token of queryTokensByIndex.get(queryIndex) ?? []) {
+      if (stem === token) score += 4
+      else if (stem.includes(token)) score += 2
+      else if (normalized.includes(token)) score += 1
+    }
+  }
+
+  return score
+}
+
+function rankDiscoveredFiles(discoveryResults) {
+  const byFile = new Map()
+  const queryFileCounts = new Map()
+  const queryTokensByIndex = new Map(
+    (discoveryResults ?? []).map((result) => [
+      result.queryIndex,
+      queryPathTokens(result.query),
+    ]),
+  )
+
+  for (const result of discoveryResults ?? []) {
+    const unique = [...new Set(result?.files ?? [])]
+    queryFileCounts.set(result.queryIndex, unique.length)
+
+    for (const file of unique) {
+      let entry = byFile.get(file)
+
+      if (!entry) {
+        entry = {
+          file,
+          queries: new Set(),
+          coverage: 0,
+          pathAffinity: 0,
+          rarity: 0,
+        }
+        byFile.set(file, entry)
+      }
+
+      entry.queries.add(result.queryIndex)
+    }
+  }
+
+  for (const entry of byFile.values()) {
+    entry.coverage = entry.queries.size
+    entry.pathAffinity = pathAffinity(
+      entry.file,
+      entry.queries,
+      queryTokensByIndex,
+    )
+    entry.rarity = [...entry.queries].reduce((score, queryIndex) => {
+      const count = Math.max(1, queryFileCounts.get(queryIndex) ?? 1)
+      return score + 1 / count
+    }, 0)
+  }
+
+  // Routing-only rank: direct lexical candidates are never filtered out.
+  // Query coverage is strongest, path affinity is a cheap task-local prior,
+  // and query rarity breaks broad-query ties without using raw line counts.
+  return [...byFile.values()].sort(
+    (a, b) =>
+      b.coverage - a.coverage ||
+      b.pathAffinity - a.pathAffinity ||
+      b.rarity - a.rarity ||
+      a.file.localeCompare(b.file),
+  )
+}
+
+function selectAutoRefineFiles(rankedFiles, discoveryResults) {
+  const selected = new Set()
+  const coveredQueries = new Set()
+  const activeQueries = (discoveryResults ?? [])
+    .filter((result) => Array.isArray(result?.files) && result.files.length > 0)
+    .sort(
+      (a, b) =>
+        a.files.length - b.files.length || a.queryIndex - b.queryIndex,
+    )
+
+  // Cover every non-empty query first, starting with the rarest query. With
+  // MAX_QUERIES=4 and AUTO_REFINE_MAX_FILES=4 this guarantees one direct
+  // lexical candidate per query whenever discovery saw one.
+  for (const result of activeQueries) {
+    if (selected.size >= AUTO_REFINE_MAX_FILES) break
+    if (coveredQueries.has(result.queryIndex)) continue
+
+    const candidate = rankedFiles.find(
+      (entry) =>
+        entry.queries.has(result.queryIndex) && !selected.has(entry.file),
+    )
+
+    if (candidate) {
+      selected.add(candidate.file)
+      for (const queryIndex of candidate.queries) {
+        coveredQueries.add(queryIndex)
+      }
+    }
+  }
+
+  for (const entry of rankedFiles) {
+    if (selected.size >= AUTO_REFINE_MAX_FILES) break
+    if (selected.has(entry.file)) continue
+    selected.add(entry.file)
+    for (const queryIndex of entry.queries) coveredQueries.add(queryIndex)
+  }
+
+  return rankedFiles.filter((entry) => selected.has(entry.file))
+}
+
+function discoverySummaryFor(results) {
+  return (results ?? []).map((result) => {
+    let count = String(result.files?.length ?? 0)
+    if (result.scanCapped) count = `>=${FILE_DISCOVERY_CAP_PER_QUERY}`
+
+    let state = "complete"
+    if (result.timedOut) state = "timeout"
+    else if (result.scanCapped) state = "scan_cap"
+    else if (result.error) state = "error"
+
+    const errorDetail = result.error
+      ? ` error=${JSON.stringify(clipLine(result.error, 240))}`
+      : ""
+
+    return `Q${result.queryIndex + 1} files=${count} discovery=${state}${errorDetail}`
+  })
+}
+
+function renderRouteMap(rankedFiles, selectedFiles, bodyBudgetBytes) {
+  const budget = Math.min(ROUTE_BODY_BUDGET_BYTES, bodyBudgetBytes)
+  const body = []
+  let bodyBytes = 0
+
+  function push(line) {
+    const cost = bytes(line + "\n")
+    if (bodyBytes + cost > budget) return false
+    body.push(line)
+    bodyBytes += cost
+    return true
+  }
+
+  const selectedSet = new Set(selectedFiles.map((entry) => entry.file))
+  const retained = Math.max(0, rankedFiles.length - selectedSet.size)
+
+  push(
+    `ROUTE strategy=query_coverage_path_rarity candidate_files=${rankedFiles.length} selected_files=${selectedSet.size}`,
+  )
+
+  let rank = 0
+  for (const entry of selectedFiles) {
+    rank += 1
+
+    const q = [...entry.queries]
+      .sort((a, b) => a - b)
+      .map((value) => `Q${value + 1}`)
+      .join(",")
+
+    if (!push(
+      `  ${rank}. ${entry.file} [${q}] coverage=${entry.coverage} path=${entry.pathAffinity} rarity=${entry.rarity.toFixed(4)}`,
+    )) break
+  }
+
+  if (retained > 0) {
+    push(`  +${retained} lexical candidates retained_unread`)
+  }
+
+  return { body, bodyBytes, retained }
+}
+
+function runQuery(root, query, queryIndex, targets, glob) {
+  return new Promise((resolve) => {
+    const searchTargets = Array.isArray(targets) ? targets : [targets]
+
+    if (searchTargets.length < 1) {
+      resolve({
+        query,
+        queryIndex,
+        matches: [],
+        timedOut: false,
+        scanCapped: false,
+        error: null,
+        scanComplete: true,
+      })
+      return
+    }
+
     const args = [
       "--json",
       "--color",
@@ -354,7 +1076,7 @@ function runQuery(root, query, queryIndex, target, glob) {
 
     for (const pattern of EXCLUDES) args.push("-g", pattern)
     if (glob) args.push("-g", glob)
-    args.push("--", query, target)
+    args.push("--", query, ...searchTargets)
 
     const child = spawn("rg", args, {
       cwd: root,
@@ -389,8 +1111,8 @@ function runQuery(root, query, queryIndex, target, glob) {
       const lineNo = event.data?.line_number
       if (typeof file !== "string" || !Number.isInteger(lineNo)) return
 
-      // Exactly DISCOVERY_CAP_PER_QUERY hits are complete; the next hit proves truncation.
-      if (matches.length >= DISCOVERY_CAP_PER_QUERY) {
+      // Exactly LINE_HIT_CAP_PER_QUERY hits are complete; the next hit proves truncation.
+      if (matches.length >= LINE_HIT_CAP_PER_QUERY) {
         scanCapped = true
         child.kill("SIGTERM")
         return
@@ -402,6 +1124,7 @@ function runQuery(root, query, queryIndex, target, glob) {
         text: event.data?.lines?.text ?? "",
         queryIndex,
         exactSpans: exactSpansFromRgMatch(event.data, queryIndex),
+        matchTexts: exactMatchTextsFromRgMatch(event.data),
       })
     }
 
@@ -881,6 +1604,7 @@ function validateEvidenceGroup(group) {
 
 async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
   const core = []
+  const facts = new Set()
   let coreBytes = 0
 
   function pushCore(line) {
@@ -929,6 +1653,8 @@ async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
       }
     }
 
+    facts.add(groupFact(group))
+
     for (const variant of group.variants) {
       const vq = queryLabels(variant.queries)
       const same = variant.subject_text === variant.statement_text
@@ -953,6 +1679,8 @@ async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
           reason: "witness_output_budget",
         }
       }
+
+      facts.add(witnessFact(group, variant))
     }
   }
 
@@ -992,6 +1720,10 @@ async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
       body.push(...block)
       bodyBytes += blockBytes
       contextSamples += 1
+
+      for (let n = start; n <= end; n++) {
+        facts.add(sourceLineFact(group.file, n))
+      }
     }
   }
 
@@ -1002,6 +1734,7 @@ async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
 
   return {
     body,
+    facts,
     bodyBytes,
     coreBytes,
     complete: true,
@@ -1082,10 +1815,602 @@ async function renderEvidence(root, hits, bodyBudgetBytes) {
   return { body, shown, bodyBytes }
 }
 
+function mergeLineRanges(ranges) {
+  const sorted = ranges
+    .filter(
+      (range) =>
+        Number.isInteger(range?.start) &&
+        Number.isInteger(range?.end) &&
+        range.start > 0 &&
+        range.end >= range.start,
+    )
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  const merged = []
+
+  for (const range of sorted) {
+    const last = merged[merged.length - 1]
+    if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end)
+    else merged.push({ ...range })
+  }
+
+  return merged
+}
+
+
+function addLineRange(rangesByFile, file, start, end) {
+  const key = evidenceFileKey(file)
+  if (!rangesByFile.has(key)) rangesByFile.set(key, [])
+  rangesByFile.get(key).push({ start, end })
+}
+
+function subtractLineRanges(ranges, exclusions) {
+  const excluded = mergeLineRanges(exclusions ?? [])
+  if (excluded.length < 1) return mergeLineRanges(ranges ?? [])
+
+  const result = []
+
+  for (const range of mergeLineRanges(ranges ?? [])) {
+    let cursor = range.start
+
+    for (const cut of excluded) {
+      if (cut.end < cursor) continue
+      if (cut.start > range.end) break
+
+      if (cut.start > cursor) {
+        result.push({
+          start: cursor,
+          end: Math.min(range.end, cut.start - 1),
+        })
+      }
+
+      cursor = Math.max(cursor, cut.end + 1)
+      if (cursor > range.end) break
+    }
+
+    if (cursor <= range.end) result.push({ start: cursor, end: range.end })
+  }
+
+  return result
+}
+
+function lineNumbersToRanges(numbers) {
+  const sorted = [...new Set(numbers)]
+    .filter((line) => Number.isInteger(line) && line > 0)
+    .sort((a, b) => a - b)
+
+  const ranges = []
+
+  for (const line of sorted) {
+    const last = ranges[ranges.length - 1]
+
+    if (last && line === last.end + 1) last.end = line
+    else ranges.push({ start: line, end: line })
+  }
+
+  return ranges
+}
+
+function hitLookupByFileLine(hits) {
+  const lookup = new Map()
+
+  for (const [key, hit] of hits ?? []) {
+    const fileKey = evidenceFileKey(hit.file)
+    let byLine = lookup.get(fileKey)
+
+    if (!byLine) {
+      byLine = new Map()
+      lookup.set(fileKey, byLine)
+    }
+
+    byLine.set(hit.line, { key, ...hit })
+  }
+
+  return lookup
+}
+
+async function renderNovelRawEvidence(
+  root,
+  hits,
+  bodyBudgetBytes,
+  seenFacts = null,
+  excludedRangesByFile = new Map(),
+  contextualizedHitLines = null,
+) {
+  const byFile = new Map()
+
+  for (const [key, hit] of hits) {
+    if (!byFile.has(hit.file)) byFile.set(hit.file, [])
+    byFile.get(hit.file).push({ key, ...hit })
+  }
+
+  const cache = new Map()
+  const body = []
+  const shown = new Set()
+  const facts = new Set()
+  let bodyBytes = 0
+  let emittedLines = 0
+  let skippedPriorLines = 0
+  let suppressedContextAnchors = 0
+
+  function push(line) {
+    const cost = bytes(line + "\n")
+    if (bodyBytes + cost > bodyBudgetBytes) return false
+    body.push(line)
+    bodyBytes += cost
+    return true
+  }
+
+  outer:
+  for (const [file, fileHits] of [...byFile.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const lines = await loadLines(root, file, cache)
+    const fileKey = evidenceFileKey(file)
+    const exclusions = excludedRangesByFile.get(fileKey) ?? []
+
+    if (!lines) {
+      for (const hit of fileHits.sort((a, b) => a.line - b.line)) {
+        const excluded = exclusions.some(
+          (range) => hit.line >= range.start && hit.line <= range.end,
+        )
+        if (excluded) continue
+
+        const alreadyContextualized =
+          contextualizedHitLines instanceof Set &&
+          contextualizedHitLines.has(
+            contextualizedHitLineKey(file, hit.line),
+          )
+        const lineFact = sourceLineFact(file, hit.line)
+        const novelLine = !factSeen(seenFacts, lineFact)
+        const novelHit = hitHasNovelPositiveFact(hit, seenFacts)
+
+        // A prior FOCUSED scope already supplied source context for this hit.
+        // A different regex matching the same hit must not manufacture
+        // progress by reopening the same source location.
+        if (alreadyContextualized && !novelHit) {
+          suppressedContextAnchors += 1
+          skippedPriorLines += 1
+          continue
+        }
+
+        if (!novelLine && !novelHit) {
+          skippedPriorLines += 1
+          continue
+        }
+
+        const q = [...hit.queries]
+          .sort((a, b) => a - b)
+          .map((x) => `Q${x + 1}`)
+          .join(",")
+
+        if (!push(`${file}:${hit.line} [${q}] ${clipLine(hit.text)}`)) break outer
+
+        facts.add(lineFact)
+        for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+        shown.add(hit.key)
+        emittedLines += 1
+      }
+      continue
+    }
+
+    const hitByLine = new Map()
+    for (const hit of fileHits) hitByLine.set(hit.line, hit)
+
+    // Context expansion is one-shot per hit line. Once a FOCUSED scope has
+    // contextualized a hit, later regex variants matching the same hit may
+    // still contribute a genuinely new positive fact, but they cannot use
+    // that old hit as an anchor to expose fringe source lines outside the
+    // already-shown scope.
+    const contextAnchorLines = []
+    const forcedNovelHitLines = []
+
+    for (const hit of fileHits) {
+      const excluded = exclusions.some(
+        (range) => hit.line >= range.start && hit.line <= range.end,
+      )
+      if (excluded) continue
+
+      const alreadyContextualized =
+        contextualizedHitLines instanceof Set &&
+        contextualizedHitLines.has(
+          contextualizedHitLineKey(file, hit.line),
+        )
+
+      if (alreadyContextualized) {
+        suppressedContextAnchors += 1
+        if (hitHasNovelPositiveFact(hit, seenFacts)) {
+          forcedNovelHitLines.push(hit.line)
+        }
+        continue
+      }
+
+      contextAnchorLines.push(hit.line)
+    }
+
+    const baseRanges =
+      contextAnchorLines.length > 0
+        ? buildRanges(contextAnchorLines, lines.length)
+        : []
+    const availableRanges = subtractLineRanges(baseRanges, exclusions)
+    const selectedLines = new Set(forcedNovelHitLines)
+
+    for (const range of availableRanges) {
+      for (let n = range.start; n <= range.end; n++) {
+        const hit = hitByLine.get(n)
+        const lineFact = sourceLineFact(file, n)
+        const novelLine = !factSeen(seenFacts, lineFact)
+        const novelHit = hit ? hitHasNovelPositiveFact(hit, seenFacts) : false
+
+        if (novelLine || novelHit) selectedLines.add(n)
+        else skippedPriorLines += 1
+      }
+    }
+
+    for (const range of lineNumbersToRanges(selectedLines)) {
+      if (!push(`--- ${file}:${range.start}-${range.end} ---`)) break outer
+
+      for (let n = range.start; n <= range.end; n++) {
+        const hit = hitByLine.get(n)
+        let prefix = " "
+
+        if (hit) {
+          const q = [...hit.queries]
+            .sort((a, b) => a - b)
+            .map((x) => `Q${x + 1}`)
+            .join(",")
+          prefix = `>[${q}]`
+        }
+
+        if (!push(`${prefix.padEnd(9)} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`)) {
+          break outer
+        }
+
+        facts.add(sourceLineFact(file, n))
+        emittedLines += 1
+
+        if (hit) {
+          for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+          shown.add(hit.key)
+        }
+      }
+    }
+  }
+
+  return {
+    body,
+    shown,
+    facts,
+    bodyBytes,
+    emittedLines,
+    skippedPriorLines,
+    suppressedContextAnchors,
+  }
+}
+
+function focusedRoleScore(role) {
+  if (role === "call") return 5
+  if (role === "assignment") return 4
+  if (role === "definition") return 3
+  if (role === "import") return 2
+  if (role === "reference") return 1
+
+  // Unknown structural roles stay discovery-only. Known imports/references
+  // are weak rather than impossible candidates: for wiring/type-usage tasks
+  // they can be exactly the behavior the user is asking about.
+  return 0
+}
+
+function focusedScopesFromGroups(groups) {
+  const scopes = new Map()
+
+  for (const group of groups ?? []) {
+    if (!validateEvidenceGroup(group)) continue
+    if (group.symbol_kind === "module" || group.symbol_name === "<module>") continue
+    if (
+      !Number.isInteger(group.start_line) ||
+      !Number.isInteger(group.end_line) ||
+      group.start_line < 1 ||
+      group.end_line < group.start_line
+    ) continue
+
+    const key =
+      `${group.file}\0${group.start_line}\0${group.end_line}` +
+      `\0${group.symbol_kind}\0${group.symbol_name}`
+    let scope = scopes.get(key)
+
+    if (!scope) {
+      scope = {
+        file: group.file,
+        start: group.start_line,
+        end: group.end_line,
+        symbolKind: group.symbol_kind,
+        symbolName: group.symbol_name,
+        hitLines: new Set(),
+        anchors: new Set(),
+        roles: new Set(),
+        roleScore: 0,
+      }
+      scopes.set(key, scope)
+    }
+
+    if (group.anchor) scope.anchors.add(group.anchor)
+    if (group.role) {
+      scope.roles.add(group.role)
+      scope.roleScore = Math.max(scope.roleScore, focusedRoleScore(group.role))
+    }
+    for (const line of group.hit_lines ?? []) {
+      if (Number.isInteger(line) && line > 0) scope.hitLines.add(line)
+    }
+  }
+
+  return [...scopes.values()]
+    .filter((scope) => scope.hitLines.size > 0 && scope.roleScore > 0)
+    .sort(
+      (a, b) =>
+        b.roleScore - a.roleScore ||
+        b.hitLines.size - a.hitLines.size ||
+        a.file.localeCompare(b.file) ||
+        a.start - b.start ||
+        a.end - b.end,
+    )
+}
+
+async function renderFocusedSupplement(
+  root,
+  groups,
+  maxBytes,
+  hits,
+  seenFacts = null,
+  contextualizedHitLines = null,
+) {
+  const budget = Math.min(FOCUSED_SUPPLEMENT_MAX_BYTES, Math.max(0, maxBytes))
+  const allCandidateScopes = focusedScopesFromGroups(groups)
+  const reusableScopes = []
+  const eligibleScopes = []
+
+  for (const scope of allCandidateScopes) {
+    const scopeAlreadySeen = factSeen(seenFacts, scopeFact(scope))
+    const hasUncontextualizedHit = [...scope.hitLines].some(
+      (line) =>
+        !(contextualizedHitLines instanceof Set) ||
+        !contextualizedHitLines.has(
+          contextualizedHitLineKey(scope.file, line),
+        ),
+    )
+
+    if (scopeAlreadySeen || !hasUncontextualizedHit) {
+      reusableScopes.push(scope)
+      continue
+    }
+
+    eligibleScopes.push(scope)
+  }
+
+  const scopes = eligibleScopes.slice(0, FOCUSED_MAX_SCOPES)
+
+  if (budget < FOCUSED_MIN_SUPPLEMENT_BYTES || scopes.length < 1) {
+    let reason = "supplement_budget"
+
+    if (allCandidateScopes.length < 1) reason = "no_behavior_scope"
+    else if (eligibleScopes.length < 1) reason = "scope_already_contextualized"
+
+    return {
+      body: [],
+      facts: new Set(),
+      bodyBytes: 0,
+      complete: false,
+      scopeCount: allCandidateScopes.length,
+      selectedScopeCount: scopes.length,
+      reusedScopeCount: reusableScopes.length,
+      fullScopes: 0,
+      partialScopes: 0,
+      radius: null,
+      coveredRangesByFile: new Map(),
+      coveredHitKeys: new Set(),
+      shownHitKeys: new Set(),
+      contextualizedHitLines: new Set(),
+      emittedLines: 0,
+      reason,
+    }
+  }
+
+  const cache = new Map()
+  const hitLookup = hitLookupByFileLine(hits)
+
+  async function build({ allowFull, radius }) {
+    const body = []
+    const facts = new Set()
+    const coveredRangesByFile = new Map()
+    const coveredHitKeys = new Set()
+    const shownHitKeys = new Set()
+    const contextualized = new Set()
+    let bodyBytes = 0
+    let fullScopes = 0
+    let partialScopes = 0
+    let emittedLines = 0
+
+    function push(line) {
+      const cost = bytes(line + "\n")
+      if (bodyBytes + cost > budget) return false
+      body.push(line)
+      bodyBytes += cost
+      return true
+    }
+
+    for (const scope of scopes) {
+      const lines = await loadLines(root, scope.file, cache)
+      if (!lines || lines.length < 1) {
+        return { complete: false, reason: "file_unavailable" }
+      }
+
+      const start = Math.max(1, Math.min(scope.start, lines.length))
+      const end = Math.max(start, Math.min(scope.end, lines.length))
+      const useFull = allowFull && end - start + 1 <= FOCUSED_FULL_SCOPE_MAX_LINES
+      const anchors = [...scope.anchors].slice(0, 4)
+      const scopeKey = scopeFact(scope)
+      const fileKey = evidenceFileKey(scope.file)
+      const byLine = hitLookup.get(fileKey) ?? new Map()
+
+      let ranges
+      if (useFull) {
+        ranges = [{ start, end }]
+      } else {
+        const headerEnd = Math.min(end, start + FOCUSED_SCOPE_HEADER_LINES - 1)
+        ranges = mergeLineRanges([
+          { start, end: headerEnd },
+          ...[...scope.hitLines].map((line) => ({
+            start: Math.max(start, line - radius),
+            end: Math.min(end, line + radius),
+          })),
+        ])
+      }
+
+      const selectedLines = []
+
+      for (const range of ranges) {
+        for (let n = range.start; n <= range.end; n++) {
+          const hit = byLine.get(n)
+          const lineNovel = !factSeen(seenFacts, sourceLineFact(scope.file, n))
+          const hitNovel = hit ? hitHasNovelPositiveFact(hit, seenFacts) : false
+
+          if (lineNovel || hitNovel) selectedLines.push(n)
+        }
+      }
+
+      const selectedRanges = lineNumbersToRanges(selectedLines)
+      const priorLinesOmitted =
+        ranges.reduce((total, range) => total + range.end - range.start + 1, 0) -
+        selectedLines.length
+
+      if (!push(
+        `SCOPE_CONTEXT ${scope.file}:${start}-${end} ` +
+          `symbol=${JSON.stringify(scope.symbolName)} kind=${scope.symbolKind} ` +
+          `hits=${scope.hitLines.size} context=${useFull ? "full_turn" : `window±${radius}`}` +
+          ` prior_lines_omitted=${Math.max(0, priorLinesOmitted)}` +
+          (anchors.length > 0 ? ` anchors=${JSON.stringify(anchors)}` : ""),
+      )) {
+        return { complete: false, reason: "supplement_budget" }
+      }
+
+      facts.add(scopeKey)
+
+      if (useFull) fullScopes += 1
+      else partialScopes += 1
+
+      let previousEnd = null
+
+      for (const range of selectedRanges) {
+        if (previousEnd !== null && range.start > previousEnd + 1) {
+          const omitted = range.start - previousEnd - 1
+          if (!push(`  … prior/unsampled scope context omitted ${omitted} lines …`)) {
+            return { complete: false, reason: "supplement_budget" }
+          }
+        }
+
+        for (let n = range.start; n <= range.end; n++) {
+          const hit = byLine.get(n)
+          let prefix = " "
+
+          if (hit) {
+            const q = [...hit.queries]
+              .sort((a, b) => a - b)
+              .map((x) => `Q${x + 1}`)
+              .join(",")
+            prefix = `>[${q}]`
+          }
+
+          if (!push(
+            `  ${prefix.padEnd(9)} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`,
+          )) {
+            return { complete: false, reason: "supplement_budget" }
+          }
+
+          addLineRange(coveredRangesByFile, scope.file, n, n)
+          facts.add(sourceLineFact(scope.file, n))
+          emittedLines += 1
+
+          if (hit) {
+            coveredHitKeys.add(hit.key)
+            shownHitKeys.add(hit.key)
+            for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+          }
+        }
+
+        previousEnd = range.end
+      }
+
+      for (const [hitKey, hit] of byLine) {
+        if (hit.line < start || hit.line > end) continue
+
+        coveredHitKeys.add(hit.key)
+        contextualized.add(contextualizedHitLineKey(hit.file, hit.line))
+      }
+    }
+
+    for (const [file, ranges] of coveredRangesByFile) {
+      coveredRangesByFile.set(file, mergeLineRanges(ranges))
+    }
+
+    return {
+      body,
+      facts,
+      bodyBytes,
+      complete: true,
+      scopeCount: allCandidateScopes.length,
+      selectedScopeCount: scopes.length,
+      reusedScopeCount: reusableScopes.length,
+      fullScopes,
+      partialScopes,
+      radius,
+      coveredRangesByFile,
+      coveredHitKeys,
+      shownHitKeys,
+      contextualizedHitLines: contextualized,
+      emittedLines,
+      reason: null,
+    }
+  }
+
+  const strategies = [
+    { allowFull: true, radius: FOCUSED_WINDOW_RADII[0] },
+    ...FOCUSED_WINDOW_RADII.map((radius) => ({ allowFull: false, radius })),
+  ]
+  let fallback = null
+
+  for (const strategy of strategies) {
+    const rendered = await build(strategy)
+    fallback = rendered
+
+    if (
+      rendered.complete &&
+      rendered.bodyBytes >= FOCUSED_MIN_SUPPLEMENT_BYTES
+    ) {
+      return rendered
+    }
+  }
+
+  return {
+    body: fallback?.body ?? [],
+    facts: fallback?.facts ?? new Set(),
+    bodyBytes: fallback?.bodyBytes ?? 0,
+    complete: false,
+    scopeCount: allCandidateScopes.length,
+    selectedScopeCount: scopes.length,
+    reusedScopeCount: reusableScopes.length,
+    fullScopes: fallback?.fullScopes ?? 0,
+    partialScopes: fallback?.partialScopes ?? 0,
+    radius: fallback?.radius ?? null,
+    coveredRangesByFile: fallback?.coveredRangesByFile ?? new Map(),
+    coveredHitKeys: fallback?.coveredHitKeys ?? new Set(),
+    shownHitKeys: fallback?.shownHitKeys ?? new Set(),
+    contextualizedHitLines: fallback?.contextualizedHitLines ?? new Set(),
+    emittedLines: fallback?.emittedLines ?? 0,
+    reason: fallback?.reason ?? "supplement_budget",
+  }
+}
+
 function querySummaryFor(results) {
   return results.map((result) => {
     let count = String(result.matches.length)
-    if (result.scanCapped) count = `>=${DISCOVERY_CAP_PER_QUERY}`
+    if (result.scanCapped) count = `>=${LINE_HIT_CAP_PER_QUERY}`
 
     let state = "complete"
     if (result.timedOut) state = "timeout"
@@ -1096,7 +2421,7 @@ function querySummaryFor(results) {
       ? ` error=${JSON.stringify(clipLine(result.error, 240))}`
       : ""
 
-    return `Q${result.queryIndex + 1} hits=${count} state=${state}${errorDetail}`
+    return `Q${result.queryIndex + 1} selected_line_hits=${count} selected_scan=${state}${errorDetail}`
   })
 }
 
@@ -1110,14 +2435,102 @@ function exactSpansInResult(result) {
     : 0
 }
 
+function normalizeIndexFacetText(text) {
+  const normalized = String(text ?? "").replace(/\s+/g, " ").trim()
+  if (!normalized) return null
+  return normalized.length <= INDEX_FACET_TEXT_MAX
+    ? normalized
+    : normalized.slice(0, INDEX_FACET_TEXT_MAX) + " …"
+}
+
+function indexFacetStats(result) {
+  const facets = new Map()
+
+  for (const match of result?.matches ?? []) {
+    for (const rawText of match?.matchTexts ?? []) {
+      const text = normalizeIndexFacetText(rawText)
+      if (!text) continue
+
+      let entry = facets.get(text)
+      if (!entry) {
+        entry = {
+          text,
+          exactMatches: 0,
+          files: new Set(),
+          firstFile: null,
+          firstLine: null,
+          sample: null,
+        }
+        facets.set(text, entry)
+      }
+
+      entry.exactMatches += 1
+      if (typeof match?.file === "string") entry.files.add(match.file)
+
+      const line = match?.line
+      const shouldReplace =
+        entry.firstFile == null ||
+        String(match.file ?? "").localeCompare(String(entry.firstFile)) < 0 ||
+        (match.file === entry.firstFile &&
+          Number.isInteger(line) &&
+          (!Number.isInteger(entry.firstLine) || line < entry.firstLine))
+
+      if (shouldReplace) {
+        entry.firstFile = match?.file ?? null
+        entry.firstLine = Number.isInteger(line) ? line : null
+        entry.sample = clipLine(match?.text, 120)
+      }
+    }
+  }
+
+  return [...facets.values()]
+}
+
+function selectIndexFacets(facets) {
+  if (!Array.isArray(facets) || facets.length < 1) {
+    return { dominant: null, discriminative: null }
+  }
+
+  const dominant = [...facets].sort(
+    (a, b) =>
+      b.exactMatches - a.exactMatches ||
+      b.files.size - a.files.size ||
+      a.text.localeCompare(b.text),
+  )[0]
+
+  const alternatives = facets.filter((entry) => entry !== dominant)
+  const discriminative = alternatives.length
+    ? [...alternatives].sort((a, b) => {
+        // Repeated match text is a stronger routing signal than an accidental
+        // singleton created by a wide wildcard branch. Among repeated facets,
+        // prefer the smaller support: it is more discriminative, not more
+        // semantically important.
+        const aSingleton = a.exactMatches < 2 ? 1 : 0
+        const bSingleton = b.exactMatches < 2 ? 1 : 0
+
+        return (
+          aSingleton - bSingleton ||
+          a.exactMatches - b.exactMatches ||
+          a.files.size - b.files.size ||
+          a.text.localeCompare(b.text)
+        )
+      })[0]
+    : null
+
+  return { dominant, discriminative }
+}
+
 function renderSearchIndex(results, groups, bodyBudgetBytes) {
   const budget = Math.min(INDEX_BODY_BUDGET_BYTES, bodyBudgetBytes)
   const body = []
+  const facts = new Set()
   let bodyBytes = 0
   let complete = true
   let sampleCount = 0
   let structuralGroupsShown = 0
+  let discriminativeFacetsShown = 0
   const uniqueFiles = new Set()
+  const queryEntries = []
 
   function push(line) {
     const cost = bytes(line + "\n")
@@ -1131,7 +2544,6 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
     return true
   }
 
-  outer:
   for (const result of results) {
     const byFile = new Map()
 
@@ -1148,7 +2560,7 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
           lineHits: 0,
           exactMatches: 0,
           firstLine: match.line,
-          sample: clipLine(match.text, 160),
+          sample: clipLine(match.text, 120),
         }
         byFile.set(file, entry)
       }
@@ -1163,45 +2575,100 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
         (!Number.isInteger(entry.firstLine) || match.line < entry.firstLine)
       ) {
         entry.firstLine = match.line
-        entry.sample = clipLine(match.text, 160)
+        entry.sample = clipLine(match.text, 120)
       }
     }
 
     const exactMatches = exactSpansInResult(result)
-    if (
-      !push(
-        `Q${result.queryIndex + 1} index files=${byFile.size} ` +
-          `collected_lines=${result.matches.length} exact_matches=${exactMatches}`,
-      )
-    ) {
-      break
-    }
-
-    const ranked = [...byFile.values()].sort(
+    const facets = indexFacetStats(result)
+    const selectedFacets = selectIndexFacets(facets)
+    const rankedFiles = [...byFile.values()].sort(
       (a, b) =>
         b.exactMatches - a.exactMatches ||
         b.lineHits - a.lineHits ||
         a.file.localeCompare(b.file),
     )
 
-    const shown = ranked.slice(0, INDEX_MAX_FILES_PER_QUERY)
+    queryEntries.push({
+      result,
+      byFile,
+      exactMatches,
+      facets,
+      selectedFacets,
+      rankedFiles,
+    })
+  }
 
-    for (const entry of shown) {
-      const line =
-        `  ${entry.file} lines=${entry.lineHits} exact=${entry.exactMatches}` +
-        (Number.isInteger(entry.firstLine)
-          ? ` sample_line=${entry.firstLine}`
-          : "") +
-        (entry.sample
-          ? ` sample=${JSON.stringify(entry.sample)}`
-          : "")
+  // Pass 1: routing core. Every query gets visibility before any query gets
+  // extra file samples. This prevents an early broad query from consuming the
+  // index body budget and hiding later, narrower query evidence.
+  for (const entry of queryEntries) {
+    const { result, byFile, exactMatches, facets, selectedFacets } = entry
+    const dominant = selectedFacets.dominant
+    const discriminative = selectedFacets.discriminative
 
-      if (!push(line)) break outer
-      sampleCount += entry.sample ? 1 : 0
+    let line =
+      `Q${result.queryIndex + 1} index files=${byFile.size} ` +
+      `collected_lines=${result.matches.length} exact_matches=${exactMatches}`
+
+    if (dominant) {
+      line +=
+        ` dominant=${JSON.stringify(dominant.text)}` +
+        `:${dominant.exactMatches}`
     }
 
-    if (ranked.length > shown.length) {
-      if (!push(`  … +${ranked.length - shown.length} files`)) break
+    if (discriminative) {
+      line +=
+        ` route=${JSON.stringify(discriminative.text)}` +
+        `:${discriminative.exactMatches}` +
+        ` route_files=${discriminative.files.size}`
+
+      if (discriminative.firstFile) {
+        line += ` route_at=${discriminative.firstFile}`
+        if (Number.isInteger(discriminative.firstLine)) {
+          line += `:${discriminative.firstLine}`
+        }
+      }
+    }
+
+    if (facets.length > 0) line += ` facets=${facets.length}`
+
+    if (!push(line)) break
+
+    facts.add(indexSummaryFact(result, byFile.size, exactMatches))
+    if (dominant) facts.add(indexFacetFact("dominant", dominant))
+    if (discriminative) {
+      facts.add(indexFacetFact("discriminative", discriminative))
+      discriminativeFacetsShown += 1
+    }
+  }
+
+  // Pass 2: bounded file details, round-robin by rank across queries.
+  if (complete) {
+    for (let rank = 0; rank < INDEX_MAX_FILES_PER_QUERY; rank += 1) {
+      let addedAtThisRank = false
+
+      for (const entry of queryEntries) {
+        const fileEntry = entry.rankedFiles[rank]
+        if (!fileEntry) continue
+        addedAtThisRank = true
+
+        const line =
+          `  Q${entry.result.queryIndex + 1} ${fileEntry.file} ` +
+          `lines=${fileEntry.lineHits} exact=${fileEntry.exactMatches}` +
+          (Number.isInteger(fileEntry.firstLine)
+            ? ` sample_line=${fileEntry.firstLine}`
+            : "") +
+          (fileEntry.sample
+            ? ` sample=${JSON.stringify(fileEntry.sample)}`
+            : "")
+
+        if (!push(line)) break
+        facts.add(indexFileFact(fileEntry))
+        sampleCount += fileEntry.sample ? 1 : 0
+      }
+
+      if (!complete || !addedAtThisRank) break
     }
   }
 
@@ -1227,6 +2694,7 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
           `hits=${group.hit_count} variants=${group.variants?.length ?? 0}`
 
         if (!push(line)) break
+        facts.add(groupFact(group))
         structuralGroupsShown += 1
       }
 
@@ -1238,11 +2706,13 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
 
   return {
     body,
+    facts,
     bodyBytes,
     complete,
     fileCount: uniqueFiles.size,
     sampleCount,
     structuralGroupsShown,
+    discriminativeFacetsShown,
   }
 }
 
@@ -1472,7 +2942,24 @@ export default {
         name: "search",
         description:
           "Search the active project with 1 to 4 regular expressions in one call. " +
-          "Returns bounded line-numbered evidence and explicit completeness metadata.",
+          "Search first performs repository-wide file discovery, ranks lexical candidate files, " +
+          "and automatically refines up to four candidates in the same tool call. " +
+          "Returns bounded line-numbered evidence and explicit completeness metadata. " +
+          "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
+          "for the requested regex/path/glob. scan_complete=true is stronger: every matching line " +
+          "was scanned, which is only possible when all discovered files were refined. " +
+          "A ROUTE block is heuristic routing only; retained_unread files remain lexical candidates " +
+          "and must not be treated as irrelevant or absent. " +
+          "Completeness is lexical: scan_complete=true means all matches for the requested " +
+          "regex/path/glob were scanned, not that a semantic category is exhaustively absent. " +
+          "evidence_complete=true means every discovered hit line is represented, not that " +
+          "the surrounding function or file is fully shown. representation=focused adds bounded " +
+          "containing-scope context chosen from structurally relevant non-module matches but still " +
+          "does not imply whole-file context. Turn evidence is deduplicated: prior_evidence_reused=true " +
+          "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
+          "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
+          "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
+          "evidence itself cannot fit or complete; broad repository routing is auto-refined before returning.",
         input: {
           type: "object",
           properties: {
@@ -1593,40 +3080,6 @@ export default {
             })
           }
 
-          const queryPlan = queries.map((query, index) => {
-            const cacheKey = queryCacheKey(root, query, target, glob)
-            const cached = state?.queryCache?.get(cacheKey) ?? null
-
-            return {
-              query,
-              index,
-              cacheKey,
-              cached,
-            }
-          })
-
-          const freshPlan = queryPlan.filter((item) => !item.cached)
-          const reusedQueryCount = queryPlan.length - freshPlan.length
-          const executedQueryCount = freshPlan.length
-
-          // `executedSearches` counts tool executions that actually start rg.
-          // A fully reused exact-query subset consumes an attempt/evidence
-          // budget, but not an executed-search slot.
-          if (
-            state &&
-            freshPlan.length > 0 &&
-            state.executedSearches >= MAX_EXECUTED_SEARCHES_PER_TURN
-          ) {
-            return await blockSearch("executed_search_budget", {
-              limit: MAX_EXECUTED_SEARCHES_PER_TURN,
-              queries,
-              path: target,
-              glob: glob ?? null,
-              reused_query_count: reusedQueryCount,
-              executed_query_count: executedQueryCount,
-            })
-          }
-
           const remainingEvidenceBytes = state
             ? Math.max(0, MAX_TURN_EVIDENCE_BYTES - state.evidenceBytes)
             : MAX_OUTPUT_BYTES
@@ -1637,16 +3090,88 @@ export default {
             })
           }
 
-          if (state) {
-            state.signatures.add(signature)
-            if (freshPlan.length > 0) state.executedSearches += 1
+          // Every new search now starts with a file-level lexical discovery
+          // pass. This is deliberate: routing must not depend on a possibly
+          // truncated stream of line hits from one noisy file.
+          if (
+            state &&
+            state.executedSearches >= MAX_EXECUTED_SEARCHES_PER_TURN
+          ) {
+            return await blockSearch("executed_search_budget", {
+              limit: MAX_EXECUTED_SEARCHES_PER_TURN,
+              queries,
+              path: target,
+              glob: glob ?? null,
+            })
           }
 
-          const freshResults = await Promise.all(
-            freshPlan.map((item) =>
-              runQuery(root, item.query, item.index, target, glob),
+          if (state) {
+            state.signatures.add(signature)
+            state.executedSearches += 1
+          }
+
+          const discoveryStarted = performance.now()
+          const discoveryResults = await Promise.all(
+            queries.map((query, index) =>
+              runFileDiscovery(root, query, index, target, glob),
             ),
           )
+          const discoveryElapsedMs =
+            Math.round((performance.now() - discoveryStarted) * 100) / 100
+
+          const discoveryComplete = discoveryResults.every(
+            (result) => result.scanComplete,
+          )
+          const rankedFiles = rankDiscoveredFiles(discoveryResults)
+          const selectedFiles = selectAutoRefineFiles(
+            rankedFiles,
+            discoveryResults,
+          )
+          const selectedFileSet = new Set(
+            selectedFiles.map((entry) => entry.file),
+          )
+          const allDiscoveredFilesSelected =
+            rankedFiles.length === selectedFileSet.size
+          const routingActive =
+            !discoveryComplete || !allDiscoveredFilesSelected
+
+          const queryPlan = queries.map((query, index) => {
+            const targets = selectedFiles
+              .filter((entry) => entry.queries.has(index))
+              .map((entry) => entry.file)
+              .sort()
+            const cacheKey = queryCacheKey(
+              root,
+              query,
+              target,
+              glob,
+              targets,
+            )
+            const cached = state?.queryCache?.get(cacheKey) ?? null
+
+            return {
+              query,
+              index,
+              targets,
+              cacheKey,
+              cached,
+            }
+          })
+
+          const freshPlan = queryPlan.filter((item) => !item.cached)
+          const reusedQueryCount = queryPlan.length - freshPlan.length
+          const executedQueryCount = freshPlan.filter(
+            (item) => item.targets.length > 0,
+          ).length
+
+          const refineStarted = performance.now()
+          const freshResults = await Promise.all(
+            freshPlan.map((item) =>
+              runQuery(root, item.query, item.index, item.targets, glob),
+            ),
+          )
+          const refineElapsedMs =
+            Math.round((performance.now() - refineStarted) * 100) / 100
 
           const freshByIndex = new Map(
             freshResults.map((result) => [result.queryIndex, result]),
@@ -1676,10 +3201,24 @@ export default {
             (total, hit) => total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
             0,
           )
-          const scanComplete = results.every((result) => result.scanComplete)
-          const querySummary = querySummaryFor(results)
+          const selectedScanComplete = results.every(
+            (result) => result.scanComplete,
+          )
+          const scanComplete =
+            discoveryComplete &&
+            allDiscoveredFilesSelected &&
+            selectedScanComplete
+          const querySummary = [
+            ...discoverySummaryFor(discoveryResults),
+            ...querySummaryFor(results),
+          ]
           const callBudgetBytes = Math.min(MAX_OUTPUT_BYTES, remainingEvidenceBytes)
-          const headerReserve = worstCaseHeaderBytes(scanComplete, querySummary, hits.size)
+          const provisionalRoute = routingActive
+            ? renderRouteMap(rankedFiles, selectedFiles, ROUTE_BODY_BUDGET_BYTES)
+            : { body: [], bodyBytes: 0, retained: 0 }
+          const headerReserve =
+            worstCaseHeaderBytes(scanComplete, querySummary, hits.size) +
+            provisionalRoute.bodyBytes
 
           if (callBudgetBytes <= headerReserve) {
             return await blockSearch("evidence_budget", {
@@ -1694,16 +3233,23 @@ export default {
             Math.max(0, callBudgetBytes - headerReserve),
           )
 
+          const routeRendered = routingActive
+            ? renderRouteMap(rankedFiles, selectedFiles, provisionalRoute.bodyBytes)
+            : { body: [], bodyBytes: 0, retained: 0 }
+
           const rawRendered = await renderEvidence(root, hits, bodyBudget)
-          const rawEvidenceComplete = rawRendered.shown.size === hits.size
+          const selectedEvidenceComplete = rawRendered.shown.size === hits.size
+          const rawEvidenceComplete = scanComplete && selectedEvidenceComplete
           const rawComplete = scanComplete && rawEvidenceComplete
           const rawReasons = []
 
-          if (!scanComplete) rawReasons.push("scan_incomplete")
-          if (!rawEvidenceComplete) rawReasons.push("output_budget")
+          if (!discoveryComplete) rawReasons.push("lexical_discovery_incomplete")
+          else if (!allDiscoveredFilesSelected) rawReasons.push("ranked_subset")
+          else if (!selectedScanComplete) rawReasons.push("scan_incomplete")
+          if (!selectedEvidenceComplete) rawReasons.push("output_budget")
 
           const rawHeader = [
-            `SEARCH complete=${rawComplete} scan_complete=${scanComplete} evidence_complete=${rawEvidenceComplete} unique_hits=${hits.size} shown_hits=${rawRendered.shown.size}`,
+            `SEARCH complete=${rawComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${rawEvidenceComplete} selected_evidence_complete=${selectedEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawRendered.shown.size}`,
             ...querySummary,
           ]
 
@@ -1711,7 +3257,12 @@ export default {
             rawHeader.push(`INCOMPLETE reasons=${rawReasons.join(",")}`)
           }
 
-          const rawContent = [...rawHeader, "", ...rawRendered.body].join("\n")
+          const rawContent = [
+            ...rawHeader,
+            ...(routeRendered.body.length > 0 ? ["", ...routeRendered.body] : []),
+            "",
+            ...rawRendered.body,
+          ].join("\n")
           const rawResultBytes = bytes(rawContent)
 
           if (rawResultBytes > callBudgetBytes) {
@@ -1721,7 +3272,11 @@ export default {
             })
           }
 
-          const pressure = evidencePressure(hits, rawRendered, rawEvidenceComplete)
+          const pressure = evidencePressure(
+            hits,
+            rawRendered,
+            selectedEvidenceComplete,
+          )
           const distillInput = distillerHitsFromMerged(hits)
           const spansComplete = spanCaptureComplete(results)
 
@@ -1746,6 +3301,7 @@ export default {
           let hybridCoreBytes = null
           let hybridContextSamples = null
           let hybridRatio = null
+          let hybridFacts = new Set()
           let variantDiversity = null
           let distillGroupsForIndex = null
 
@@ -1754,10 +3310,38 @@ export default {
           let indexFiles = null
           let indexSamples = null
           let indexStructuralGroups = null
+          let indexDiscriminativeFacets = null
+          let indexFacts = new Set()
           let refinementRequired = false
 
-          if (!scanComplete) distillReason = "scan_incomplete"
-          else if (!pressure.active) distillReason = "not_needed"
+          let focusedCandidate = false
+          let focusedAttempted = false
+          let focusedReason = "not_needed"
+          let focusedSupplementBytes = null
+          let focusedScopeCandidates = null
+          let focusedSelectedScopes = null
+          let focusedReusedScopes = null
+          let focusedFullScopes = null
+          let focusedPartialScopes = null
+          let focusedRadius = null
+          let focusedCanonicalSavedBytes = null
+          let focusedFacts = new Set()
+          let focusedContextualizedHitLines = new Set()
+
+          focusedCandidate =
+            selectedScanComplete &&
+            selectedEvidenceComplete &&
+            hits.size > 0 &&
+            hits.size <= FOCUSED_PROBE_MAX_LINE_HITS &&
+            pressure.maxHitsPerFile <= FOCUSED_PROBE_MAX_HITS_PER_FILE &&
+            spansComplete &&
+            distillInput.length > 0 &&
+            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
+
+          const shouldDistill = pressure.active || focusedCandidate
+
+          if (!selectedScanComplete) distillReason = "selected_scan_incomplete"
+          else if (!shouldDistill) distillReason = "not_needed"
           else if (!spansComplete) distillReason = "span_capture_incomplete"
           else if (distillInput.length < 1) distillReason = "no_exact_spans"
           else {
@@ -1768,6 +3352,7 @@ export default {
 
             if (!distill.ok) {
               distillReason = distill.reason
+              if (focusedCandidate) focusedReason = `distill_${distill.reason}`
               distillIrComplete = distill.response?.ir_complete ?? false
               distillWitnessComplete = distill.response?.witness_complete ?? false
               v2GroupingPreserved = distill.response?.v2_grouping_preserved ?? null
@@ -1794,18 +3379,31 @@ export default {
               hybridBodyBytes = hybridRendered.bodyBytes
               hybridCoreBytes = hybridRendered.coreBytes
               hybridContextSamples = hybridRendered.contextSamples
+              hybridFacts = hybridRendered.facts ?? new Set()
 
               if (!hybridRendered.complete) {
                 distillReason = hybridRendered.reason ?? "hybrid_render_incomplete"
               } else {
                 const contextSampled = hybridRendered.contextSamples > 0
+                const publicHybridRepresentation = routingActive
+                  ? "ranked_hybrid"
+                  : "hybrid"
                 const hybridHeader = [
-                  `SEARCH representation=hybrid complete=true scan_complete=true evidence_complete=true matches_complete=true witnesses_complete=true context_complete=false context_sampled=${contextSampled} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
+                  `SEARCH representation=${publicHybridRepresentation} complete=${scanComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete} selected_evidence_complete=true matches_complete=${scanComplete} selected_witnesses_complete=true context_complete=false context_sampled=${contextSampled} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
                   ...querySummary,
                 ]
 
+                if (routingActive) {
+                  hybridHeader.push(
+                    `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset" : "lexical_discovery_incomplete"}`,
+                  )
+                }
+
                 const hybridContent = [
                   ...hybridHeader,
+                  ...(routeRendered.body.length > 0
+                    ? ["", ...routeRendered.body]
+                    : []),
                   "",
                   ...hybridRendered.body,
                 ].join("\n")
@@ -1819,7 +3417,8 @@ export default {
                   hybridResultBytes <= rawResultBytes * HYBRID_MIN_SAVINGS_RATIO
 
                 const hybridBeneficial =
-                  !rawEvidenceComplete || materiallySmaller
+                  pressure.active &&
+                  (!selectedEvidenceComplete || materiallySmaller)
 
                 if (hybridResultBytes > callBudgetBytes) {
                   distillReason = "hybrid_output_budget"
@@ -1831,9 +3430,147 @@ export default {
                   resultBytes = hybridResultBytes
                   bodyBytes = hybridRendered.bodyBytes
                   shownHits = hits.size
-                  evidenceComplete = true
-                  complete = true
+                  evidenceComplete = scanComplete
+                  complete = scanComplete
                   distillReason = "selected"
+                }
+              }
+
+              if (representation !== "raw" && focusedCandidate) {
+                focusedReason = "superseded_by_hybrid"
+              }
+
+              if (representation === "raw" && focusedCandidate) {
+                focusedAttempted = true
+                const supplementBudget = Math.min(
+                  FOCUSED_SUPPLEMENT_MAX_BYTES,
+                  Math.max(0, bodyBudget - rawRendered.bodyBytes),
+                )
+                const focusedRendered = await renderFocusedSupplement(
+                  root,
+                  distill.response.groups,
+                  supplementBudget,
+                  hits,
+                  state?.evidenceLedger ?? null,
+                  state?.contextualizedHitLines ?? null,
+                )
+
+                focusedSupplementBytes = focusedRendered.bodyBytes
+                focusedScopeCandidates = focusedRendered.scopeCount
+                focusedSelectedScopes = focusedRendered.selectedScopeCount
+                focusedReusedScopes = focusedRendered.reusedScopeCount
+                focusedFullScopes = focusedRendered.fullScopes
+                focusedPartialScopes = focusedRendered.partialScopes
+                focusedRadius = focusedRendered.radius
+
+                if (!focusedRendered.complete) {
+                  focusedReason = focusedRendered.reason ?? "supplement_incomplete"
+                } else {
+                  const uncoveredHits = new Map(
+                    [...hits.entries()].filter(
+                      ([key]) => !focusedRendered.coveredHitKeys.has(key),
+                    ),
+                  )
+                  const seenForRaw = new Set(state?.evidenceLedger ?? [])
+
+                  for (const fact of focusedRendered.facts ?? []) {
+                    seenForRaw.add(fact)
+                  }
+
+                  const rawRemainingBudget = Math.max(
+                    0,
+                    bodyBudget - focusedRendered.bodyBytes,
+                  )
+                  const rawUncovered = await renderNovelRawEvidence(
+                    root,
+                    uncoveredHits,
+                    rawRemainingBudget,
+                    seenForRaw,
+                    focusedRendered.coveredRangesByFile,
+                    state?.contextualizedHitLines ?? null,
+                  )
+                  const uncoveredComplete = [...uncoveredHits.entries()].every(
+                    ([key, hit]) =>
+                      rawUncovered.shown.has(key) ||
+                      hitFactsAlreadySeen(hit, state?.evidenceLedger),
+                  )
+
+                  if (!uncoveredComplete) {
+                    focusedReason = "canonical_raw_budget"
+                  } else {
+                    const focusedBody = []
+
+                    if (rawUncovered.body.length > 0) {
+                      focusedBody.push(...rawUncovered.body)
+                    }
+
+                    if (
+                      rawUncovered.body.length > 0 &&
+                      focusedRendered.body.length > 0
+                    ) {
+                      focusedBody.push("")
+                    }
+
+                    focusedBody.push(...focusedRendered.body)
+
+                    const shownNow = new Set([
+                      ...rawUncovered.shown,
+                      ...focusedRendered.shownHitKeys,
+                    ])
+                    const priorHits = countHitsAlreadySeen(
+                      hits,
+                      state?.evidenceLedger,
+                    )
+                    const publicFocusedRepresentation = routingActive
+                      ? "ranked_focused"
+                      : "focused"
+                    const focusedHeader = [
+                      `SEARCH representation=${publicFocusedRepresentation} complete=${scanComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete} selected_evidence_complete=true matches_complete=${scanComplete} context_complete=false context_mode=scope_guided_dedup candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${shownNow.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawUncovered.skippedPriorLines > 0} full_scopes=${focusedRendered.fullScopes} partial_scopes=${focusedRendered.partialScopes}`,
+                      ...querySummary,
+                    ]
+
+                    if (routingActive) {
+                      focusedHeader.push(
+                        `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset" : "lexical_discovery_incomplete"}`,
+                      )
+                    }
+                    const focusedContent = [
+                      ...focusedHeader,
+                      ...(routeRendered.body.length > 0
+                        ? ["", ...routeRendered.body]
+                        : []),
+                      "",
+                      ...focusedBody,
+                    ].join("\n")
+                    const focusedResultBytes = bytes(focusedContent)
+
+                    if (focusedResultBytes > callBudgetBytes) {
+                      focusedReason = "focused_output_budget"
+                    } else {
+                      representation = "focused"
+                      content = focusedContent
+                      resultBytes = focusedResultBytes
+                      bodyBytes =
+                        rawUncovered.bodyBytes + focusedRendered.bodyBytes
+                      shownHits = shownNow.size
+                      evidenceComplete = scanComplete
+                      complete = scanComplete
+                      distillReason = "ir_complete"
+                      focusedReason = "selected"
+                      focusedFacts = new Set([
+                        ...rawUncovered.facts,
+                        ...focusedRendered.facts,
+                      ])
+                      focusedContextualizedHitLines =
+                        focusedRendered.contextualizedHitLines
+                      focusedCanonicalSavedBytes = Math.max(
+                        0,
+                        rawRendered.bodyBytes +
+                          focusedRendered.bodyBytes -
+                          bodyBytes,
+                      )
+                    }
+                  }
                 }
               }
             }
@@ -1845,7 +3582,8 @@ export default {
           // forbids absence conclusions from an incomplete discovery.
           if (
             representation === "raw" &&
-            (!scanComplete || !rawEvidenceComplete)
+            !routingActive &&
+            (!scanComplete || !selectedEvidenceComplete)
           ) {
             const indexRendered = renderSearchIndex(
               results,
@@ -1853,19 +3591,19 @@ export default {
               bodyBudget,
             )
 
-            const discoveryComplete = scanComplete
-            const absenceNotProven = !discoveryComplete
+            const lineDiscoveryComplete = scanComplete
+            const absenceNotProven = !lineDiscoveryComplete
             const indexHeader = [
               `SEARCH representation=index complete=false scan_complete=${scanComplete} evidence_complete=false index_render_complete=${indexRendered.complete} refinement_required=true absence_not_proven=${absenceNotProven} collected_line_hits=${hits.size} exact_matches=${exactSpanHits} indexed_files=${indexRendered.fileCount}`,
               ...querySummary,
-              `REFINE_REQUIRED action=search_narrower_by_file_or_api`,
+              `REFINE_REQUIRED action=prefer_route_match_or_narrow_file routing=match_facets`,
             ]
 
             if (absenceNotProven) {
               indexHeader.push(
-                "ABSENCE_NOT_PROVEN reason=discovery_incomplete do_not_conclude_no_other_matches",
+                "ABSENCE_NOT_PROVEN reason=line_scan_incomplete do_not_conclude_no_other_matches",
               )
-              indexReason = "discovery_incomplete"
+              indexReason = "line_scan_incomplete"
             } else {
               indexHeader.push(
                 "EVIDENCE_SUMMARIZED reason=raw_output_budget inspect_focused_evidence_before_code_level_conclusions",
@@ -1893,7 +3631,195 @@ export default {
               indexFiles = indexRendered.fileCount
               indexSamples = indexRendered.sampleCount
               indexStructuralGroups = indexRendered.structuralGroupsShown
+              indexDiscriminativeFacets =
+                indexRendered.discriminativeFacetsShown
+              indexFacts = indexRendered.facts ?? new Set()
             }
+          }
+
+          // Final RAW packing is turn-aware. Prior source/context remains in
+          // conversation history, so only novel lines or newly-matched spans
+          // need to be emitted again.
+          let rawNovelFacts = new Set()
+          let rawNovelEmittedLines = null
+          let rawPriorHits = null
+          let rawSkippedPriorLines = null
+          let rawSuppressedContextAnchors = null
+
+          if (representation === "raw") {
+            const rawNovel = await renderNovelRawEvidence(
+              root,
+              hits,
+              bodyBudget,
+              state?.evidenceLedger ?? null,
+              new Map(),
+              state?.contextualizedHitLines ?? null,
+            )
+            const priorHits = countHitsAlreadySeen(
+              hits,
+              state?.evidenceLedger,
+            )
+            const accountedHits = [...hits.entries()].every(
+              ([key, hit]) =>
+                rawNovel.shown.has(key) ||
+                hitFactsAlreadySeen(hit, state?.evidenceLedger),
+            )
+            const selectedTurnEvidenceComplete =
+              selectedEvidenceComplete && accountedHits
+            const turnEvidenceComplete =
+              scanComplete && selectedTurnEvidenceComplete
+            const turnComplete = scanComplete && turnEvidenceComplete
+            const rawNovelReasons = []
+
+            if (!discoveryComplete) {
+              rawNovelReasons.push("lexical_discovery_incomplete")
+            } else if (!allDiscoveredFilesSelected) {
+              rawNovelReasons.push("ranked_subset")
+            } else if (!selectedScanComplete) {
+              rawNovelReasons.push("scan_incomplete")
+            }
+            if (!selectedTurnEvidenceComplete) {
+              rawNovelReasons.push("output_budget")
+            }
+
+            const publicRawRepresentation = routingActive
+              ? "ranked_raw"
+              : "raw"
+            const rawNovelHeader = [
+              `SEARCH representation=${publicRawRepresentation} complete=${turnComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${turnEvidenceComplete} selected_evidence_complete=${selectedTurnEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawNovel.shown.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawNovel.skippedPriorLines > 0}`,
+              ...querySummary,
+            ]
+
+            if (rawNovelReasons.length) {
+              rawNovelHeader.push(
+                `INCOMPLETE reasons=${rawNovelReasons.join(",")}`,
+              )
+            }
+
+            const rawNovelContent = [
+              ...rawNovelHeader,
+              ...(routeRendered.body.length > 0
+                ? ["", ...routeRendered.body]
+                : []),
+              "",
+              ...rawNovel.body,
+            ].join("\n")
+            const rawNovelResultBytes = bytes(rawNovelContent)
+
+            if (rawNovelResultBytes <= callBudgetBytes) {
+              content = rawNovelContent
+              resultBytes = rawNovelResultBytes
+              bodyBytes = rawNovel.bodyBytes
+              shownHits = rawNovel.shown.size
+              evidenceComplete = turnEvidenceComplete
+              complete = turnComplete
+              rawNovelFacts = rawNovel.facts
+              rawNovelEmittedLines = rawNovel.emittedLines
+              rawPriorHits = priorHits
+              rawSkippedPriorLines = rawNovel.skippedPriorLines
+              rawSuppressedContextAnchors =
+                rawNovel.suppressedContextAnchors
+            } else {
+              // Safe fallback: the original bounded RAW body is already known
+              // to fit. Positive hit facts are still ledgered; context-line
+              // dedup simply becomes conservative for this one result.
+              rawNovelFacts = positiveFactsForHits(hits)
+            }
+          }
+
+          const sourceRepresentation = representation
+          const finalFacts = new Set()
+
+          if (representation === "raw") {
+            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
+            for (const fact of rawNovelFacts) finalFacts.add(fact)
+          } else if (representation === "focused") {
+            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
+            for (const fact of focusedFacts) finalFacts.add(fact)
+          } else if (representation === "hybrid") {
+            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
+            for (const fact of hybridFacts) finalFacts.add(fact)
+          } else if (representation === "index") {
+            for (const fact of indexFacts) finalFacts.add(fact)
+          }
+
+          for (const fact of negativeFactsForDiscoveryResults(
+            discoveryResults,
+            target,
+            glob,
+          )) {
+            finalFacts.add(fact)
+          }
+
+          const routeFacts = routeFactsForRanking(
+            rankedFiles,
+            selectedFileSet,
+            discoveryComplete,
+            target,
+            glob,
+          )
+          const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
+          const novelty = novelEvidenceFacts(state, finalFacts)
+          const routeNovelty = novelRouteFacts(state, routeFacts)
+          const meaningfulRouteProgress =
+            routingActive && routeNovelty.novel.size > 0
+          const novelFactStats = summarizeEvidenceFacts(novelty.novel)
+          let ledgerFactsAdded = 0
+          let routeFactsAdded = 0
+          let noProgress = false
+          let noProgressBlocked = false
+
+          if (
+            state &&
+            novelty.novel.size < 1 &&
+            !meaningfulRouteProgress
+          ) {
+            state.consecutiveNoProgress += 1
+            noProgress = true
+            noProgressBlocked =
+              state.consecutiveNoProgress >= MAX_CONSECUTIVE_NO_PROGRESS
+
+            if (noProgressBlocked) {
+              content =
+                `SEARCH_BLOCKED reason=no_progress_loop ` +
+                `source_representation=${sourceRepresentation} ` +
+                `prior_evidence_reused=true no_progress_streak=${state.consecutiveNoProgress} ` +
+                `action=use_prior_or_change_search_dimension`
+            } else {
+              content =
+                `SEARCH_NO_PROGRESS reason=evidence_already_seen ` +
+                `source_representation=${sourceRepresentation} ` +
+                `prior_evidence_reused=true no_progress_streak=${state.consecutiveNoProgress} ` +
+                `action=use_prior_or_change_search_dimension`
+            }
+
+            representation = "no_progress"
+            resultBytes = bytes(content)
+            bodyBytes = 0
+            shownHits = 0
+          } else if (state) {
+            state.consecutiveNoProgress = 0
+            const remembered = rememberEvidenceFacts(state, finalFacts)
+            const rememberedRoutes = rememberRouteFacts(state, routeFacts)
+            ledgerFactsAdded = remembered.added
+            routeFactsAdded = rememberedRoutes.added
+
+            if (sourceRepresentation === "focused") {
+              rememberContextualizedHitLines(
+                state,
+                focusedContextualizedHitLines,
+              )
+            }
+          }
+
+          if (
+            !noProgress &&
+            routingActive &&
+            (representation === "raw" ||
+              representation === "focused" ||
+              representation === "hybrid")
+          ) {
+            representation = `ranked_${representation}`
           }
 
           if (state) {
@@ -1914,7 +3840,31 @@ export default {
             queries,
             path: target,
             glob: glob ?? null,
-            discovery_cap_per_query: DISCOVERY_CAP_PER_QUERY,
+            file_discovery_cap_per_query: FILE_DISCOVERY_CAP_PER_QUERY,
+            line_hit_cap_per_query: LINE_HIT_CAP_PER_QUERY,
+            lexical_discovery_complete: discoveryComplete,
+            selected_scan_complete: selectedScanComplete,
+            routing_active: routingActive,
+            route_strategy: "query_coverage_path_rarity",
+            candidate_files: rankedFiles.length,
+            discovery_elapsed_ms: discoveryElapsedMs,
+            refine_elapsed_ms: refineElapsedMs,
+            selected_files: selectedFiles.map((entry) => ({
+              file: entry.file,
+              queries: [...entry.queries].sort((a, b) => a - b),
+              coverage: entry.coverage,
+              path_affinity: entry.pathAffinity,
+              rarity: entry.rarity,
+            })),
+            retained_unread_files: routeRendered.retained,
+            discovery_files_by_query: discoveryResults.map((result) => ({
+              query_index: result.queryIndex,
+              files: result.files?.length ?? 0,
+              complete: result.scanComplete,
+              capped: result.scanCapped,
+              timed_out: result.timedOut,
+              error: result.error ?? null,
+            })),
             reused_query_count: reusedQueryCount,
             executed_query_count: executedQueryCount,
             reused_queries: queryPlan
@@ -1923,6 +3873,7 @@ export default {
             query_cache_entries: state?.queryCache?.size ?? null,
             query_cache_matches: state?.queryCacheMatches ?? null,
             representation,
+            source_representation: sourceRepresentation,
             unique_hits: hits.size,
             exact_span_hits: exactSpanHits,
             distill_input_hits: distillInput.length,
@@ -1937,6 +3888,22 @@ export default {
             raw_output_bytes: rawResultBytes,
             raw_body_bytes: rawRendered.bodyBytes,
             raw_evidence_complete: rawEvidenceComplete,
+            selected_evidence_complete: selectedEvidenceComplete,
+            raw_novel_emitted_lines: rawNovelEmittedLines,
+            raw_prior_hits: rawPriorHits,
+            raw_skipped_prior_lines: rawSkippedPriorLines,
+            raw_suppressed_context_anchors: rawSuppressedContextAnchors,
+            focused_candidate: focusedCandidate,
+            focused_attempted: focusedAttempted,
+            focused_reason: focusedReason,
+            focused_supplement_bytes: focusedSupplementBytes,
+            focused_scope_candidates: focusedScopeCandidates,
+            focused_selected_scopes: focusedSelectedScopes,
+            focused_reused_scopes: focusedReusedScopes,
+            focused_full_scopes: focusedFullScopes,
+            focused_partial_scopes: focusedPartialScopes,
+            focused_radius: focusedRadius,
+            focused_canonical_saved_bytes: focusedCanonicalSavedBytes,
             pressure_active: pressure.active,
             pressure_reasons: pressure.reasons,
             max_hits_per_file: pressure.maxHitsPerFile,
@@ -1959,7 +3926,29 @@ export default {
             index_files: indexFiles,
             index_samples: indexSamples,
             index_structural_groups: indexStructuralGroups,
+            index_discriminative_facets: indexDiscriminativeFacets,
             refinement_required: refinementRequired,
+            ledger_facts_before: ledgerFactsBefore,
+            ledger_new_facts: novelty.novel.size,
+            ledger_prior_facts: novelty.prior,
+            ledger_facts_added: ledgerFactsAdded,
+            ledger_facts_after: state?.evidenceLedger?.size ?? null,
+            ledger_saturated: state?.ledgerSaturated ?? null,
+            route_ledger_new_facts: routeNovelty.novel.size,
+            route_ledger_prior_facts: routeNovelty.prior,
+            route_ledger_facts_added: routeFactsAdded,
+            route_ledger_facts_after: state?.routeLedger?.size ?? null,
+            meaningful_route_progress: meaningfulRouteProgress,
+            novel_positive_facts: novelFactStats.positive,
+            novel_context_facts: novelFactStats.context,
+            novel_negative_facts: novelFactStats.negative,
+            novel_structural_facts: novelFactStats.structural,
+            novel_routing_facts: novelFactStats.routing,
+            no_progress: noProgress,
+            no_progress_streak: state?.consecutiveNoProgress ?? null,
+            no_progress_blocked: noProgressBlocked,
+            contextualized_hit_lines:
+              state?.contextualizedHitLines?.size ?? null,
             turn_model_calls: state?.modelCalls ?? null,
             turn_search_attempts: state?.searchAttempts ?? null,
             turn_executed_searches: state?.executedSearches ?? null,
@@ -1977,15 +3966,33 @@ export default {
               turn_executed_searches: state?.executedSearches ?? null,
               turn_evidence_bytes: state?.evidenceBytes ?? null,
               representation,
+              source_representation: sourceRepresentation,
               unique_hits: hits.size,
               shown_hits: shownHits,
               scan_complete: scanComplete,
+              lexical_discovery_complete: discoveryComplete,
+              selected_scan_complete: selectedScanComplete,
+              routing_active: routingActive,
+              route_strategy: "query_coverage_path_rarity",
+              candidate_files: rankedFiles.length,
+              discovery_elapsed_ms: discoveryElapsedMs,
+              refine_elapsed_ms: refineElapsedMs,
+              selected_files: selectedFiles.map((entry) => entry.file),
+              retained_unread_files: routeRendered.retained,
               reused_query_count: reusedQueryCount,
               executed_query_count: executedQueryCount,
               refinement_required: refinementRequired,
               index_reason: indexReason,
+              focused_reason: focusedReason,
               evidence_complete: evidenceComplete,
               complete,
+              ledger_new_facts: novelty.novel.size,
+              ledger_prior_facts: novelty.prior,
+              route_ledger_new_facts: routeNovelty.novel.size,
+              meaningful_route_progress: meaningfulRouteProgress,
+              no_progress: noProgress,
+              no_progress_streak: state?.consecutiveNoProgress ?? null,
+              no_progress_blocked: noProgressBlocked,
               distill_attempted: distillAttempted,
               distill_reason: distillReason,
               elapsed_ms: elapsedMs,
