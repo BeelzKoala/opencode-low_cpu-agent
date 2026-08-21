@@ -1,0 +1,20 @@
+# Rust
+target/
+
+# Runtime telemetry/state
+*.jsonl
+*.log
+*.bak
+*.backup
+.opencode/
+
+# Secrets
+.env
+.env.*
+
+# Models and compiled binaries
+*.gguf
+opencode-evidence-distiller
+
+# OS/editor
+.DS_Store
