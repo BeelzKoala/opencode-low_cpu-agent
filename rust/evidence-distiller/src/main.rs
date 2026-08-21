@@ -10,14 +10,16 @@ use std::{
     time::Instant,
 };
 
-const PROTOCOL: &str = "evidence-distiller-v2";
+const PROTOCOL: &str = "evidence-distiller-v3";
 const BACKEND: &str = "ast-grep-0.45.1";
 
-const DEFAULT_BUDGET_BYTES: usize = 3_000;
+const DEFAULT_BUDGET_BYTES: usize = 32 * 1024;
 const MAX_BUDGET_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 const MAX_REPORTED_LINES_PER_RECORD: usize = 8;
+const MAX_SUBJECT_TEXT_CHARS: usize = 320;
+const MAX_STATEMENT_TEXT_CHARS: usize = 500;
 const MAX_MATCH_TEXT_CHARS: usize = 160;
 const MAX_ANCHOR_CHARS: usize = 200;
 const MAX_SYMBOL_NAME_CHARS: usize = 120;
@@ -57,7 +59,7 @@ struct Hit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RecordKey {
+struct GroupKey {
     file: String,
     symbol_kind: String,
     symbol_name: String,
@@ -69,40 +71,56 @@ struct RecordKey {
     anchor: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct VariantKey {
+    subject_text: String,
+    statement_text: String,
+}
+
 #[derive(Debug, Default)]
-struct Aggregate {
+struct VariantAggregate {
     hit_count: usize,
     queries: BTreeSet<usize>,
     lines: BTreeSet<usize>,
 }
 
+#[derive(Debug, Default)]
+struct GroupAggregate {
+    hit_count: usize,
+    queries: BTreeSet<usize>,
+    lines: BTreeSet<usize>,
+    variants: BTreeMap<VariantKey, VariantAggregate>,
+}
+
 #[derive(Debug, Serialize)]
-struct Record {
-    file: String,
-
-    symbol_kind: String,
-    symbol_name: String,
-    start_line: usize,
-    end_line: usize,
-
-    role: String,
-
-    // Smallest named AST node that covers the match.
-    node_kind: String,
-
-    // Exact rg match text when precise byte span is supplied.
-    // Falls back to node text for legacy line/column-only hits.
-    match_text: String,
-
-    // Structural context:
-    // call -> callee, assignment -> target, import -> imported source/path,
-    // definition -> defined name, reference -> matched node.
-    anchor: String,
-
+struct Variant {
+    subject_text: String,
+    statement_text: String,
     hit_count: usize,
     queries: Vec<usize>,
     hit_lines: Vec<usize>,
     lines_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct Group {
+    // The group header intentionally preserves the strongest part of v2:
+    // file/scope/role/anchor/count/line provenance. v3 adds witness variants
+    // underneath instead of discarding occurrence-level differences.
+    file: String,
+    symbol_kind: String,
+    symbol_name: String,
+    start_line: usize,
+    end_line: usize,
+    role: String,
+    node_kind: String,
+    match_text: String,
+    anchor: String,
+    hit_count: usize,
+    queries: Vec<usize>,
+    hit_lines: Vec<usize>,
+    lines_truncated: bool,
+    variants: Vec<Variant>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,35 +139,44 @@ struct Response {
     mapped_hits: usize,
     exact_span_hits: usize,
     anchored_hits: usize,
+    witness_hits: usize,
     lossy_hits: usize,
     unresolved_hits: usize,
 
-    structural_records_total: usize,
-    structural_records_shown: usize,
+    groups_total: usize,
+    groups_shown: usize,
+    variants_total: usize,
+    variants_shown: usize,
+    variant_diversity: f64,
 
     parsed_files: usize,
     unsupported_files: Vec<String>,
     errors: Vec<FileError>,
 
     budget_bytes: usize,
-    output_record_bytes: usize,
+    output_group_bytes: usize,
 
     location_complete: bool,
     anchor_complete: bool,
+    witness_complete: bool,
     distill_complete: bool,
+    ir_complete: bool,
 
-    // Only true when structural output can safely replace the bounded raw evidence.
-    // Integration MUST fall back to raw unless this is true.
-    safe_for_replacement: bool,
+    // v2 is retained as the grouping/index layer inside every v3 group.
+    // The added variants preserve the differences that v2 collapsed.
+    v2_grouping_preserved: bool,
+
+    // Structural IR is not raw surrounding context. The TS packer decides
+    // whether and how much raw context to sample beside these witnesses.
+    context_complete: bool,
+    context_omitted: bool,
 
     truncated: bool,
-
     elapsed_ms: f64,
-
-    records: Vec<Record>,
+    groups: Vec<Group>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TextValue {
     text: String,
     truncated: bool,
@@ -169,12 +196,15 @@ struct SourceStats {
     mapped_hits: usize,
     exact_span_hits: usize,
     anchored_hits: usize,
+    witness_hits: usize,
     lossy_hits: usize,
 }
 
 struct Classification {
     role: &'static str,
     anchor: TextValue,
+    subject: TextValue,
+    statement: TextValue,
 }
 
 fn compact_text(text: &str, max_chars: usize) -> TextValue {
@@ -395,7 +425,83 @@ fn first_named_child_text(node: &SgNode<'_>, limit: usize) -> Option<TextValue> 
         .and_then(|child| node_text(&child, limit))
 }
 
-fn classify_with_anchor(
+fn is_statement_kind(kind: &str) -> bool {
+    kind.contains("statement")
+        || kind.contains("assignment")
+        || kind == "variable_declarator"
+        || kind == "variable_declaration"
+        || kind == "lexical_declaration"
+        || kind == "let_declaration"
+        || kind == "short_var_declaration"
+        || kind == "use_declaration"
+        || kind == "use_item"
+        || kind.contains("import")
+}
+
+fn nearest_statement_text(
+    node: &SgNode<'_>,
+    symbol: Option<&SgNode<'_>>,
+    fallback: &TextValue,
+) -> TextValue {
+    let stop_id = symbol.map(|s| s.node_id());
+    let mut current = Some(node.clone());
+
+    while let Some(candidate) = current {
+        if Some(candidate.node_id()) == stop_id {
+            break;
+        }
+
+        if is_statement_kind(candidate.kind().as_ref()) {
+            if let Some(text) = node_text(&candidate, MAX_STATEMENT_TEXT_CHARS) {
+                return text;
+            }
+        }
+
+        current = candidate.parent();
+    }
+
+    fallback.clone()
+}
+
+fn definition_header_text(node: &SgNode<'_>) -> Option<TextValue> {
+    let raw = node.text();
+    let first_line = raw.as_ref().lines().next()?.trim();
+
+    if first_line.is_empty() {
+        return None;
+    }
+
+    Some(compact_text(first_line, MAX_SUBJECT_TEXT_CHARS))
+}
+
+fn classification_from_owner(
+    role: &'static str,
+    anchor: TextValue,
+    owner: &SgNode<'_>,
+    symbol: Option<&SgNode<'_>>,
+    definition_header: bool,
+) -> Option<Classification> {
+    let subject = if definition_header {
+        definition_header_text(owner)?
+    } else {
+        node_text(owner, MAX_SUBJECT_TEXT_CHARS)?
+    };
+
+    let statement = if definition_header {
+        subject.clone()
+    } else {
+        nearest_statement_text(owner, symbol, &subject)
+    };
+
+    Some(Classification {
+        role,
+        anchor,
+        subject,
+        statement,
+    })
+}
+
+fn classify_with_witness(
     node: &SgNode<'_>,
     symbol: Option<&SgNode<'_>>,
 ) -> Option<Classification> {
@@ -403,11 +509,13 @@ fn classify_with_anchor(
         if let Some(name) = symbol.field("name") {
             if range_contains(name.range(), node.range()) {
                 let anchor = node_text(&name, MAX_ANCHOR_CHARS)?;
-
-                return Some(Classification {
-                    role: "definition",
+                return classification_from_owner(
+                    "definition",
                     anchor,
-                });
+                    symbol,
+                    None,
+                    true,
+                );
             }
         }
     }
@@ -423,10 +531,7 @@ fn classify_with_anchor(
         let kind = candidate.kind();
         let k = kind.as_ref();
 
-        if k.contains("import")
-            || k == "use_declaration"
-            || k == "use_item"
-        {
+        if k.contains("import") || k == "use_declaration" || k == "use_item" {
             let anchor = field_text(
                 &candidate,
                 &["source", "module", "path", "name"],
@@ -434,23 +539,30 @@ fn classify_with_anchor(
             )
             .or_else(|| node_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return Some(Classification {
-                role: "import",
+            return classification_from_owner(
+                "import",
                 anchor,
-            });
+                &candidate,
+                symbol,
+                false,
+            );
         }
 
         if k.contains("call") || k.contains("invocation") {
-            let anchor =
-                field_text(&candidate, &["function", "callee"], MAX_ANCHOR_CHARS)
-                    .or_else(|| {
-                        first_named_child_text(&candidate, MAX_ANCHOR_CHARS)
-                    })?;
+            let anchor = field_text(
+                &candidate,
+                &["function", "callee"],
+                MAX_ANCHOR_CHARS,
+            )
+            .or_else(|| first_named_child_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return Some(Classification {
-                role: "call",
+            return classification_from_owner(
+                "call",
                 anchor,
-            });
+                &candidate,
+                symbol,
+                false,
+            );
         }
 
         if k.contains("assignment")
@@ -463,35 +575,42 @@ fn classify_with_anchor(
                 &["left", "name", "pattern", "declarator"],
                 MAX_ANCHOR_CHARS,
             )
-            .or_else(|| {
-                first_named_child_text(&candidate, MAX_ANCHOR_CHARS)
-            })?;
+            .or_else(|| first_named_child_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return Some(Classification {
-                role: "assignment",
+            return classification_from_owner(
+                "assignment",
                 anchor,
-            });
+                &candidate,
+                symbol,
+                false,
+            );
         }
 
         if k.contains("declaration") || k.contains("definition") {
-            let anchor =
-                field_text(&candidate, &["name"], MAX_ANCHOR_CHARS)
-                    .or_else(|| node_text(node, MAX_ANCHOR_CHARS))?;
+            let anchor = field_text(&candidate, &["name"], MAX_ANCHOR_CHARS)
+                .or_else(|| node_text(node, MAX_ANCHOR_CHARS))?;
 
-            return Some(Classification {
-                role: "definition",
+            return classification_from_owner(
+                "definition",
                 anchor,
-            });
+                &candidate,
+                symbol,
+                true,
+            );
         }
 
         current = candidate.parent();
     }
 
     let anchor = node_text(node, MAX_ANCHOR_CHARS)?;
+    let subject = node_text(node, MAX_SUBJECT_TEXT_CHARS)?;
+    let statement = nearest_statement_text(node, symbol, &subject);
 
     Some(Classification {
         role: "reference",
         anchor,
+        subject,
+        statement,
     })
 }
 
@@ -588,7 +707,7 @@ fn distill_source_ast_grep(
     source: &str,
     lang: SupportLang,
     hits: &[Hit],
-    aggregates: &mut BTreeMap<RecordKey, Aggregate>,
+    aggregates: &mut BTreeMap<GroupKey, GroupAggregate>,
 ) -> Result<SourceStats> {
     let ast = lang.ast_grep(source);
     let root = ast.root();
@@ -637,12 +756,13 @@ fn distill_source_ast_grep(
         let symbol = enclosing_symbol(&node);
 
         let Some(classification) =
-            classify_with_anchor(&node, symbol.as_ref())
+            classify_with_witness(&node, symbol.as_ref())
         else {
             continue;
         };
 
         stats.anchored_hits += 1;
+        stats.witness_hits += 1;
 
         let (
             symbol_kind,
@@ -654,12 +774,14 @@ fn distill_source_ast_grep(
 
         if match_value.truncated
             || classification.anchor.truncated
+            || classification.subject.truncated
+            || classification.statement.truncated
             || symbol_name_truncated
         {
             stats.lossy_hits += 1;
         }
 
-        let key = RecordKey {
+        let group_key = GroupKey {
             file: relative_file.to_string(),
             symbol_kind,
             symbol_name,
@@ -671,11 +793,20 @@ fn distill_source_ast_grep(
             anchor: classification.anchor.text,
         };
 
-        let entry = aggregates.entry(key).or_default();
+        let variant_key = VariantKey {
+            subject_text: classification.subject.text,
+            statement_text: classification.statement.text,
+        };
 
-        entry.hit_count += 1;
-        entry.queries.insert(hit.query);
-        entry.lines.insert(hit.line);
+        let group = aggregates.entry(group_key).or_default();
+        group.hit_count += 1;
+        group.queries.insert(hit.query);
+        group.lines.insert(hit.line);
+
+        let variant = group.variants.entry(variant_key).or_default();
+        variant.hit_count += 1;
+        variant.queries.insert(hit.query);
+        variant.lines.insert(hit.line);
     }
 
     Ok(stats)
@@ -736,7 +867,7 @@ fn main() -> Result<()> {
             .push(hit.clone());
     }
 
-    let mut aggregates: BTreeMap<RecordKey, Aggregate> = BTreeMap::new();
+    let mut aggregates: BTreeMap<GroupKey, GroupAggregate> = BTreeMap::new();
 
     let mut unsupported_files = Vec::new();
     let mut errors = Vec::new();
@@ -745,6 +876,7 @@ fn main() -> Result<()> {
     let mut mapped_hits = 0usize;
     let mut exact_span_hits = 0usize;
     let mut anchored_hits = 0usize;
+    let mut witness_hits = 0usize;
     let mut lossy_hits = 0usize;
 
     for (relative_file, hits) in by_file {
@@ -809,6 +941,7 @@ fn main() -> Result<()> {
                 mapped_hits += stats.mapped_hits;
                 exact_span_hits += stats.exact_span_hits;
                 anchored_hits += stats.anchored_hits;
+                witness_hits += stats.witness_hits;
                 lossy_hits += stats.lossy_hits;
             }
 
@@ -821,21 +954,51 @@ fn main() -> Result<()> {
         }
     }
 
-    let total_records = aggregates.len();
+    let total_groups = aggregates.len();
 
-    let mut all_records: Vec<Record> = aggregates
+    let mut all_groups: Vec<Group> = aggregates
         .into_iter()
         .map(|(key, aggregate)| {
-            let mut lines: Vec<usize> = aggregate
+            let mut group_lines: Vec<usize> = aggregate
                 .lines
                 .iter()
                 .copied()
                 .take(MAX_REPORTED_LINES_PER_RECORD)
                 .collect();
+            group_lines.sort_unstable();
 
-            lines.sort_unstable();
+            let mut variants: Vec<Variant> = aggregate
+                .variants
+                .into_iter()
+                .map(|(variant_key, variant_aggregate)| {
+                    let mut lines: Vec<usize> = variant_aggregate
+                        .lines
+                        .iter()
+                        .copied()
+                        .take(MAX_REPORTED_LINES_PER_RECORD)
+                        .collect();
+                    lines.sort_unstable();
 
-            Record {
+                    Variant {
+                        subject_text: variant_key.subject_text,
+                        statement_text: variant_key.statement_text,
+                        hit_count: variant_aggregate.hit_count,
+                        queries: variant_aggregate.queries.into_iter().collect(),
+                        hit_lines: lines,
+                        lines_truncated: variant_aggregate.lines.len()
+                            > MAX_REPORTED_LINES_PER_RECORD,
+                    }
+                })
+                .collect();
+
+            variants.sort_by(|a, b| {
+                b.hit_count
+                    .cmp(&a.hit_count)
+                    .then_with(|| a.statement_text.cmp(&b.statement_text))
+                    .then_with(|| a.subject_text.cmp(&b.subject_text))
+            });
+
+            Group {
                 file: key.file,
                 symbol_kind: key.symbol_kind,
                 symbol_name: key.symbol_name,
@@ -847,66 +1010,78 @@ fn main() -> Result<()> {
                 anchor: key.anchor,
                 hit_count: aggregate.hit_count,
                 queries: aggregate.queries.into_iter().collect(),
+                hit_lines: group_lines,
                 lines_truncated: aggregate.lines.len()
                     > MAX_REPORTED_LINES_PER_RECORD,
-                hit_lines: lines,
+                variants,
             }
         })
         .collect();
 
-    // Most repeated structural facts first.
-    // Tie-breakers keep output deterministic.
-    all_records.sort_by(|a, b| {
+    // Preserve the v2 summary ordering at the group level: repeated structural
+    // facts first. v3 variants then preserve differences inside each group.
+    all_groups.sort_by(|a, b| {
         b.hit_count
             .cmp(&a.hit_count)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.start_line.cmp(&b.start_line))
             .then_with(|| a.role.cmp(&b.role))
             .then_with(|| a.anchor.cmp(&b.anchor))
-            .then_with(|| a.match_text.cmp(&b.match_text))
     });
 
-    let mut records = Vec::new();
-    let mut record_bytes = 0usize;
+    let total_variants: usize = all_groups.iter().map(|g| g.variants.len()).sum();
+    let variant_diversity = if raw_hits > 0 {
+        total_variants as f64 / raw_hits as f64
+    } else {
+        0.0
+    };
+
+    let mut groups = Vec::new();
+    let mut group_bytes = 0usize;
+    let mut shown_variants = 0usize;
     let mut truncated = false;
 
-    for record in all_records {
-        let encoded = serde_json::to_vec(&record)?;
+    for group in all_groups {
+        let encoded = serde_json::to_vec(&group)?;
 
-        if record_bytes + encoded.len() > budget {
+        if group_bytes + encoded.len() > budget {
             truncated = true;
             continue;
         }
 
-        record_bytes += encoded.len();
-        records.push(record);
+        group_bytes += encoded.len();
+        shown_variants += group.variants.len();
+        groups.push(group);
     }
 
     let unresolved_hits = raw_hits.saturating_sub(mapped_hits);
 
-    let location_complete =
-        raw_hits > 0 && exact_span_hits == raw_hits;
+    let location_complete = raw_hits > 0 && exact_span_hits == raw_hits;
 
     let anchor_complete =
-        raw_hits > 0
-            && anchored_hits == raw_hits
-            && lossy_hits == 0;
+        raw_hits > 0 && anchored_hits == raw_hits && lossy_hits == 0;
+
+    let witness_complete =
+        raw_hits > 0 && witness_hits == raw_hits && lossy_hits == 0;
 
     let distill_complete =
         unsupported_files.is_empty()
             && errors.is_empty()
             && unresolved_hits == 0;
 
-    let safe_for_replacement =
+    let ir_complete =
         distill_complete
             && location_complete
             && anchor_complete
-            && !truncated;
+            && witness_complete
+            && !truncated
+            && groups.len() == total_groups
+            && shown_variants == total_variants;
 
-    let representation = if records.is_empty() {
+    let representation = if groups.is_empty() {
         "none"
     } else {
-        "structural"
+        "evidence_ir"
     };
 
     let response = Response {
@@ -918,29 +1093,38 @@ fn main() -> Result<()> {
         mapped_hits,
         exact_span_hits,
         anchored_hits,
+        witness_hits,
         lossy_hits,
         unresolved_hits,
 
-        structural_records_total: total_records,
-        structural_records_shown: records.len(),
+        groups_total: total_groups,
+        groups_shown: groups.len(),
+        variants_total: total_variants,
+        variants_shown: shown_variants,
+        variant_diversity,
 
         parsed_files,
         unsupported_files,
         errors,
 
         budget_bytes: budget,
-        output_record_bytes: record_bytes,
+        output_group_bytes: group_bytes,
 
         location_complete,
         anchor_complete,
+        witness_complete,
         distill_complete,
-        safe_for_replacement,
+        ir_complete,
+
+        v2_grouping_preserved: true,
+        context_complete: false,
+        context_omitted: true,
 
         truncated,
 
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
 
-        records,
+        groups,
     };
 
     serde_json::to_writer(io::stdout(), &response)?;
@@ -1000,7 +1184,7 @@ mod tests {
         source: &str,
         lang: SupportLang,
         hits: Vec<Hit>,
-    ) -> (SourceStats, BTreeMap<RecordKey, Aggregate>) {
+    ) -> (SourceStats, BTreeMap<GroupKey, GroupAggregate>) {
         let mut aggregates = BTreeMap::new();
 
         let stats = distill_source_ast_grep(
@@ -1016,7 +1200,7 @@ mod tests {
     }
 
     fn count_for_anchor(
-        aggregates: &BTreeMap<RecordKey, Aggregate>,
+        aggregates: &BTreeMap<GroupKey, GroupAggregate>,
         anchor: &str,
     ) -> usize {
         aggregates
@@ -1026,21 +1210,30 @@ mod tests {
             .sum()
     }
 
-    #[test]
-    fn python_preserves_distinct_callees_and_aggregates_repeats() {
-        let source = r#"
-import requests
-import httpx
+    fn variants_for_anchor<'a>(
+        aggregates: &'a BTreeMap<GroupKey, GroupAggregate>,
+        anchor: &str,
+    ) -> Vec<(&'a VariantKey, &'a VariantAggregate)> {
+        aggregates
+            .iter()
+            .filter(|(key, _)| key.anchor == anchor)
+            .flat_map(|(_, group)| group.variants.iter())
+            .collect()
+    }
 
-requests.get(url)
-requests.get(url2)
-httpx.post(url3)
+    #[test]
+    fn python_preserves_v2_grouping_but_keeps_witness_variants() {
+        let source = r#"
+def load():
+    a = requests.get(URL_A)
+    b = requests.get(URL_B)
+    return requests.get(FALLBACK)
 "#;
 
         let hits = vec![
             exact_hit("sample.py", source, "requests.get", 1, 1),
             exact_hit("sample.py", source, "requests.get", 2, 1),
-            exact_hit("sample.py", source, "httpx.post", 1, 1),
+            exact_hit("sample.py", source, "requests.get", 3, 1),
         ];
 
         let (stats, aggregates) =
@@ -1049,10 +1242,49 @@ httpx.post(url3)
         assert_eq!(stats.mapped_hits, 3);
         assert_eq!(stats.exact_span_hits, 3);
         assert_eq!(stats.anchored_hits, 3);
+        assert_eq!(stats.witness_hits, 3);
         assert_eq!(stats.lossy_hits, 0);
 
-        assert_eq!(count_for_anchor(&aggregates, "requests.get"), 2);
-        assert_eq!(count_for_anchor(&aggregates, "httpx.post"), 1);
+        // v2's useful grouping remains: one scope/role/anchor group with 3 hits.
+        assert_eq!(count_for_anchor(&aggregates, "requests.get"), 3);
+
+        // v3 strengthens it by keeping the three occurrence-level witnesses.
+        let variants = variants_for_anchor(&aggregates, "requests.get");
+        assert_eq!(variants.len(), 3);
+
+        let statements: BTreeSet<_> = variants
+            .iter()
+            .map(|(key, _)| key.statement_text.as_str())
+            .collect();
+
+        assert!(statements.contains("a = requests.get(URL_A)"));
+        assert!(statements.contains("b = requests.get(URL_B)"));
+        assert!(statements.contains("return requests.get(FALLBACK)"));
+    }
+
+    #[test]
+    fn repeated_identical_witnesses_are_compressed_not_deleted() {
+        let source = r#"
+def load():
+    requests.get(DEFAULT_URL)
+    requests.get(DEFAULT_URL)
+    requests.get(DEFAULT_URL)
+"#;
+
+        let hits = vec![
+            exact_hit("sample.py", source, "requests.get", 1, 1),
+            exact_hit("sample.py", source, "requests.get", 2, 1),
+            exact_hit("sample.py", source, "requests.get", 3, 1),
+        ];
+
+        let (_, aggregates) =
+            distill_for_test("sample.py", source, SupportLang::Python, hits);
+
+        let variants = variants_for_anchor(&aggregates, "requests.get");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].1.hit_count, 3);
+        assert_eq!(variants[0].0.subject_text, "requests.get(DEFAULT_URL)");
+        assert_eq!(variants[0].0.statement_text, "requests.get(DEFAULT_URL)");
     }
 
     #[test]
@@ -1069,14 +1301,13 @@ httpx.post(url3)
             distill_for_test("sample.py", source, SupportLang::Python, hits);
 
         assert_eq!(stats.exact_span_hits, 3);
-
         assert_eq!(count_for_anchor(&aggregates, "foo"), 1);
         assert_eq!(count_for_anchor(&aggregates, "bar"), 1);
         assert_eq!(count_for_anchor(&aggregates, "baz"), 1);
     }
 
     #[test]
-    fn typescript_call_anchors_are_preserved() {
+    fn typescript_call_anchors_and_witnesses_are_preserved() {
         let source = r#"
 function run() {
   client.fetch(url);
@@ -1097,12 +1328,13 @@ function run() {
         );
 
         assert_eq!(stats.exact_span_hits, 2);
+        assert_eq!(stats.witness_hits, 2);
         assert_eq!(count_for_anchor(&aggregates, "client.fetch"), 1);
         assert_eq!(count_for_anchor(&aggregates, "axios.get"), 1);
     }
 
     #[test]
-    fn rust_call_anchors_are_preserved() {
+    fn rust_call_anchors_and_witnesses_are_preserved() {
         let source = r#"
 fn run() {
     client.fetch(url);
@@ -1119,12 +1351,13 @@ fn run() {
             distill_for_test("sample.rs", source, SupportLang::Rust, hits);
 
         assert_eq!(stats.exact_span_hits, 2);
+        assert_eq!(stats.witness_hits, 2);
         assert_eq!(count_for_anchor(&aggregates, "client.fetch"), 1);
         assert_eq!(count_for_anchor(&aggregates, "http::get"), 1);
     }
 
     #[test]
-    fn go_call_anchors_are_preserved() {
+    fn go_call_anchors_and_witnesses_are_preserved() {
         let source = r#"
 package sample
 
@@ -1143,6 +1376,7 @@ func run() {
             distill_for_test("sample.go", source, SupportLang::Go, hits);
 
         assert_eq!(stats.exact_span_hits, 2);
+        assert_eq!(stats.witness_hits, 2);
         assert_eq!(count_for_anchor(&aggregates, "client.Fetch"), 1);
         assert_eq!(count_for_anchor(&aggregates, "http.Get"), 1);
     }
@@ -1163,14 +1397,12 @@ func run() {
         };
 
         let resolved = resolve_hit(source, &root, &hit).unwrap();
-
         assert!(!resolved.exact_span);
     }
 
     #[test]
     fn parse_errors_are_rejected() {
         let source = "def broken(:\n    pass\n";
-
         let mut aggregates = BTreeMap::new();
 
         let hit = Hit {

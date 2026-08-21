@@ -11,7 +11,16 @@ const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
 const QUERY_TIMEOUT_MS = 1500
 
-const SEARCH_PROTOCOL = "search-v2.3.2-global"
+const DISTILLER_TIMEOUT_MS = 500
+const DISTILLER_MAX_STDOUT_BYTES = 512 * 1024
+const DISTILLER_RAW_BODY_PRESSURE_BYTES = 2500
+const DISTILLER_MAX_HITS_PER_FILE = 12
+const DISTILLER_IR_BUDGET_BYTES = 32 * 1024
+const HYBRID_MIN_SAVINGS_RATIO = 0.75
+const HYBRID_CONTEXT_RADIUS = 1
+const HYBRID_CONTEXT_SAMPLES_PER_GROUP = 3
+
+const SEARCH_PROTOCOL = "search-v2.5.0-global"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -457,6 +466,482 @@ function mergeHits(results) {
   }
 
   return hits
+}
+
+function spanCaptureComplete(results) {
+  return results.every((result) =>
+    result.matches.every(
+      (match) => Array.isArray(match.exactSpans) && match.exactSpans.length > 0,
+    ),
+  )
+}
+
+function distillerHitsFromMerged(hits) {
+  const unique = new Map()
+
+  for (const hit of hits.values()) {
+    for (const span of hit.exactSpans ?? []) {
+      const startByte = span?.startByte
+      const endByte = span?.endByte
+      const queryIndex = span?.queryIndex
+
+      if (
+        !Number.isSafeInteger(startByte) ||
+        !Number.isSafeInteger(endByte) ||
+        !Number.isInteger(queryIndex) ||
+        startByte < 0 ||
+        endByte <= startByte
+      ) {
+        continue
+      }
+
+      const key = `${hit.file}\0${startByte}\0${endByte}`
+      const query = queryIndex + 1
+      const existing = unique.get(key)
+
+      if (!existing || query < existing.query) {
+        unique.set(key, {
+          file: hit.file,
+          line: hit.line,
+          query,
+          start_byte: startByte,
+          end_byte: endByte,
+        })
+      }
+    }
+  }
+
+  return [...unique.values()].sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.start_byte - b.start_byte ||
+      a.end_byte - b.end_byte ||
+      a.query - b.query,
+  )
+}
+
+function maxHitsInOneFile(hits) {
+  const counts = new Map()
+  let max = 0
+
+  for (const hit of hits.values()) {
+    const count = (counts.get(hit.file) ?? 0) + 1
+    counts.set(hit.file, count)
+    if (count > max) max = count
+  }
+
+  return max
+}
+
+function evidencePressure(hits, rawRendered, rawEvidenceComplete) {
+  const reasons = []
+  const maxHitsPerFile = maxHitsInOneFile(hits)
+
+  if (!rawEvidenceComplete) reasons.push("raw_output_budget")
+  if (rawRendered.bodyBytes >= DISTILLER_RAW_BODY_PRESSURE_BYTES) {
+    reasons.push("raw_body_bytes")
+  }
+  if (maxHitsPerFile >= DISTILLER_MAX_HITS_PER_FILE) {
+    reasons.push("hits_per_file")
+  }
+
+  return {
+    active: reasons.length > 0,
+    reasons,
+    maxHitsPerFile,
+  }
+}
+
+function distillerBinary() {
+  const override = process.env.OPENCODE_EVIDENCE_DISTILLER
+  if (typeof override === "string" && override.length > 0) return override
+
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+
+  return path.join(
+    home,
+    ".local",
+    "libexec",
+    "opencode-cpu-agent",
+    "opencode-evidence-distiller",
+  )
+}
+
+function runDistiller(root, hits) {
+  return new Promise((resolve) => {
+    const binary = distillerBinary()
+
+    if (!binary) {
+      resolve({
+        ok: false,
+        reason: "binary_path_unavailable",
+        elapsedMs: 0,
+      })
+      return
+    }
+
+    const started = performance.now()
+    const child = spawn(binary, [], {
+      cwd: root,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+
+    const stdout = []
+    const stderr = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+
+      resolve({
+        ...result,
+        elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+      })
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, DISTILLER_TIMEOUT_MS)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+
+      if (stdoutBytes > DISTILLER_MAX_STDOUT_BYTES) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      stdout.push(Buffer.from(chunk))
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= 4096) return
+
+      const remaining = 4096 - stderrBytes
+      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
+      stderr.push(Buffer.from(kept))
+      stderrBytes += kept.length
+    })
+
+    child.stdin.on("error", () => {
+      // spawn/close handlers determine the final fallback reason.
+    })
+
+    child.on("error", (error) => {
+      finish({
+        ok: false,
+        reason: "spawn_error",
+        error: String(error?.message ?? error),
+      })
+    })
+
+    child.on("close", (code, signal) => {
+      if (settled) return
+
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
+
+      if (timedOut) {
+        finish({
+          ok: false,
+          reason: "timeout",
+          error: stderrText || null,
+        })
+        return
+      }
+
+      if (outputLimited) {
+        finish({
+          ok: false,
+          reason: "stdout_limit",
+          error: stderrText || null,
+        })
+        return
+      }
+
+      if (code !== 0) {
+        finish({
+          ok: false,
+          reason: "exit_error",
+          exitCode: code,
+          signal: signal ?? null,
+          error: stderrText || null,
+        })
+        return
+      }
+
+      let response
+      try {
+        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
+      } catch (error) {
+        finish({
+          ok: false,
+          reason: "invalid_json",
+          error: String(error?.message ?? error),
+        })
+        return
+      }
+
+      // Rolling-upgrade compatibility: an old v2 helper is recognized, but its
+      // summary-only output is never allowed to replace raw evidence. v3 keeps
+      // v2's grouping idea inside enriched groups and adds witness variants.
+      if (response?.protocol === "evidence-distiller-v2") {
+        finish({
+          ok: false,
+          reason: "legacy_v2_summary_only",
+          response,
+        })
+        return
+      }
+
+      if (
+        response?.protocol !== "evidence-distiller-v3" ||
+        response?.representation !== "evidence_ir" ||
+        response?.ir_complete !== true ||
+        response?.location_complete !== true ||
+        response?.anchor_complete !== true ||
+        response?.witness_complete !== true ||
+        response?.v2_grouping_preserved !== true ||
+        response?.raw_hits !== hits.length ||
+        !Array.isArray(response?.groups) ||
+        response.groups.length < 1 ||
+        response?.groups_shown !== response.groups.length ||
+        response?.variants_shown !== response?.variants_total
+      ) {
+        finish({
+          ok: false,
+          reason: "unsafe_ir",
+          response,
+        })
+        return
+      }
+
+      finish({
+        ok: true,
+        reason: "ir_complete",
+        response,
+      })
+    })
+
+    try {
+      child.stdin.end(
+        JSON.stringify({
+          root,
+          hits,
+          budget_bytes: DISTILLER_IR_BUDGET_BYTES,
+        }),
+      )
+    } catch (error) {
+      child.kill("SIGKILL")
+      finish({
+        ok: false,
+        reason: "stdin_error",
+        error: String(error?.message ?? error),
+      })
+    }
+  })
+}
+
+function integerList(values) {
+  if (!Array.isArray(values)) return null
+
+  const result = [...new Set(values)]
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b)
+
+  return result.length > 0 ? result : null
+}
+
+function lineList(values) {
+  const lines = integerList(values)
+  return lines ? lines.join(",") : "-"
+}
+
+function queryLabels(values) {
+  const queries = integerList(values)
+  return queries ? queries.map((value) => `Q${value}`).join(",") : null
+}
+
+function validateEvidenceGroup(group) {
+  if (
+    typeof group?.file !== "string" ||
+    typeof group?.symbol_kind !== "string" ||
+    typeof group?.symbol_name !== "string" ||
+    typeof group?.role !== "string" ||
+    typeof group?.node_kind !== "string" ||
+    typeof group?.match_text !== "string" ||
+    typeof group?.anchor !== "string" ||
+    !Number.isInteger(group?.start_line) ||
+    !Number.isInteger(group?.end_line) ||
+    !Number.isInteger(group?.hit_count) ||
+    group.hit_count < 1 ||
+    !queryLabels(group?.queries) ||
+    !Array.isArray(group?.hit_lines) ||
+    !Array.isArray(group?.variants) ||
+    group.variants.length < 1
+  ) {
+    return false
+  }
+
+  let variantHits = 0
+
+  for (const variant of group.variants) {
+    if (
+      typeof variant?.subject_text !== "string" ||
+      typeof variant?.statement_text !== "string" ||
+      !Number.isInteger(variant?.hit_count) ||
+      variant.hit_count < 1 ||
+      !queryLabels(variant?.queries) ||
+      !Array.isArray(variant?.hit_lines)
+    ) {
+      return false
+    }
+
+    variantHits += variant.hit_count
+  }
+
+  return variantHits === group.hit_count
+}
+
+async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
+  const core = []
+  let coreBytes = 0
+
+  function pushCore(line) {
+    const cost = bytes(line + "\n")
+    if (coreBytes + cost > bodyBudgetBytes) return false
+    core.push(line)
+    coreBytes += cost
+    return true
+  }
+
+  for (const group of groups) {
+    if (!validateEvidenceGroup(group)) {
+      return {
+        body: [],
+        bodyBytes: 0,
+        coreBytes: 0,
+        complete: false,
+        contextSamples: 0,
+        shownGroups: 0,
+        shownVariants: 0,
+        reason: "invalid_group",
+      }
+    }
+
+    const q = queryLabels(group.queries)
+    const header =
+      `${group.file}:${group.start_line}-${group.end_line} [${q}] ` +
+      `symbol=${JSON.stringify(group.symbol_name)} ` +
+      `role=${group.role} ` +
+      `anchor=${JSON.stringify(group.anchor)} ` +
+      `match=${JSON.stringify(group.match_text)} ` +
+      `hits=${group.hit_count} variants=${group.variants.length} ` +
+      `lines=${lineList(group.hit_lines)}` +
+      (group.lines_truncated ? ",…" : "")
+
+    if (!pushCore(header)) {
+      return {
+        body: core,
+        bodyBytes: coreBytes,
+        coreBytes,
+        complete: false,
+        contextSamples: 0,
+        shownGroups: 0,
+        shownVariants: 0,
+        reason: "witness_output_budget",
+      }
+    }
+
+    for (const variant of group.variants) {
+      const vq = queryLabels(variant.queries)
+      const same = variant.subject_text === variant.statement_text
+      const detail = same
+        ? `subject=${JSON.stringify(variant.subject_text)}`
+        : `subject=${JSON.stringify(variant.subject_text)} statement=${JSON.stringify(variant.statement_text)}`
+
+      const line =
+        `  x${variant.hit_count} [${vq}] ${detail} ` +
+        `lines=${lineList(variant.hit_lines)}` +
+        (variant.lines_truncated ? ",…" : "")
+
+      if (!pushCore(line)) {
+        return {
+          body: core,
+          bodyBytes: coreBytes,
+          coreBytes,
+          complete: false,
+          contextSamples: 0,
+          shownGroups: 0,
+          shownVariants: 0,
+          reason: "witness_output_budget",
+        }
+      }
+    }
+  }
+
+  // Witnesses are complete at this point. Context is deliberately sampled,
+  // never confused with complete raw context. Samples are all-or-nothing per
+  // group and use the already-proven file loader/path confinement.
+  const body = [...core]
+  let bodyBytes = coreBytes
+  let contextSamples = 0
+  const cache = new Map()
+
+  for (const group of groups) {
+    const lines = await loadLines(root, group.file, cache)
+    if (!lines || lines.length < 1) continue
+
+    for (const variant of group.variants.slice(0, HYBRID_CONTEXT_SAMPLES_PER_GROUP)) {
+      const exemplar = integerList(variant.hit_lines)?.[0]
+      if (!exemplar) continue
+
+      const start = Math.max(1, exemplar - HYBRID_CONTEXT_RADIUS)
+      const end = Math.min(lines.length, exemplar + HYBRID_CONTEXT_RADIUS)
+      const block = [
+        `  variant_context=${group.file}:${start}-${end} subject=${JSON.stringify(variant.subject_text)}`,
+      ]
+
+      for (let n = start; n <= end; n++) {
+        const marker = n === exemplar ? ">" : " "
+        block.push(`  ${marker} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`)
+      }
+
+      const blockBytes = block.reduce(
+        (total, line) => total + bytes(line + "\n"),
+        0,
+      )
+      if (bodyBytes + blockBytes > bodyBudgetBytes) continue
+
+      body.push(...block)
+      bodyBytes += blockBytes
+      contextSamples += 1
+    }
+  }
+
+  const shownVariants = groups.reduce(
+    (total, group) => total + group.variants.length,
+    0,
+  )
+
+  return {
+    body,
+    bodyBytes,
+    coreBytes,
+    complete: true,
+    contextSamples,
+    shownGroups: groups.length,
+    shownVariants,
+    reason: null,
+  }
 }
 
 async function renderEvidence(root, hits, bodyBudgetBytes) {
@@ -945,29 +1430,140 @@ export default {
             Math.max(0, callBudgetBytes - headerReserve),
           )
 
-          const rendered = await renderEvidence(root, hits, bodyBudget)
-          const evidenceComplete = rendered.shown.size === hits.size
-          const complete = scanComplete && evidenceComplete
-          const reasons = []
+          const rawRendered = await renderEvidence(root, hits, bodyBudget)
+          const rawEvidenceComplete = rawRendered.shown.size === hits.size
+          const rawComplete = scanComplete && rawEvidenceComplete
+          const rawReasons = []
 
-          if (!scanComplete) reasons.push("scan_incomplete")
-          if (!evidenceComplete) reasons.push("output_budget")
+          if (!scanComplete) rawReasons.push("scan_incomplete")
+          if (!rawEvidenceComplete) rawReasons.push("output_budget")
 
-          const header = [
-            `SEARCH complete=${complete} scan_complete=${scanComplete} evidence_complete=${evidenceComplete} unique_hits=${hits.size} shown_hits=${rendered.shown.size}`,
+          const rawHeader = [
+            `SEARCH complete=${rawComplete} scan_complete=${scanComplete} evidence_complete=${rawEvidenceComplete} unique_hits=${hits.size} shown_hits=${rawRendered.shown.size}`,
             ...querySummary,
           ]
 
-          if (reasons.length) header.push(`INCOMPLETE reasons=${reasons.join(",")}`)
+          if (rawReasons.length) {
+            rawHeader.push(`INCOMPLETE reasons=${rawReasons.join(",")}`)
+          }
 
-          const content = [...header, "", ...rendered.body].join("\n")
-          const resultBytes = bytes(content)
+          const rawContent = [...rawHeader, "", ...rawRendered.body].join("\n")
+          const rawResultBytes = bytes(rawContent)
 
-          if (resultBytes > callBudgetBytes) {
+          if (rawResultBytes > callBudgetBytes) {
             return await blockSearch("internal_budget_guard", {
-              result_bytes: resultBytes,
+              result_bytes: rawResultBytes,
               call_budget_bytes: callBudgetBytes,
             })
+          }
+
+          const pressure = evidencePressure(hits, rawRendered, rawEvidenceComplete)
+          const distillInput = distillerHitsFromMerged(hits)
+          const spansComplete = spanCaptureComplete(results)
+
+          let representation = "raw"
+          let content = rawContent
+          let resultBytes = rawResultBytes
+          let bodyBytes = rawRendered.bodyBytes
+          let shownHits = rawRendered.shown.size
+          let evidenceComplete = rawEvidenceComplete
+          let complete = rawComplete
+
+          let distillAttempted = false
+          let distillReason = "not_needed"
+          let distillElapsedMs = null
+          let distillerElapsedMs = null
+          let distillIrComplete = null
+          let distillWitnessComplete = null
+          let v2GroupingPreserved = null
+          let hybridGroups = null
+          let hybridVariants = null
+          let hybridBodyBytes = null
+          let hybridCoreBytes = null
+          let hybridContextSamples = null
+          let hybridRatio = null
+          let variantDiversity = null
+
+          if (!scanComplete) distillReason = "scan_incomplete"
+          else if (!pressure.active) distillReason = "not_needed"
+          else if (!spansComplete) distillReason = "span_capture_incomplete"
+          else if (distillInput.length < 1) distillReason = "no_exact_spans"
+          else {
+            distillAttempted = true
+
+            const distill = await runDistiller(root, distillInput)
+            distillElapsedMs = distill.elapsedMs
+
+            if (!distill.ok) {
+              distillReason = distill.reason
+              distillIrComplete = distill.response?.ir_complete ?? false
+              distillWitnessComplete = distill.response?.witness_complete ?? false
+              v2GroupingPreserved = distill.response?.v2_grouping_preserved ?? null
+            } else {
+              distillIrComplete = true
+              distillWitnessComplete = true
+              v2GroupingPreserved = true
+              variantDiversity = Number.isFinite(distill.response?.variant_diversity)
+                ? distill.response.variant_diversity
+                : null
+              distillerElapsedMs = Number.isFinite(distill.response?.elapsed_ms)
+                ? distill.response.elapsed_ms
+                : null
+
+              const hybridRendered = await renderHybridEvidence(
+                root,
+                distill.response.groups,
+                bodyBudget,
+              )
+
+              hybridGroups = hybridRendered.shownGroups
+              hybridVariants = hybridRendered.shownVariants
+              hybridBodyBytes = hybridRendered.bodyBytes
+              hybridCoreBytes = hybridRendered.coreBytes
+              hybridContextSamples = hybridRendered.contextSamples
+
+              if (!hybridRendered.complete) {
+                distillReason = hybridRendered.reason ?? "hybrid_render_incomplete"
+              } else {
+                const contextSampled = hybridRendered.contextSamples > 0
+                const hybridHeader = [
+                  `SEARCH representation=hybrid complete=true scan_complete=true evidence_complete=true matches_complete=true witnesses_complete=true context_complete=false context_sampled=${contextSampled} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
+                  ...querySummary,
+                ]
+
+                const hybridContent = [
+                  ...hybridHeader,
+                  "",
+                  ...hybridRendered.body,
+                ].join("\n")
+                const hybridResultBytes = bytes(hybridContent)
+                hybridRatio = rawResultBytes > 0
+                  ? Math.round((hybridResultBytes / rawResultBytes) * 1000) / 1000
+                  : null
+
+                const materiallySmaller =
+                  rawResultBytes > 0 &&
+                  hybridResultBytes <= rawResultBytes * HYBRID_MIN_SAVINGS_RATIO
+
+                const hybridBeneficial =
+                  !rawEvidenceComplete || materiallySmaller
+
+                if (hybridResultBytes > callBudgetBytes) {
+                  distillReason = "hybrid_output_budget"
+                } else if (!hybridBeneficial) {
+                  distillReason = "no_material_size_reduction"
+                } else {
+                  representation = "hybrid"
+                  content = hybridContent
+                  resultBytes = hybridResultBytes
+                  bodyBytes = hybridRendered.bodyBytes
+                  shownHits = hits.size
+                  evidenceComplete = true
+                  complete = true
+                  distillReason = "selected"
+                }
+              }
+            }
           }
 
           if (state) {
@@ -988,16 +1584,38 @@ export default {
             queries,
             path: target,
             glob: glob ?? null,
+            representation,
             unique_hits: hits.size,
             exact_span_hits: exactSpanHits,
-            shown_hits: rendered.shown.size,
+            distill_input_hits: distillInput.length,
+            shown_hits: shownHits,
             scan_complete: scanComplete,
             evidence_complete: evidenceComplete,
             complete,
             elapsed_ms: elapsedMs,
             output_bytes: resultBytes,
-            body_bytes: rendered.bodyBytes,
+            body_bytes: bodyBytes,
             body_budget_bytes: bodyBudget,
+            raw_output_bytes: rawResultBytes,
+            raw_body_bytes: rawRendered.bodyBytes,
+            raw_evidence_complete: rawEvidenceComplete,
+            pressure_active: pressure.active,
+            pressure_reasons: pressure.reasons,
+            max_hits_per_file: pressure.maxHitsPerFile,
+            distill_attempted: distillAttempted,
+            distill_reason: distillReason,
+            distill_elapsed_ms: distillElapsedMs,
+            distiller_elapsed_ms: distillerElapsedMs,
+            distill_ir_complete: distillIrComplete,
+            distill_witness_complete: distillWitnessComplete,
+            v2_grouping_preserved: v2GroupingPreserved,
+            hybrid_groups: hybridGroups,
+            hybrid_variants: hybridVariants,
+            hybrid_body_bytes: hybridBodyBytes,
+            hybrid_core_bytes: hybridCoreBytes,
+            hybrid_context_samples: hybridContextSamples,
+            hybrid_ratio: hybridRatio,
+            variant_diversity: variantDiversity,
             turn_model_calls: state?.modelCalls ?? null,
             turn_search_attempts: state?.searchAttempts ?? null,
             turn_executed_searches: state?.executedSearches ?? null,
@@ -1014,11 +1632,14 @@ export default {
               turn_model_calls: state?.modelCalls ?? null,
               turn_executed_searches: state?.executedSearches ?? null,
               turn_evidence_bytes: state?.evidenceBytes ?? null,
+              representation,
               unique_hits: hits.size,
-              shown_hits: rendered.shown.size,
+              shown_hits: shownHits,
               scan_complete: scanComplete,
               evidence_complete: evidenceComplete,
               complete,
+              distill_attempted: distillAttempted,
+              distill_reason: distillReason,
               elapsed_ms: elapsedMs,
             },
           }
