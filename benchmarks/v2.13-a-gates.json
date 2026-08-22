@@ -1,0 +1,53 @@
+{
+  "version": "v2.13-A",
+  "protocol": "search-v2.13.0-impact-shadow",
+  "helper_protocol": "impact-index-v1",
+  "goal": "measure precision-first non-lexical impact recovery without changing v2.12 routing",
+  "gates": [
+    {
+      "name": "exact_edges",
+      "expect": {
+        "forward_reverse": true,
+        "bindings_and_witness": true,
+        "ambiguous_resolution_rejected": true
+      }
+    },
+    {
+      "name": "persistent_query_path",
+      "expect": {
+        "warm_reindexed": 0,
+        "neighbors_without_repo_walk": true,
+        "dirty_reindexed": 1
+      }
+    },
+    {
+      "name": "shadow_recovery",
+      "expect": {
+        "graph_lexical_misses_min": 1,
+        "routing_unchanged": true,
+        "graph_hidden_from_model_output": true
+      }
+    },
+    {
+      "name": "warm_runtime",
+      "expect": {
+        "refresh_due": false
+      }
+    },
+    {
+      "name": "fail_open",
+      "expect": {
+        "lexical_search_complete": true
+      }
+    },
+    {
+      "name": "v2_12_b_regression",
+      "expect": {
+        "target_initial_rank": 5,
+        "target_probe_rank": 1,
+        "probed_files": 8,
+        "emitted_files": 4
+      }
+    }
+  ]
+}

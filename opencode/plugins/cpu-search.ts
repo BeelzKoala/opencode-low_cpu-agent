@@ -29,6 +29,13 @@ const DISTILLER_MAX_STDOUT_BYTES = 512 * 1024
 const DISTILLER_RAW_BODY_PRESSURE_BYTES = 2500
 const DISTILLER_MAX_HITS_PER_FILE = 12
 const DISTILLER_IR_BUDGET_BYTES = 32 * 1024
+
+const IMPACT_INDEX_REFRESH_TIMEOUT_MS = 800
+const IMPACT_INDEX_QUERY_TIMEOUT_MS = 150
+const IMPACT_INDEX_MAX_STDOUT_BYTES = 128 * 1024
+const IMPACT_INDEX_MAX_SEEDS = PROBE_MAX_FILES
+const IMPACT_INDEX_MAX_NEIGHBORS = 24
+const IMPACT_INDEX_REFRESH_TTL_MS = 120_000
 const HYBRID_MIN_SAVINGS_RATIO = 0.75
 const HYBRID_CONTEXT_RADIUS = 1
 const HYBRID_CONTEXT_SAMPLES_PER_GROUP = 3
@@ -55,7 +62,7 @@ const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.12.1-probe-emit-router"
+const SEARCH_PROTOCOL = "search-v2.13.0-impact-shadow"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -118,6 +125,7 @@ async function writeProjectTrace(root, fileName, record) {
 }
 
 const sessionStates = new Map()
+const impactIndexRefreshAt = new Map()
 
 function dropSessionState(sessionID) {
   sessionStates.delete(sessionID)
@@ -1624,6 +1632,176 @@ function runDistiller(root, hits) {
       })
     }
   })
+}
+
+
+function impactIndexBinary() {
+  const override = process.env.OPENCODE_IMPACT_INDEX
+  if (typeof override === "string" && override.length > 0) return override
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-impact-index")
+}
+
+function runImpactIndexRequest(root, request, timeoutMs) {
+  return new Promise((resolve) => {
+    const binary = impactIndexBinary()
+    if (!binary) {
+      resolve({ ok: false, reason: "binary_path_unavailable", elapsedMs: 0 })
+      return
+    }
+    const started = performance.now()
+    const child = spawn(binary, [], { cwd: root, stdio: ["pipe", "pipe", "pipe"] })
+    const stdout = []
+    const stderr = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
+    }
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, timeoutMs)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+      if (stdoutBytes > IMPACT_INDEX_MAX_STDOUT_BYTES) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+      stdout.push(Buffer.from(chunk))
+    })
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= 4096) return
+      const remaining = 4096 - stderrBytes
+      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
+      stderr.push(Buffer.from(kept))
+      stderrBytes += kept.length
+    })
+    child.stdin.on("error", () => {})
+    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", error: String(error?.message ?? error) }))
+    child.on("close", (code, signal) => {
+      if (settled) return
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
+      if (timedOut) return finish({ ok: false, reason: "timeout", error: stderrText || null })
+      if (outputLimited) return finish({ ok: false, reason: "stdout_limit", error: stderrText || null })
+      if (code !== 0) return finish({ ok: false, reason: "exit_error", exitCode: code, signal: signal ?? null, error: stderrText || null })
+      let response
+      try {
+        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
+      } catch (error) {
+        return finish({ ok: false, reason: "invalid_json", error: String(error?.message ?? error) })
+      }
+      if (response?.protocol !== "impact-index-v1") return finish({ ok: false, reason: "protocol_mismatch", response })
+      finish({ ok: true, reason: "ok", response })
+    })
+    try {
+      child.stdin.end(JSON.stringify({ root, ...request }))
+    } catch (error) {
+      child.kill("SIGKILL")
+      finish({ ok: false, reason: "stdin_error", error: String(error?.message ?? error) })
+    }
+  })
+}
+
+async function runImpactIndexShadow(root, seedFiles) {
+  const seeds = [...new Set(
+    (seedFiles ?? [])
+      .map((entry) => typeof entry === "string" ? entry : entry?.file)
+      .filter((value) => typeof value === "string" && value.length > 0),
+  )].slice(0, IMPACT_INDEX_MAX_SEEDS)
+
+  if (seeds.length === 0) {
+    return { attempted: false, ok: false, reason: "no_seed_files", seeds, elapsedMs: 0, refresh: null, query: null }
+  }
+
+  const started = performance.now()
+  const previousRefresh = impactIndexRefreshAt.get(root) ?? 0
+  const refreshDue = nowMs() - previousRefresh >= IMPACT_INDEX_REFRESH_TTL_MS
+  let refresh = null
+
+  if (refreshDue) {
+    refresh = await runImpactIndexRequest(root, { mode: "refresh" }, IMPACT_INDEX_REFRESH_TIMEOUT_MS)
+    if (refresh.ok && refresh.response?.mode === "refresh" && refresh.response?.ready === true && refresh.response?.refresh_complete === true) {
+      impactIndexRefreshAt.set(root, nowMs())
+    }
+  }
+
+  const query = await runImpactIndexRequest(
+    root,
+    { mode: "neighbors", seed_files: seeds, max_neighbors: IMPACT_INDEX_MAX_NEIGHBORS },
+    IMPACT_INDEX_QUERY_TIMEOUT_MS,
+  )
+  const querySafe = query.ok && query.response?.mode === "neighbors" && query.response?.ready === true && Array.isArray(query.response?.neighbors)
+
+  return {
+    attempted: true,
+    ok: querySafe,
+    reason: querySafe
+      ? refreshDue
+        ? refresh?.ok === true && refresh.response?.refresh_complete === true
+          ? "shadow_refreshed"
+          : "shadow_stale_after_refresh_failure"
+        : "shadow_warm"
+      : query.reason ?? "query_unavailable",
+    seeds,
+    elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+    refreshDue,
+    refresh,
+    query,
+  }
+}
+
+function impactIndexShadowStats(result, lexicalFiles) {
+  const lexical = new Set((lexicalFiles ?? []).map((entry) => evidenceFileKey(typeof entry === "string" ? entry : entry?.file)))
+  const neighbors = result?.ok && Array.isArray(result?.query?.response?.neighbors) ? result.query.response.neighbors : []
+  const lexicalMisses = neighbors.filter((neighbor) => typeof neighbor?.file === "string" && !lexical.has(evidenceFileKey(neighbor.file)))
+  const refresh = result?.refresh?.response ?? null
+  const query = result?.query?.response ?? null
+
+  return {
+    attempted: result?.attempted === true,
+    ok: result?.ok === true,
+    reason: result?.reason ?? "unknown",
+    elapsedMs: result?.elapsedMs ?? 0,
+    refreshDue: result?.refreshDue ?? false,
+    refreshOk: result?.refresh?.ok === true && refresh?.mode === "refresh" && refresh?.ready === true && refresh?.refresh_complete === true,
+    refreshReason: result?.refresh?.reason ?? null,
+    refreshElapsedMs: result?.refresh?.elapsedMs ?? null,
+    queryElapsedMs: result?.query?.elapsedMs ?? null,
+    cacheAgeMs: query?.cache_age_ms ?? null,
+    filesTotal: query?.files_total ?? refresh?.files_total ?? null,
+    filesReused: refresh?.files_reused ?? null,
+    filesReindexed: refresh?.files_reindexed ?? null,
+    filesRemoved: refresh?.files_removed ?? null,
+    importsTotal: query?.imports_total ?? refresh?.imports_total ?? null,
+    edgesTotal: query?.edges_total ?? refresh?.edges_total ?? null,
+    resolvedImports: refresh?.resolved_imports ?? null,
+    unresolvedImports: refresh?.unresolved_imports ?? null,
+    neighborsTotal: query?.neighbors_total ?? null,
+    neighborsShown: neighbors.length,
+    lexicalMisses: lexicalMisses.length,
+    forwardNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "forward").length,
+    reverseNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "reverse").length,
+    candidates: lexicalMisses.slice(0, IMPACT_INDEX_MAX_NEIGHBORS).map((neighbor) => ({
+      file: neighbor.file,
+      seed: neighbor.seed,
+      direction: neighbor.direction,
+      kind: neighbor.kind,
+      confidence: neighbor.confidence,
+      witness_file: neighbor.witness_file,
+      witness_line: neighbor.witness_line,
+      spec: neighbor.spec,
+      bindings: Array.isArray(neighbor.bindings) ? neighbor.bindings : [],
+      witness: neighbor.witness ?? null,
+    })),
+  }
 }
 
 function integerList(values) {
@@ -3372,6 +3550,7 @@ export default {
           )
           const rankedFiles = rankDiscoveredFiles(discoveryResults)
           const probeFiles = selectProbeFiles(rankedFiles, discoveryResults)
+          const impactIndexShadowPromise = runImpactIndexShadow(root, probeFiles)
           const probeFileSet = new Set(probeFiles.map((entry) => entry.file))
           const allDiscoveredFilesProbed =
             rankedFiles.length === probeFileSet.size
@@ -3439,6 +3618,10 @@ export default {
 
           const probeRankedFiles = rankProbedFiles(rankedFiles, probeResults)
           const selectedFiles = selectEmitFiles(probeRankedFiles, discoveryResults)
+          const impactIndexShadow = impactIndexShadowStats(
+            await impactIndexShadowPromise,
+            rankedFiles,
+          )
           const selectedFileSet = new Set(
             selectedFiles.map((entry) => entry.file),
           )
@@ -4205,6 +4388,31 @@ export default {
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
             probe_elapsed_ms: refineElapsedMs,
+            impact_index_shadow_attempted: impactIndexShadow.attempted,
+            impact_index_shadow_ok: impactIndexShadow.ok,
+            impact_index_shadow_reason: impactIndexShadow.reason,
+            impact_index_shadow_elapsed_ms: impactIndexShadow.elapsedMs,
+            impact_index_refresh_due: impactIndexShadow.refreshDue,
+            impact_index_refresh_ok: impactIndexShadow.refreshOk,
+            impact_index_refresh_reason: impactIndexShadow.refreshReason,
+            impact_index_refresh_elapsed_ms: impactIndexShadow.refreshElapsedMs,
+            impact_index_query_elapsed_ms: impactIndexShadow.queryElapsedMs,
+            impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
+            impact_index_files_total: impactIndexShadow.filesTotal,
+            impact_index_files_reused: impactIndexShadow.filesReused,
+            impact_index_files_reindexed: impactIndexShadow.filesReindexed,
+            impact_index_files_removed: impactIndexShadow.filesRemoved,
+            impact_index_imports_total: impactIndexShadow.importsTotal,
+            impact_index_edges_total: impactIndexShadow.edgesTotal,
+            impact_index_resolved_imports: impactIndexShadow.resolvedImports,
+            impact_index_unresolved_imports: impactIndexShadow.unresolvedImports,
+            impact_index_neighbors_total: impactIndexShadow.neighborsTotal,
+            impact_index_neighbors_shown: impactIndexShadow.neighborsShown,
+            impact_index_lexical_misses: impactIndexShadow.lexicalMisses,
+            impact_index_forward_neighbors: impactIndexShadow.forwardNeighbors,
+            impact_index_reverse_neighbors: impactIndexShadow.reverseNeighbors,
+            impact_index_shadow_candidates: impactIndexShadow.candidates,
+            impact_index_routing_unchanged: true,
             probe_files: probeFiles.map((entry) => ({
               file: entry.file,
               queries: [...entry.queries].sort((a, b) => a - b),
@@ -4368,6 +4576,12 @@ export default {
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
               probe_elapsed_ms: refineElapsedMs,
+            impact_index_shadow_ok: impactIndexShadow.ok,
+            impact_index_shadow_reason: impactIndexShadow.reason,
+            impact_index_lexical_misses: impactIndexShadow.lexicalMisses,
+            impact_index_neighbors_shown: impactIndexShadow.neighborsShown,
+            impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
+            impact_index_routing_unchanged: true,
               probed_files: probeFileSet.size,
               emitted_files: selectedFileSet.size,
               probe_files: probeFiles.map((entry) => entry.file),

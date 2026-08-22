@@ -68,3 +68,22 @@ Secondary: touched/gold file recall, first useful region rank, useful coverage a
 2 KiB/4 KiB budgets, output bytes/search, dense searches resolved without
 `refinement_required=true`, no-progress loops, tool wall time, lexical retention and
 parse/unsupported fallbacks.
+
+### v2.13 — Impact Index
+
+#### v2.13-A — shadow gate
+- precision-first local dependency edges only; no PageRank/embeddings/full repo map;
+- persistent cache: `refresh` walks/stats the repo, `neighbors` reads adjacency only;
+- forward + reverse edges carry import binding, witness line and confidence;
+- graph candidates are telemetry-only and cannot change v2.12 probe/emit routing;
+- helper is fail-open; stale/missing/timed-out index cannot break lexical search.
+
+#### v2.13-B — guarded activation (after A passes)
+- preserve all 8 lexical probe slots;
+- add at most 2 graph hypotheses outside those slots;
+- graph edge is never evidence: bindings must be validated in source before ranking/emission;
+- emit budget remains <= 4 files/regions.
+
+#### v2.13-C — real-task freeze
+- accept only if non-lexical recovery improves without material model-context/model-call regression;
+- after freeze, discovery plane stops growing and work moves to v2.14 Patch Executor.

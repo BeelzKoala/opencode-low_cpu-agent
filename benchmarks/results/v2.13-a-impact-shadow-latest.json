@@ -1,0 +1,34 @@
+{
+  "protocol": "v2.13-a-impact-shadow-benchmark-v1",
+  "verdict": "PASS",
+  "gates": 5,
+  "impact_helper": {
+    "warm_reindexed": 0,
+    "dirty_reindexed": 1,
+    "forward_reverse": true,
+    "binding_witness": true,
+    "query_without_walk": true,
+    "warm_query_elapsed_ms": 0.039434000000000004
+  },
+  "shadow_runtime": {
+    "lexical_candidate_files": 1,
+    "graph_lexical_misses": 1,
+    "routing_unchanged": true,
+    "bindings": [
+      "handle"
+    ],
+    "query_elapsed_ms": 1.82
+  },
+  "warm_runtime": {
+    "refresh_due": false,
+    "cache_age_ms": 24329,
+    "query_elapsed_ms": 1.75
+  },
+  "fail_open": true,
+  "v2_12_b_regression": {
+    "initial_rank": 5,
+    "probe_rank": 1,
+    "probed_files": 8,
+    "emitted_files": 4
+  }
+}
