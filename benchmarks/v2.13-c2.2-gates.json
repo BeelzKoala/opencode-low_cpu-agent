@@ -1,0 +1,14 @@
+{
+  "version": "v2.13-C2.2-R",
+  "protocol": "search-v2.13.5-task-local-impact",
+  "gates": [
+    "task relevance is applied before neighbor cap on every active graph query",
+    "python and js/ts aliases preserve explicit local-to-source binding pairs",
+    "python parenthesized multiline imports are indexed as first-class exact local edges",
+    "routing and validation inspect up to 16 exact edge symbols while display remains capped",
+    "stale import witnesses are fingerprint-checked before routing",
+    "missing or changed seed files trigger one refresh-on-miss retry",
+    "graph neighbor cap is fair across lexical seed and direction lanes",
+    "lexical probe cap 8 / graph probe cap 2 / total 10 / emit 4 / graph emit 1 remain unchanged"
+  ]
+}

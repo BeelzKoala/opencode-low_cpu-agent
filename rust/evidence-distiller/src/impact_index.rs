@@ -10,7 +10,7 @@ use std::{
 };
 
 const PROTOCOL: &str = "impact-index-v1";
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 // Safety ceiling only. Git-aware inventory is the primary scaling mechanism.
 const DEFAULT_MAX_FILES: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -21,13 +21,32 @@ const MAX_BINDINGS: usize = 16;
 const MAX_WITNESS_CHARS: usize = 180;
 
 #[derive(Debug, Deserialize)]
+struct SeedFilter {
+    seed: String,
+    #[serde(default)]
+    forward_bindings: Vec<String>,
+    #[serde(default)]
+    reverse_source_symbols: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Request {
     root: String,
     mode: String,
     #[serde(default)]
     seed_files: Vec<String>,
     #[serde(default)]
+    seed_filters: Vec<SeedFilter>,
+    #[serde(default)]
     max_neighbors: Option<usize>,
+    #[serde(default)]
+    check_freshness: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct BindingPair {
+    local: String,
+    source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +59,8 @@ struct ImportRecord {
     // Identifier expected to exist in the target module/file.
     #[serde(default)]
     source_symbols: Vec<String>,
+    #[serde(default)]
+    binding_pairs: Vec<BindingPair>,
     witness: String,
     // exact_local can be activated; exact_local_resource remains shadow-only.
     confidence: String,
@@ -71,6 +92,8 @@ struct EdgeRecord {
     bindings: Vec<String>,
     #[serde(default)]
     source_symbols: Vec<String>,
+    #[serde(default)]
+    binding_pairs: Vec<BindingPair>,
     witness: String,
     confidence: String,
 }
@@ -129,6 +152,7 @@ struct Neighbor {
     spec: String,
     bindings: Vec<String>,
     source_symbols: Vec<String>,
+    binding_pairs: Vec<BindingPair>,
     witness: String,
     confidence: String,
 }
@@ -165,6 +189,9 @@ struct Response {
     seed_files: Vec<String>,
     neighbors_total: usize,
     neighbors: Vec<Neighbor>,
+    task_filters_applied: Option<bool>,
+    stale_seed_files: Option<usize>,
+    stale_witness_edges: Option<usize>,
     walk_elapsed_ms: Option<f64>,
     parse_elapsed_ms: Option<f64>,
     elapsed_ms: f64,
@@ -326,41 +353,65 @@ fn local_binding(source: &str, alias: Option<&str>) -> Option<String> {
     alias.and_then(ident).or_else(|| ident(source))
 }
 
-fn python_import_items(raw: &str) -> (Vec<String>, Vec<String>) {
-    let mut locals = BTreeSet::new();
-    let mut sources = BTreeSet::new();
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if values.len() < MAX_BINDINGS && !values.contains(&value) { values.push(value); }
+}
+
+fn push_pair(pairs: &mut Vec<BindingPair>, local: String, source: String) {
+    if pairs.len() >= MAX_BINDINGS { return; }
+    if !pairs.iter().any(|pair| pair.local == local && pair.source == source) {
+        pairs.push(BindingPair { local, source });
+    }
+}
+
+fn python_import_items(raw: &str) -> (Vec<String>, Vec<String>, Vec<BindingPair>) {
+    let mut locals = Vec::new();
+    let mut sources = Vec::new();
+    let mut pairs = Vec::new();
     for item in raw.split(',') {
         let mut parts = item.trim().split_whitespace();
         let source = parts.next().unwrap_or("");
         if source == "*" || source.is_empty() { continue; }
         let alias = if parts.next() == Some("as") { parts.next() } else { None };
-        if let Some(src) = ident(source) {
-            sources.insert(src.clone());
-            if let Some(local) = local_binding(&src, alias) { locals.insert(local); }
-        }
-        if locals.len() >= MAX_BINDINGS { break; }
+        let Some(src) = ident(source) else { continue; };
+        let Some(local) = local_binding(&src, alias) else { continue; };
+        push_unique(&mut locals, local.clone());
+        push_unique(&mut sources, src.clone());
+        push_pair(&mut pairs, local, src);
+        if pairs.len() >= MAX_BINDINGS { break; }
     }
-    (locals.into_iter().collect(), sources.into_iter().collect())
+    (locals, sources, pairs)
 }
 
 fn parse_python_import(line_no: usize, line: &str) -> Option<ImportRecord> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.contains('\\') { return None; }
+    if trimmed.is_empty() || trimmed.starts_with('#') { return None; }
 
     if let Some(rest) = trimmed.strip_prefix("from ") {
         let (spec, imported) = rest.split_once(" import ")?;
         let spec = spec.trim();
-        if spec.is_empty() || imported.contains('(') || imported.contains(')') { return None; }
-        let (bindings, source_symbols) = python_import_items(imported);
+        if spec.is_empty() { return None; }
+        let mut imported = imported.trim();
+        if imported.starts_with('(') && imported.ends_with(')') && imported.len() >= 2 {
+            imported = imported[1..imported.len()-1].trim();
+        }
+        // After statement collection, nested expressions are not valid import
+        // lists. Stay conservative instead of guessing through malformed code.
+        if imported.contains('(') || imported.contains(')') || imported.contains('\\') { return None; }
+        let (bindings, source_symbols, binding_pairs) = python_import_items(imported);
         if bindings.is_empty() { return None; }
         return Some(ImportRecord {
             spec: spec.to_string(), line: line_no, kind: "python_from".to_string(),
-            bindings, source_symbols, witness: clipped_witness(line), confidence: "exact_local".to_string(),
+            bindings, source_symbols, binding_pairs,
+            witness: clipped_witness(trimmed), confidence: "exact_local".to_string(),
         });
     }
 
     if let Some(rest) = trimmed.strip_prefix("import ") {
-        if rest.contains(',') { return None; }
+        // Multiple module imports are deliberately left unresolved because one
+        // ImportRecord has one target spec. Common `import pkg as alias` stays
+        // exact and module-member use is validated later in the TS router.
+        if rest.contains(',') || rest.contains('\\') { return None; }
         let mut parts = rest.split_whitespace();
         let spec = parts.next()?.trim();
         let alias = if parts.next() == Some("as") { parts.next() } else { None };
@@ -369,10 +420,66 @@ fn parse_python_import(line_no: usize, line: &str) -> Option<ImportRecord> {
         let binding = local_binding(default_local, alias).into_iter().collect();
         return Some(ImportRecord {
             spec: spec.to_string(), line: line_no, kind: "python_import".to_string(),
-            bindings: binding, source_symbols: Vec::new(), witness: clipped_witness(line), confidence: "exact_local".to_string(),
+            bindings: binding, source_symbols: Vec::new(), binding_pairs: Vec::new(),
+            witness: clipped_witness(trimmed), confidence: "exact_local".to_string(),
         });
     }
     None
+}
+
+fn strip_python_inline_comment(line: &str) -> &str {
+    // Imports very rarely need # inside a quoted token; module/import names do
+    // not. Treat # as a comment boundary to keep the collector deterministic.
+    line.split_once('#').map(|(head, _)| head).unwrap_or(line)
+}
+
+fn parse_python_imports(source: &str) -> Vec<ImportRecord> {
+    const MAX_IMPORT_STATEMENT_LINES: usize = 64;
+    const MAX_IMPORT_STATEMENT_BYTES: usize = 16 * 1024;
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < lines.len() && out.len() < MAX_IMPORTS_PER_FILE {
+        let start = i;
+        let first = lines[i].trim_start();
+        if !(first.starts_with("from ") || first.starts_with("import ")) {
+            i += 1;
+            continue;
+        }
+
+        let mut statement = String::new();
+        let mut depth: i32 = 0;
+        let mut continued = false;
+        let mut consumed = 0usize;
+        loop {
+            if i >= lines.len() || consumed >= MAX_IMPORT_STATEMENT_LINES || statement.len() >= MAX_IMPORT_STATEMENT_BYTES { break; }
+            let raw = strip_python_inline_comment(lines[i]).trim();
+            let mut piece = raw;
+            let slash = piece.ends_with('\\');
+            if slash { piece = piece[..piece.len()-1].trim_end(); }
+            if !piece.is_empty() {
+                if !statement.is_empty() { statement.push(' '); }
+                statement.push_str(piece);
+                for ch in piece.chars() {
+                    if ch == '(' { depth += 1; }
+                    else if ch == ')' { depth -= 1; }
+                }
+            }
+            consumed += 1;
+            i += 1;
+            continued = slash || depth > 0;
+            if !continued { break; }
+        }
+
+        // Unbalanced/truncated statements are ignored rather than creating a
+        // low-confidence dependency edge.
+        if continued || depth != 0 || statement.len() >= MAX_IMPORT_STATEMENT_BYTES {
+            continue;
+        }
+        if let Some(record) = parse_python_import(start + 1, &statement) { out.push(record); }
+    }
+    out
 }
 
 fn quoted_specs(line: &str) -> Vec<String> {
@@ -407,58 +514,118 @@ fn looks_alias_spec(spec: &str) -> bool {
     spec.starts_with("@/") || spec.starts_with("~/") || spec.starts_with("#/")
 }
 
-fn js_named_bindings(clause: &str) -> (Vec<String>, Vec<String>) {
+fn js_named_bindings(clause: &str) -> (Vec<String>, Vec<String>, Vec<BindingPair>) {
     let Some(inner) = clause.trim().strip_prefix('{').and_then(|v| v.strip_suffix('}')) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
-    let mut locals = BTreeSet::new();
-    let mut sources = BTreeSet::new();
+    let mut locals = Vec::new();
+    let mut sources = Vec::new();
+    let mut pairs = Vec::new();
     for item in inner.split(',') {
-        let item = item.trim();
+        let mut item = item.trim();
+        if let Some(rest) = item.strip_prefix("type ") { item = rest.trim(); }
         if item.is_empty() { continue; }
-        let (source, local) = if let Some((a, b)) = item.split_once(" as ") { (a.trim(), b.trim()) } else { (item, item) };
+        let parts: Vec<_> = item.split_whitespace().collect();
+        let (source, local) = if parts.len() >= 3 && parts[parts.len()-2] == "as" {
+            (parts[0], parts[parts.len()-1])
+        } else {
+            (parts.first().copied().unwrap_or(""), parts.first().copied().unwrap_or(""))
+        };
         if let (Some(src), Some(loc)) = (ident(source), ident(local)) {
-            sources.insert(src);
-            locals.insert(loc);
+            push_unique(&mut locals, loc.clone());
+            push_unique(&mut sources, src.clone());
+            push_pair(&mut pairs, loc, src);
         }
+        if pairs.len() >= MAX_BINDINGS { break; }
     }
-    (locals.into_iter().take(MAX_BINDINGS).collect(), sources.into_iter().take(MAX_BINDINGS).collect())
+    (locals, sources, pairs)
 }
 
-fn parse_js_import(line_no: usize, line: &str, stats: &mut ParseStats) -> Option<ImportRecord> {
-    let trimmed = line.trim();
-    let specs = quoted_specs(trimmed);
-    let spec = specs.last()?.clone();
-    let import_like = trimmed.starts_with("import ") || trimmed.contains("require(") || trimmed.contains("import(");
-    if !import_like { return None; }
+fn js_merge_strings(dst: &mut Vec<String>, values: Vec<String>) {
+    for value in values { push_unique(dst, value); }
+}
 
+fn js_merge_pairs(dst: &mut Vec<BindingPair>, values: Vec<BindingPair>) {
+    for pair in values { push_pair(dst, pair.local, pair.source); }
+}
+
+fn parse_js_import(line_no: usize, statement: &str, stats: &mut ParseStats) -> Option<ImportRecord> {
+    let trimmed = statement.trim();
+    let flat = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let spec = quoted_specs(trimmed).last()?.clone();
+    let import_like = flat.starts_with("import ") || flat.contains("require(") || flat.contains("import(");
+    if !import_like { return None; }
     if !is_relative_spec(&spec) {
-        if looks_alias_spec(&spec) { stats.unsupported_alias += 1; }
-        else { stats.external_package += 1; }
+        if looks_alias_spec(&spec) { stats.unsupported_alias += 1; } else { stats.external_package += 1; }
         return None;
     }
-    if trimmed.contains("import(") { stats.unsupported_dynamic += 1; return None; }
+    if flat.contains("import(") { stats.unsupported_dynamic += 1; return None; }
 
     let mut bindings = Vec::new();
     let mut source_symbols = Vec::new();
-    if let Some(body) = trimmed.strip_prefix("import ") {
+    let mut binding_pairs = Vec::new();
+    if let Some(body) = flat.strip_prefix("import ") {
         if let Some((clause, _)) = body.split_once(" from ") {
-            let clause = clause.trim();
+            let mut clause = clause.trim();
+            if let Some(rest) = clause.strip_prefix("type ") { clause = rest.trim(); }
             if clause.starts_with('{') {
-                (bindings, source_symbols) = js_named_bindings(clause);
+                (bindings, source_symbols, binding_pairs) = js_named_bindings(clause);
             } else if let Some(rest) = clause.strip_prefix("* as ") {
                 bindings = ident(rest).into_iter().collect();
             } else if !clause.is_empty() {
-                bindings = ident(clause.split(',').next().unwrap_or("")).into_iter().collect();
+                if let Some((default_part, rest)) = clause.split_once(',') {
+                    bindings = ident(default_part.trim()).into_iter().collect();
+                    let rest = rest.trim();
+                    if rest.starts_with('{') {
+                        let (l, s, p) = js_named_bindings(rest);
+                        js_merge_strings(&mut bindings, l);
+                        js_merge_strings(&mut source_symbols, s);
+                        js_merge_pairs(&mut binding_pairs, p);
+                    } else if let Some(ns) = rest.strip_prefix("* as ") {
+                        js_merge_strings(&mut bindings, ident(ns).into_iter().collect());
+                    }
+                } else {
+                    bindings = ident(clause).into_iter().collect();
+                }
+            }
+        }
+    } else if flat.contains("require(") {
+        if let Some((lhs, _)) = flat.split_once('=') {
+            let lhs = lhs.trim();
+            let lhs = lhs.strip_prefix("const ").or_else(|| lhs.strip_prefix("let ")).or_else(|| lhs.strip_prefix("var ")).unwrap_or(lhs).trim();
+            if lhs.starts_with('{') {
+                let (l, s, p) = js_named_bindings(lhs);
+                bindings = l; source_symbols = s; binding_pairs = p;
+            } else {
+                bindings = ident(lhs).into_iter().collect();
             }
         }
     }
-
     Some(ImportRecord {
-        spec, line: line_no,
-        kind: if trimmed.contains("require(") { "js_require" } else { "js_relative_import" }.to_string(),
-        bindings, source_symbols, witness: clipped_witness(line), confidence: "exact_local".to_string(),
+        spec, line: line_no, kind: if flat.contains("require(") { "js_require" } else { "js_relative_import" }.to_string(),
+        bindings, source_symbols, binding_pairs,
+        witness: clipped_witness(&flat), confidence: "exact_local".to_string(),
     })
+}
+
+fn js_import_statement_complete(statement: &str) -> bool {
+    let flat=statement.split_whitespace().collect::<Vec<_>>().join(" "); let has_spec=!quoted_specs(statement).is_empty();
+    has_spec && (flat.contains(" from ") || flat.starts_with("import '") || flat.starts_with("import \"") || flat.contains("require("))
+}
+
+fn parse_js_imports(source: &str, stats: &mut ParseStats) -> Vec<ImportRecord> {
+    const MAX_IMPORT_STATEMENT_LINES:usize=64; const MAX_IMPORT_STATEMENT_BYTES:usize=16*1024;
+    let lines:Vec<&str>=source.lines().collect(); let mut out=Vec::new(); let mut i=0usize;
+    while i<lines.len() && out.len()<MAX_IMPORTS_PER_FILE {
+        let line=lines[i]; let trimmed=line.trim();
+        if trimmed.starts_with("import ") && !trimmed.contains("import(") {
+            let start_line=i+1; let mut statement=line.to_string(); let mut j=i;
+            while !js_import_statement_complete(&statement) && j+1<lines.len() && j+1<i+MAX_IMPORT_STATEMENT_LINES && statement.len()<MAX_IMPORT_STATEMENT_BYTES { j+=1; statement.push('\n'); statement.push_str(lines[j]); }
+            if let Some(record)=parse_js_import(start_line,&statement,stats) { out.push(record); } i=j+1; continue;
+        }
+        if let Some(record)=parse_js_import(i+1,line,stats) { out.push(record); } i+=1;
+    }
+    out
 }
 
 fn parse_rust_import(line_no: usize, line: &str) -> Option<ImportRecord> {
@@ -466,13 +633,13 @@ fn parse_rust_import(line_no: usize, line: &str) -> Option<ImportRecord> {
     let no_vis = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
     if let Some(rest) = no_vis.strip_prefix("mod ") {
         let name = ident(rest)?;
-        return Some(ImportRecord { spec: name.clone(), line: line_no, kind: "rust_mod".to_string(), bindings: vec![name], source_symbols: Vec::new(), witness: clipped_witness(line), confidence: "exact_local".to_string() });
+        return Some(ImportRecord { spec: name.clone(), line: line_no, kind: "rust_mod".to_string(), bindings: vec![name], source_symbols: Vec::new(), binding_pairs: Vec::new(), witness: clipped_witness(line), confidence: "exact_local".to_string() });
     }
     if let Some(rest) = no_vis.strip_prefix("use crate::") {
         if rest.contains('*') { return None; }
         let value = rest.trim().trim_end_matches(';');
         let source = value.rsplit("::").next().and_then(ident).into_iter().collect::<Vec<_>>();
-        return Some(ImportRecord { spec: value.to_string(), line: line_no, kind: "rust_crate_use".to_string(), bindings: source.clone(), source_symbols: source, witness: clipped_witness(line), confidence: "exact_local".to_string() });
+        return Some(ImportRecord { spec: value.to_string(), line: line_no, kind: "rust_crate_use".to_string(), bindings: source.clone(), source_symbols: source.clone(), binding_pairs: source.into_iter().map(|value| BindingPair { local: value.clone(), source: value }).collect(), witness: clipped_witness(line), confidence: "exact_local".to_string() });
     }
     None
 }
@@ -481,7 +648,7 @@ fn parse_c_include(line_no: usize, line: &str) -> Option<ImportRecord> {
     let trimmed = line.trim();
     if !trimmed.starts_with("#include") { return None; }
     let spec = quoted_specs(trimmed).into_iter().next()?;
-    Some(ImportRecord { spec, line: line_no, kind: "c_quote_include".to_string(), bindings: Vec::new(), source_symbols: Vec::new(), witness: clipped_witness(line), confidence: "exact_local_resource".to_string() })
+    Some(ImportRecord { spec, line: line_no, kind: "c_quote_include".to_string(), bindings: Vec::new(), source_symbols: Vec::new(), binding_pairs: Vec::new(), witness: clipped_witness(line), confidence: "exact_local_resource".to_string() })
 }
 
 fn resource_binding(spec: &str) -> Vec<String> {
@@ -490,7 +657,7 @@ fn resource_binding(spec: &str) -> Vec<String> {
 
 fn local_resource_record(line_no: usize, line: &str, kind: &str, spec: String) -> Option<ImportRecord> {
     if is_remote_spec(&spec) || spec.contains("{{") || spec.contains("${") || spec.contains("<%") { return None; }
-    Some(ImportRecord { bindings: resource_binding(&spec), source_symbols: Vec::new(), spec, line: line_no, kind: kind.to_string(), witness: clipped_witness(line), confidence: "exact_local_resource".to_string() })
+    Some(ImportRecord { bindings: resource_binding(&spec), source_symbols: Vec::new(), binding_pairs: Vec::new(), spec, line: line_no, kind: kind.to_string(), witness: clipped_witness(line), confidence: "exact_local_resource".to_string() })
 }
 
 fn extract_attr(line: &str, name: &str) -> Option<String> {
@@ -575,30 +742,20 @@ fn parse_sql_dependency(line_no: usize, line: &str) -> Option<ImportRecord> {
 }
 
 fn parse_imports(path: &Path, source: &str) -> (Vec<ImportRecord>, ParseStats) {
-    let lang = language_key(path);
-    let mut out = Vec::new();
-    let mut stats = ParseStats::default();
-    for (idx, line) in source.lines().enumerate() {
-        if out.len() >= MAX_IMPORTS_PER_FILE { break; }
-        let line_no = idx + 1;
-        let records: Vec<ImportRecord> = match lang {
-            "python" => parse_python_import(line_no, line).into_iter().collect(),
-            "javascript" | "typescript" => parse_js_import(line_no, line, &mut stats).into_iter().collect(),
-            "html" => parse_html_dependencies(line_no, line),
-            "css" => parse_css_dependency(line_no, line).into_iter().collect(),
-            "xml" => parse_xml_dependency(line_no, line).into_iter().collect(),
-            "docker" => parse_docker_dependency(line_no, line).into_iter().collect(),
-            "sql" => parse_sql_dependency(line_no, line).into_iter().collect(),
-            "rust" => parse_rust_import(line_no, line).into_iter().collect(),
-            "c_cpp" => parse_c_include(line_no, line).into_iter().collect(),
-            _ => Vec::new(),
-        };
-        for record in records {
-            if out.len() >= MAX_IMPORTS_PER_FILE { break; }
-            out.push(record);
-        }
+    let lang=language_key(path); let mut stats=ParseStats::default();
+    if lang=="python" { return (parse_python_imports(source),stats); }
+    if matches!(lang,"javascript"|"typescript") { return (parse_js_imports(source,&mut stats),stats); }
+    let mut out=Vec::new();
+    for (idx,line) in source.lines().enumerate() {
+        if out.len()>=MAX_IMPORTS_PER_FILE { break; } let line_no=idx+1;
+        let records:Vec<ImportRecord>=match lang {
+            "html"=>parse_html_dependencies(line_no,line),
+            "css"=>parse_css_dependency(line_no,line).into_iter().collect(), "xml"=>parse_xml_dependency(line_no,line).into_iter().collect(),
+            "docker"=>parse_docker_dependency(line_no,line).into_iter().collect(), "sql"=>parse_sql_dependency(line_no,line).into_iter().collect(),
+            "rust"=>parse_rust_import(line_no,line).into_iter().collect(), "c_cpp"=>parse_c_include(line_no,line).into_iter().collect(), _=>Vec::new(), };
+        for record in records { if out.len()>=MAX_IMPORTS_PER_FILE { break; } out.push(record); }
     }
-    (out, stats)
+    (out,stats)
 }
 
 fn unique_existing(candidates: impl IntoIterator<Item = String>, file_set: &HashSet<String>) -> Resolution {
@@ -735,7 +892,8 @@ fn empty_response(mode: &str, path: &Path, started: Instant) -> Response {
         local_resolved: None, local_unresolved: None, local_ambiguous: None,
         external_package: None, unsupported_alias: None, unsupported_dynamic: None,
         skipped_files: None, lossy_files: None, capped: None, seed_files: Vec::new(),
-        neighbors_total: 0, neighbors: Vec::new(), walk_elapsed_ms: None, parse_elapsed_ms: None,
+        neighbors_total: 0, neighbors: Vec::new(), task_filters_applied: None, stale_seed_files: None, stale_witness_edges: None,
+        walk_elapsed_ms: None, parse_elapsed_ms: None,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
@@ -791,7 +949,7 @@ fn refresh(root: &Path, path: &Path, started: Instant) -> Result<Response> {
                     stats.local_resolved += 1;
                     edges.insert(EdgeRecord {
                         from: importer.clone(), to: target, kind: import.kind.clone(), witness_line: import.line,
-                        spec: import.spec.clone(), bindings: import.bindings.clone(), source_symbols: import.source_symbols.clone(),
+                        spec: import.spec.clone(), bindings: import.bindings.clone(), source_symbols: import.source_symbols.clone(), binding_pairs: import.binding_pairs.clone(),
                         witness: import.witness.clone(), confidence: import.confidence.clone(),
                     });
                 }
@@ -832,25 +990,126 @@ fn refresh(root: &Path, path: &Path, started: Instant) -> Result<Response> {
         local_resolved: Some(stats.local_resolved), local_unresolved: Some(stats.local_unresolved), local_ambiguous: Some(stats.local_ambiguous),
         external_package: Some(stats.external_package), unsupported_alias: Some(stats.unsupported_alias), unsupported_dynamic: Some(stats.unsupported_dynamic),
         skipped_files: Some(skipped_files), lossy_files: Some(lossy_files), capped: Some(capped), seed_files: Vec::new(),
-        neighbors_total: 0, neighbors: Vec::new(), walk_elapsed_ms: Some(walk_elapsed), parse_elapsed_ms: Some(parse_elapsed),
+        neighbors_total: 0, neighbors: Vec::new(), task_filters_applied: None, stale_seed_files: None, stale_witness_edges: None,
+        walk_elapsed_ms: Some(walk_elapsed), parse_elapsed_ms: Some(parse_elapsed),
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
-fn neighbors(request: &Request, path: &Path, started: Instant) -> Result<Response> {
+fn symbol_intersects(values: &[String], wanted: &HashSet<String>) -> bool {
+    !wanted.is_empty() && values.iter().any(|value| wanted.contains(value))
+}
+
+fn cached_file_fresh(root: &Path, cache: &CacheFile, rel: &str) -> bool {
+    let Some(old) = cache.files.get(rel) else { return false; };
+    let Ok(meta) = fs::metadata(root.join(rel)) else { return false; };
+    meta.len() == old.size && mtime_ms(&meta) == old.mtime_ms
+}
+
+fn neighbors(request: &Request, root: &Path, path: &Path, started: Instant) -> Result<Response> {
     let Some(cache) = load_cache(path) else { return Ok(empty_response("neighbors", path, started)); };
     let max_neighbors = request.max_neighbors.unwrap_or(DEFAULT_MAX_NEIGHBORS).clamp(1, MAX_NEIGHBORS);
-    let seeds: Vec<String> = request.seed_files.iter().filter_map(|seed| sanitize_seed(seed, &cache)).collect::<BTreeSet<_>>().into_iter().collect();
-    let seed_set: HashSet<_> = seeds.iter().cloned().collect();
-    let mut out = BTreeSet::new();
-    for edge in &cache.edges {
-        if seed_set.contains(&edge.from) { out.insert((edge.from.clone(), edge.to.clone(), "forward".to_string(), edge.clone())); }
-        if seed_set.contains(&edge.to) { out.insert((edge.to.clone(), edge.from.clone(), "reverse".to_string(), edge.clone())); }
+
+    // Preserve lexical probe order. BTreeSet sorting here would reintroduce a
+    // graph-side fairness bug where alphabetically earlier seeds monopolize cap.
+    let mut seen = HashSet::new();
+    let mut seeds = Vec::new();
+    let mut missing_seed_files = 0usize;
+    for raw in &request.seed_files {
+        if raw.is_empty() || Path::new(raw).is_absolute() { continue; }
+        let Some(normalized) = normalize_rel(Path::new(raw.trim_start_matches("./"))) else { continue; };
+        if !seen.insert(normalized.clone()) { continue; }
+        if cache.files.contains_key(&normalized) { seeds.push(normalized); }
+        else { missing_seed_files += 1; }
     }
-    let neighbors_total = out.len();
-    let neighbors = out.into_iter().take(max_neighbors).map(|(seed, file, direction, edge)| Neighbor {
+    let seed_set: HashSet<_> = seeds.iter().cloned().collect();
+
+    let mut filters: BTreeMap<String, (HashSet<String>, HashSet<String>)> = BTreeMap::new();
+    for filter in &request.seed_filters {
+        let Some(seed) = sanitize_seed(&filter.seed, &cache) else { continue; };
+        if !seed_set.contains(&seed) { continue; }
+        filters.insert(
+            seed,
+            (
+                filter.forward_bindings.iter().filter(|v| !v.is_empty()).cloned().collect(),
+                filter.reverse_source_symbols.iter().filter(|v| !v.is_empty()).cloned().collect(),
+            ),
+        );
+    }
+    let task_filters_applied = !filters.is_empty();
+
+    let mut freshness_cache = BTreeMap::<String, bool>::new();
+    let mut is_fresh = |rel: &str| -> bool {
+        if let Some(value) = freshness_cache.get(rel) { return *value; }
+        let value = cached_file_fresh(root, &cache, rel);
+        freshness_cache.insert(rel.to_string(), value);
+        value
+    };
+    let mut stale_seed_files = missing_seed_files;
+    if request.check_freshness {
+        stale_seed_files += seeds.iter().filter(|seed| !is_fresh(seed)).count();
+    }
+
+    // Separate (seed,direction) lanes. Relevance filtering and witness
+    // freshness happen before any cap; round-robin then prevents one high-
+    // fanout seed/direction from hiding all other lexical seeds.
+    let mut lanes: BTreeMap<(String, String), BTreeSet<(String, EdgeRecord)>> = BTreeMap::new();
+    let mut stale_witness_edges = 0usize;
+    for edge in &cache.edges {
+        if seed_set.contains(&edge.from) {
+            let allowed = filters.get(&edge.from)
+                .map(|(forward, _)| symbol_intersects(&edge.bindings, forward))
+                .unwrap_or(!task_filters_applied);
+            if allowed {
+                if request.check_freshness && !is_fresh(&edge.from) {
+                    stale_witness_edges += 1;
+                } else {
+                    lanes.entry((edge.from.clone(), "forward".to_string())).or_default()
+                        .insert((edge.to.clone(), edge.clone()));
+                }
+            }
+        }
+        if seed_set.contains(&edge.to) {
+            let allowed = filters.get(&edge.to)
+                .map(|(_, reverse)| symbol_intersects(&edge.source_symbols, reverse))
+                .unwrap_or(!task_filters_applied);
+            if allowed {
+                if request.check_freshness && !is_fresh(&edge.from) {
+                    stale_witness_edges += 1;
+                } else {
+                    lanes.entry((edge.to.clone(), "reverse".to_string())).or_default()
+                        .insert((edge.from.clone(), edge.clone()));
+                }
+            }
+        }
+    }
+
+    let neighbors_total: usize = lanes.values().map(|lane| lane.len()).sum();
+    let mut lane_vec = Vec::new();
+    for seed in &seeds {
+        for direction in ["forward", "reverse"] {
+            if let Some(values) = lanes.remove(&(seed.clone(), direction.to_string())) {
+                lane_vec.push((seed.clone(), direction.to_string(), values.into_iter().collect::<Vec<_>>(), 0usize));
+            }
+        }
+    }
+
+    let mut chosen = Vec::new();
+    while chosen.len() < max_neighbors {
+        let mut progressed = false;
+        for (seed, direction, values, index) in &mut lane_vec {
+            if chosen.len() >= max_neighbors { break; }
+            let Some((file, edge)) = values.get(*index).cloned() else { continue; };
+            *index += 1;
+            progressed = true;
+            chosen.push((seed.clone(), file, direction.clone(), edge));
+        }
+        if !progressed { break; }
+    }
+
+    let neighbors = chosen.into_iter().map(|(seed, file, direction, edge)| Neighbor {
         seed, file, direction, kind: edge.kind, witness_file: edge.from, witness_line: edge.witness_line,
-        spec: edge.spec, bindings: edge.bindings, source_symbols: edge.source_symbols,
+        spec: edge.spec, bindings: edge.bindings, source_symbols: edge.source_symbols, binding_pairs: edge.binding_pairs,
         witness: edge.witness, confidence: edge.confidence,
     }).collect::<Vec<_>>();
     let imports_total = cache.files.values().map(|file| file.imports.len()).sum();
@@ -865,6 +1124,7 @@ fn neighbors(request: &Request, path: &Path, started: Instant) -> Result<Respons
         local_resolved: Some(st.local_resolved), local_unresolved: Some(st.local_unresolved), local_ambiguous: Some(st.local_ambiguous),
         external_package: Some(st.external_package), unsupported_alias: Some(st.unsupported_alias), unsupported_dynamic: Some(st.unsupported_dynamic),
         skipped_files: None, lossy_files: None, capped: None, seed_files: seeds, neighbors_total, neighbors,
+        task_filters_applied: Some(task_filters_applied), stale_seed_files: Some(stale_seed_files), stale_witness_edges: Some(stale_witness_edges),
         walk_elapsed_ms: None, parse_elapsed_ms: None, elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -879,7 +1139,7 @@ fn main() -> Result<()> {
     let path = cache_path(&root);
     let response = match request.mode.as_str() {
         "refresh" => refresh(&root, &path, started)?,
-        "neighbors" => neighbors(&request, &path, started)?,
+        "neighbors" => neighbors(&request, &root, &path, started)?,
         other => anyhow::bail!("unsupported mode: {other}"),
     };
     serde_json::to_writer(io::stdout(), &response)?;
@@ -896,6 +1156,7 @@ mod tests {
         let r = parse_python_import(7, "from service import handle as h, other").unwrap();
         assert_eq!(r.bindings, vec!["h".to_string(), "other".to_string()]);
         assert_eq!(r.source_symbols, vec!["handle".to_string(), "other".to_string()]);
+        assert_eq!(r.binding_pairs[0], BindingPair { local: "h".to_string(), source: "handle".to_string() });
     }
 
     #[test]
@@ -907,9 +1168,24 @@ mod tests {
     }
 
     #[test]
+    fn multiline_ts_import_preserves_named_bindings() {
+        let mut stats=ParseStats::default();
+        let source="import type {\n    Alpha,\n    Beta as LocalBeta,\n} from \"./service.js\";\n";
+        let imports=parse_js_imports(source,&mut stats); assert_eq!(imports.len(),1); let r=&imports[0];
+        assert_eq!(r.spec,"./service.js"); assert!(r.bindings.contains(&"Alpha".to_string())); assert!(r.bindings.contains(&"LocalBeta".to_string()));
+        assert!(r.source_symbols.contains(&"Alpha".to_string())); assert!(r.source_symbols.contains(&"Beta".to_string()));
+    }
+
+    #[test]
+    fn multiline_namespace_import_is_recorded() {
+        let mut stats=ParseStats::default(); let source="import * as ts from\n    \"./_namespaces/ts.js\";\n";
+        let imports=parse_js_imports(source,&mut stats); assert_eq!(imports.len(),1); assert_eq!(imports[0].bindings,vec!["ts".to_string()]);
+    }
+
+    #[test]
     fn explicit_js_runtime_spec_maps_to_ts_source() {
         let files: HashSet<String> = ["src/service.ts"].into_iter().map(str::to_string).collect();
-        let import = ImportRecord { spec: "./service.js".to_string(), line: 1, kind: "js_relative_import".to_string(), bindings: vec!["handle".to_string()], source_symbols: vec!["handle".to_string()], witness: "import { handle } from './service.js';".to_string(), confidence: "exact_local".to_string() };
+        let import = ImportRecord { spec: "./service.js".to_string(), line: 1, kind: "js_relative_import".to_string(), bindings: vec!["handle".to_string()], source_symbols: vec!["handle".to_string()], binding_pairs: vec![BindingPair { local: "handle".to_string(), source: "handle".to_string() }], witness: "import { handle } from './service.js';".to_string(), confidence: "exact_local".to_string() };
         match resolve_import("src/api.ts", &import, &files) {
             Resolution::Resolved(value) => assert_eq!(value, "src/service.ts"),
             other => panic!("unexpected resolution: {other:?}"),
@@ -919,7 +1195,7 @@ mod tests {
     #[test]
     fn ambiguous_ts_resolution_is_rejected() {
         let files: HashSet<String> = ["src/service.ts", "src/service.js"].into_iter().map(str::to_string).collect();
-        let import = ImportRecord { spec: "./service.js".to_string(), line: 1, kind: "js_relative_import".to_string(), bindings: vec!["handle".to_string()], source_symbols: vec!["handle".to_string()], witness: String::new(), confidence: "exact_local".to_string() };
+        let import = ImportRecord { spec: "./service.js".to_string(), line: 1, kind: "js_relative_import".to_string(), bindings: vec!["handle".to_string()], source_symbols: vec!["handle".to_string()], binding_pairs: vec![BindingPair { local: "handle".to_string(), source: "handle".to_string() }], witness: String::new(), confidence: "exact_local".to_string() };
         assert!(matches!(resolve_import("src/api.ts", &import, &files), Resolution::Ambiguous));
     }
 
@@ -935,4 +1211,39 @@ mod tests {
         assert_eq!(parse_docker_dependency(1, "COPY requirements.txt /app/").unwrap().kind, "docker_copy");
         assert_eq!(parse_sql_dependency(1, "\\i ./schema.sql").unwrap().kind, "sql_include");
     }
+
+    #[test]
+    fn pairwise_task_filter_keeps_matching_binding_beyond_four() {
+        let wanted = ["e".to_string()].into_iter().collect::<HashSet<_>>();
+        assert!(symbol_intersects(&["a".into(), "b".into(), "c".into(), "d".into(), "e".into()], &wanted));
+    }
+
+
+    #[test]
+    fn alias_pairs_survive_adversarial_sort_order() {
+        let py = parse_python_import(1, "from service import Zebra as alpha, Alpha as zebra").unwrap();
+        assert_eq!(py.binding_pairs, vec![
+            BindingPair { local: "alpha".to_string(), source: "Zebra".to_string() },
+            BindingPair { local: "zebra".to_string(), source: "Alpha".to_string() },
+        ]);
+        let mut stats = ParseStats::default();
+        let js = parse_js_import(1, "import { Zebra as alpha, Alpha as zebra } from './service.js';", &mut stats).unwrap();
+        assert_eq!(js.binding_pairs, vec![
+            BindingPair { local: "alpha".to_string(), source: "Zebra".to_string() },
+            BindingPair { local: "zebra".to_string(), source: "Alpha".to_string() },
+        ]);
+    }
+
+    #[test]
+    fn python_multiline_from_import_preserves_pairs() {
+        let source = "from service import (\n    Alpha as a,\n    beta,  # comment\n)\n";
+        let imports = parse_python_imports(source);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(imports[0].binding_pairs, vec![
+            BindingPair { local: "a".to_string(), source: "Alpha".to_string() },
+            BindingPair { local: "beta".to_string(), source: "beta".to_string() },
+        ]);
+    }
+
 }

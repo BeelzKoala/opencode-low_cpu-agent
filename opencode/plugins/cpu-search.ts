@@ -39,9 +39,12 @@ const IMPACT_INDEX_REFRESH_TTL_MS = 120_000
 const IMPACT_GRAPH_PROBE_MAX_FILES = 2
 const IMPACT_GRAPH_EMIT_MAX_FILES = 1
 const IMPACT_BINDINGS_PER_CANDIDATE = 4
+const IMPACT_EDGE_SYMBOL_CAP = 16
+const IMPACT_VALIDATION_SYMBOL_CAP = IMPACT_EDGE_SYMBOL_CAP
+const IMPACT_SCOPE_IDENTIFIER_CAP = 160
+const IMPACT_FILTER_SYMBOL_CAP = IMPACT_SCOPE_IDENTIFIER_CAP
 const IMPACT_VALIDATION_TIMEOUT_MS = 350
 const IMPACT_VALIDATION_HIT_CAP = 8
-const IMPACT_SCOPE_IDENTIFIER_CAP = 160
 const IMPACT_SCOPE_WINDOW_RADIUS = 12
 const IMPACT_SCOPE_MAX_LINES = 180
 const HYBRID_MIN_SAVINGS_RATIO = 0.75
@@ -70,7 +73,7 @@ const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.13.3-evidence-conditioned-impact-fixes"
+const SEARCH_PROTOCOL = "search-v2.13.5-task-local-impact"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -133,7 +136,6 @@ async function writeProjectTrace(root, fileName, record) {
 }
 
 const sessionStates = new Map()
-const impactIndexRefreshAt = new Map()
 
 function dropSessionState(sessionID) {
   sessionStates.delete(sessionID)
@@ -1726,83 +1728,6 @@ function runImpactIndexRequest(root, request, timeoutMs) {
   })
 }
 
-async function runImpactIndexShadow(root, seedFiles) {
-  const seeds = [...new Set(
-    (seedFiles ?? [])
-      .map((entry) => typeof entry === "string" ? entry : entry?.file)
-      .filter((value) => typeof value === "string" && value.length > 0),
-  )].slice(0, IMPACT_INDEX_MAX_SEEDS)
-
-  if (seeds.length === 0) {
-    return {
-      attempted: false,
-      ok: false,
-      reason: "no_seed_files",
-      seeds,
-      elapsedMs: 0,
-      refresh: null,
-      query: null,
-    }
-  }
-
-  const started = performance.now()
-  const previousRefresh = impactIndexRefreshAt.get(root) ?? 0
-  const refreshDue = nowMs() - previousRefresh >= IMPACT_INDEX_REFRESH_TTL_MS
-  let refresh = null
-
-  if (refreshDue) {
-    refresh = await runImpactIndexRequest(
-      root,
-      { mode: "refresh" },
-      IMPACT_INDEX_REFRESH_TIMEOUT_MS,
-    )
-    // The graph is heuristic routing data. A partial-but-ready cache is useful
-    // and should respect the TTL; completeness is tracked separately.
-    if (
-      refresh.ok &&
-      refresh.response?.mode === "refresh" &&
-      refresh.response?.ready === true
-    ) {
-      impactIndexRefreshAt.set(root, nowMs())
-    }
-  }
-
-  const query = await runImpactIndexRequest(
-    root,
-    {
-      mode: "neighbors",
-      seed_files: seeds,
-      max_neighbors: IMPACT_INDEX_MAX_NEIGHBORS,
-    },
-    IMPACT_INDEX_QUERY_TIMEOUT_MS,
-  )
-
-  const querySafe =
-    query.ok &&
-    query.response?.mode === "neighbors" &&
-    query.response?.ready === true &&
-    Array.isArray(query.response?.neighbors)
-
-  return {
-    attempted: true,
-    ok: querySafe,
-    reason: querySafe
-      ? refreshDue
-        ? refresh?.ok === true && refresh.response?.ready === true
-          ? refresh.response?.coverage_complete === false
-            ? "impact_refreshed_partial"
-            : "impact_refreshed"
-          : "impact_stale_after_refresh_failure"
-        : "impact_warm"
-      : query.reason ?? "query_unavailable",
-    seeds,
-    elapsedMs: Math.round((performance.now() - started) * 100) / 100,
-    refreshDue,
-    refresh,
-    query,
-  }
-}
-
 function impactIndexShadowStats(result, lexicalFiles) {
   const lexical = new Set((lexicalFiles ?? []).map((entry) =>
     evidenceFileKey(typeof entry === "string" ? entry : entry?.file),
@@ -1821,18 +1746,23 @@ function impactIndexShadowStats(result, lexicalFiles) {
     ok: result?.ok === true,
     reason: result?.reason ?? "unknown",
     elapsedMs: result?.elapsedMs ?? 0,
-    refreshDue: result?.refreshDue ?? false,
+    refreshDue: result?.refreshDue === true,
+    refreshDeferred: result?.refreshDeferred === true,
     refreshOk:
       result?.refresh?.ok === true &&
       refresh?.mode === "refresh" &&
       refresh?.ready === true,
-    refreshComplete: refresh?.coverage_complete ?? refresh?.refresh_complete ?? null,
+    refreshComplete: query?.coverage_complete ?? refresh?.coverage_complete ?? refresh?.refresh_complete ?? null,
     partialReason: query?.partial_reason ?? refresh?.partial_reason ?? null,
     inventoryKind: query?.inventory_kind ?? refresh?.inventory_kind ?? null,
     refreshReason: result?.refresh?.reason ?? null,
     refreshElapsedMs: result?.refresh?.elapsedMs ?? null,
     queryElapsedMs: result?.query?.elapsedMs ?? null,
     cacheAgeMs: query?.cache_age_ms ?? null,
+    staleSeedFiles: query?.stale_seed_files ?? 0,
+    staleWitnessEdges: query?.stale_witness_edges ?? 0,
+    taskFiltersApplied: query?.task_filters_applied === true,
+    bootstrapCacheHit: false,
     filesTotal: query?.files_total ?? refresh?.files_total ?? null,
     filesReused: refresh?.files_reused ?? null,
     filesReindexed: refresh?.files_reindexed ?? null,
@@ -1861,24 +1791,86 @@ function impactIndexShadowStats(result, lexicalFiles) {
       spec: neighbor.spec,
       bindings: Array.isArray(neighbor.bindings) ? neighbor.bindings : [],
       source_symbols: Array.isArray(neighbor.source_symbols) ? neighbor.source_symbols : [],
+      binding_pairs: Array.isArray(neighbor.binding_pairs) ? neighbor.binding_pairs : [],
       witness: neighbor.witness ?? null,
     })),
   }
+}
+
+function impactStatsForTaskQuery(queryResult, lexicalFiles, reason = "impact_task_filtered", refresh = null) {
+  const response = queryResult?.response ?? null
+  const age = Number(response?.cache_age_ms)
+  const ready =
+    queryResult?.ok === true &&
+    response?.mode === "neighbors" &&
+    response?.ready === true &&
+    Array.isArray(response?.neighbors)
+  const staleSeedFiles = Number(response?.stale_seed_files ?? 0)
+  const staleWitnessEdges = Number(response?.stale_witness_edges ?? 0)
+  const refreshDue =
+    queryResult?.ok === true && (
+      !ready ||
+      !Number.isFinite(age) ||
+      age >= IMPACT_INDEX_REFRESH_TTL_MS ||
+      staleSeedFiles > 0 ||
+      staleWitnessEdges > 0
+    )
+  return impactIndexShadowStats({
+    attempted: true,
+    ok: ready,
+    reason: ready ? reason : queryResult?.reason ?? "query_unavailable",
+    elapsedMs: queryResult?.elapsedMs ?? 0,
+    refreshDue,
+    refreshDeferred: ready && refreshDue,
+    refresh,
+    query: queryResult,
+  }, lexicalFiles)
 }
 
 function regexEscape(value) {
   return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
+function impactSymbolArray(values, cap = IMPACT_EDGE_SYMBOL_CAP) {
+  const out = []
+  for (const value of values ?? []) {
+    if (
+      typeof value !== "string" ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) ||
+      value.length > 80
+    ) continue
+    out.push(value)
+    if (out.length >= cap) break
+  }
+  return out
+}
+
 function impactBindingList(values) {
-  return [...new Set(values ?? [])]
-    .filter(
-      (value) =>
-        typeof value === "string" &&
-        /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) &&
-        value.length <= 80,
-    )
-    .slice(0, IMPACT_BINDINGS_PER_CANDIDATE)
+  return [...new Set(impactSymbolArray(values, IMPACT_BINDINGS_PER_CANDIDATE))]
+}
+
+function impactRelationPairs(candidate) {
+  const local = impactSymbolArray(candidate?.bindings)
+  const source = impactSymbolArray(candidate?.source_symbols)
+  const explicit = []
+  for (const pair of candidate?.binding_pairs ?? []) {
+    const localName = typeof pair?.local === "string" ? pair.local : null
+    const sourceName = typeof pair?.source === "string" ? pair.source : null
+    if (!localName || !sourceName) continue
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(localName) || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sourceName)) continue
+    explicit.push({ local: localName, source: sourceName })
+    if (explicit.length >= IMPACT_EDGE_SYMBOL_CAP) break
+  }
+  if (explicit.length > 0) return { local, source, pairs: explicit }
+
+  // Fail-open only for identity mappings. Old caches are rejected by cache
+  // version, but this keeps helper skew conservative instead of guessing alias
+  // alignment from two independently ordered arrays.
+  const pairs = []
+  if (local.length === source.length && local.every((value, index) => value === source[index])) {
+    for (let i = 0; i < local.length; i += 1) pairs.push({ local: local[i], source: source[i] })
+  }
+  return { local, source, pairs }
 }
 
 function impactLanguage(file) {
@@ -1916,6 +1908,95 @@ function impactIdentifiers(text) {
     if (out.size >= IMPACT_SCOPE_IDENTIFIER_CAP) break
   }
   return out
+}
+
+function impactDeclaredSymbols(line, language) {
+  const text = String(line ?? "").trim()
+  const out = new Set()
+  const patterns = language === "python"
+    ? [
+        /^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/,
+        /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/,
+      ]
+    : [
+        /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:export\s+)?(?:default\s+)?(?:class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:(?:public|private|protected|static|readonly|async|abstract|override|get|set)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;]*\)\s*(?::[^={]+)?\s*\{?/,
+      ]
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match?.[1]) continue
+    const value = match[1]
+    if (!["if", "for", "while", "switch", "catch", "function", "constructor"].includes(value)) out.add(value)
+  }
+  return out
+}
+
+function impactPythonOwnerSymbols(lines, ranges, hitLines) {
+  const owners = new Set()
+  for (const range of ranges ?? []) {
+    const start = Math.max(0, range.start ?? 0)
+    for (const value of impactDeclaredSymbols(lines[start] ?? "", "python")) owners.add(value)
+    const baseIndent = impactIndent(lines[start] ?? "")
+    let ceilingIndent = baseIndent
+    for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+      const line = lines[i] ?? ""
+      const match = line.match(/^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
+      if (!match) continue
+      const indent = impactIndent(line)
+      if (indent < ceilingIndent) {
+        owners.add(match[1]); ceilingIndent = indent
+        if (indent === 0) break
+      }
+    }
+  }
+  for (const lineNo of hitLines ?? []) {
+    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", "python")) owners.add(value)
+  }
+  return owners
+}
+
+function impactBraceEnclosingOwner(lines, start) {
+  let depth = 0
+  for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+    const line = lines[i] ?? ""
+    for (let j = line.length - 1; j >= 0; j -= 1) {
+      const ch = line[j]
+      if (ch === "}") depth += 1
+      else if (ch === "{") {
+        if (depth > 0) depth -= 1
+        else {
+          for (const value of impactDeclaredSymbols(line, "typescript")) return value
+        }
+      }
+    }
+  }
+  return null
+}
+
+function impactBraceOwnerSymbols(lines, ranges, hitLines, language) {
+  const owners = new Set()
+  for (const range of ranges ?? []) {
+    const start = Math.max(0, range.start ?? 0)
+    const end = Math.min(lines.length - 1, start + 5)
+    for (let i = Math.max(0, start - 2); i <= end; i += 1) {
+      for (const value of impactDeclaredSymbols(lines[i] ?? "", language)) owners.add(value)
+    }
+    const enclosing = impactBraceEnclosingOwner(lines, start)
+    if (enclosing) owners.add(enclosing)
+  }
+  for (const lineNo of hitLines ?? []) {
+    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", language)) owners.add(value)
+  }
+  return owners
+}
+
+function impactOwnerSymbols(lines, ranges, hitLines, language) {
+  if (!Array.isArray(lines)) return new Set()
+  if (language === "python") return impactPythonOwnerSymbols(lines, ranges, hitLines)
+  if (["javascript", "typescript"].includes(language)) return impactBraceOwnerSymbols(lines, ranges, hitLines, language)
+  return new Set()
 }
 
 function impactIndent(line) {
@@ -2054,12 +2135,14 @@ async function buildImpactSeedContexts(root, probeResults) {
       chunks.push(...entry.fallbackText)
     }
 
+    const mergedRanges = impactMergeRanges(ranges)
     const text = chunks.join("\n")
     contexts.set(entry.file, {
       file: entry.file,
       language,
       identifiers: impactIdentifiers(text),
-      ranges: impactMergeRanges(ranges),
+      ownerSymbols: impactOwnerSymbols(lines, mergedRanges, entry.hitLines, language),
+      ranges: mergedRanges,
       text,
       hitLines: entry.hitLines,
     })
@@ -2067,20 +2150,78 @@ async function buildImpactSeedContexts(root, probeResults) {
   return contexts
 }
 
-function impactIntersects(values, identifiers) {
-  for (const value of impactBindingList(values)) {
-    if (identifiers?.has(value)) return true
+function impactFilterSymbols(values, cap = IMPACT_FILTER_SYMBOL_CAP) {
+  const out = []
+  const seen = new Set()
+  for (const value of values ?? []) {
+    if (
+      typeof value !== "string" ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) ||
+      value.length > 80 ||
+      seen.has(value)
+    ) continue
+    seen.add(value)
+    out.push(value)
+    if (out.length >= cap) break
   }
-  return false
+  return out
+}
+
+function impactSeedFilters(seedContexts) {
+  return [...seedContexts.entries()].map(([seed, context]) => ({
+    seed,
+    forward_bindings: impactFilterSymbols(context?.identifiers),
+    reverse_source_symbols: impactFilterSymbols(context?.ownerSymbols),
+  }))
+}
+
+async function runTaskFilteredImpactQuery(root, seedContexts) {
+  const seedFilters = impactSeedFilters(seedContexts)
+  const seeds = seedFilters.map((entry) => entry.seed)
+  if (seeds.length < 1) return null
+  return await runImpactIndexRequest(
+    root,
+    {
+      mode: "neighbors",
+      seed_files: seeds,
+      seed_filters: seedFilters,
+      max_neighbors: IMPACT_INDEX_MAX_NEIGHBORS,
+      check_freshness: true,
+    },
+    IMPACT_INDEX_QUERY_TIMEOUT_MS,
+  )
+}
+
+function impactMatchedForwardSymbols(candidate, context) {
+  const { local, source, pairs } = impactRelationPairs(candidate)
+  const matched = []
+  if (pairs.length > 0) {
+    for (const pair of pairs) {
+      if (context?.identifiers?.has(pair.local)) matched.push(pair.source)
+    }
+    return [...new Set(matched)].slice(0, IMPACT_VALIDATION_SYMBOL_CAP)
+  }
+  const matchedLocals = local.filter((value) => context?.identifiers?.has(value))
+  if (matchedLocals.length < 1 || source.length > 0) return []
+  return impactMemberSymbols(context, matchedLocals).slice(0, IMPACT_VALIDATION_SYMBOL_CAP)
+}
+
+function impactMatchedReverseBindings(candidate, context) {
+  const { pairs } = impactRelationPairs(candidate)
+  const matched = []
+  for (const pair of pairs) {
+    if (context?.ownerSymbols?.has(pair.source)) matched.push(pair.local)
+  }
+  return [...new Set(matched)].slice(0, IMPACT_VALIDATION_SYMBOL_CAP)
 }
 
 function impactMemberSymbols(context, bindings) {
   const out = new Set()
-  for (const binding of impactBindingList(bindings)) {
+  for (const binding of [...new Set(impactSymbolArray(bindings, IMPACT_VALIDATION_SYMBOL_CAP))]) {
     const pattern = new RegExp(`\\b${regexEscape(binding)}\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][A-Za-z0-9_$]*)`, "g")
     for (const match of context?.text?.matchAll(pattern) ?? []) {
       out.add(match[1])
-      if (out.size >= IMPACT_BINDINGS_PER_CANDIDATE) return [...out]
+      if (out.size >= IMPACT_VALIDATION_SYMBOL_CAP) return [...out]
     }
   }
   return [...out]
@@ -2123,7 +2264,6 @@ function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scop
     const file = evidenceFileKey(candidate?.file)
     const seed = evidenceFileKey(candidate?.seed)
     if (!file || !seed || lexical.has(file)) continue
-    // Resource/config edges are indexed but remain shadow-only in C1.
     if (candidate?.confidence !== "exact_local") continue
     if (!impactFileAllowedByScope(root, file, scope)) continue
 
@@ -2133,27 +2273,21 @@ function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scop
       continue
     }
 
-    const localBindings = impactBindingList(candidate?.bindings)
-    const sourceSymbols = impactBindingList(candidate?.source_symbols)
-    let relevant = false
     let forwardSymbols = []
     let reverseBindings = []
-
-    if (candidate.direction === "forward" && impactIntersects(localBindings, context.identifiers)) {
-      forwardSymbols = sourceSymbols.length > 0
-        ? sourceSymbols
-        : impactMemberSymbols(context, localBindings)
-      relevant = forwardSymbols.length > 0
-    } else if (candidate.direction === "reverse" && impactIntersects(sourceSymbols, context.identifiers)) {
-      reverseBindings = localBindings
-      relevant = reverseBindings.length > 0
+    if (candidate.direction === "forward") {
+      forwardSymbols = impactMatchedForwardSymbols(candidate, context)
+    } else if (candidate.direction === "reverse") {
+      reverseBindings = impactMatchedReverseBindings(candidate, context)
     }
 
-    if (!relevant) {
+    if (forwardSymbols.length < 1 && reverseBindings.length < 1) {
       rejectedByScope += 1
       continue
     }
 
+    const rawLocal = impactSymbolArray(candidate?.bindings)
+    const rawSource = impactSymbolArray(candidate?.source_symbols)
     let entry = grouped.get(file)
     if (!entry) {
       entry = {
@@ -2172,18 +2306,18 @@ function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scop
     for (const queryIndex of seedQueries.get(seed) ?? []) entry.queries.add(queryIndex)
     for (const symbol of forwardSymbols) entry.forwardSymbols.add(symbol)
     for (const binding of reverseBindings) entry.reverseBindings.add(binding)
-    for (const value of [...localBindings, ...sourceSymbols]) entry.displayBindings.add(value)
+    for (const value of [...rawLocal, ...rawSource]) entry.displayBindings.add(value)
     entry.hasForward ||= candidate.direction === "forward"
     entry.hasReverse ||= candidate.direction === "reverse"
-    entry.relations.push({ ...candidate, file, seed, bindings: localBindings, source_symbols: sourceSymbols })
+    entry.relations.push({ ...candidate, file, seed, bindings: rawLocal, source_symbols: rawSource })
   }
 
   const hypotheses = [...grouped.values()]
     .map((entry) => ({
       ...entry,
-      forwardSymbols: [...entry.forwardSymbols].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
-      reverseBindings: [...entry.reverseBindings].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
-      displayBindings: [...entry.displayBindings].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
+      forwardSymbols: [...entry.forwardSymbols].slice(0, IMPACT_VALIDATION_SYMBOL_CAP),
+      reverseBindings: [...entry.reverseBindings].slice(0, IMPACT_VALIDATION_SYMBOL_CAP),
+      displayBindings: [...entry.displayBindings].slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
     }))
     .filter((entry) => entry.forwardSymbols.length > 0 || entry.reverseBindings.length > 0)
     .sort(
@@ -2193,6 +2327,8 @@ function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scop
         (b.forwardSymbols.length + b.reverseBindings.length) - (a.forwardSymbols.length + a.reverseBindings.length) ||
         a.file.localeCompare(b.file),
     )
+    // This is the actual graph-file probe budget. We deliberately do not hide
+    // extra deterministic file reads behind a larger "validation pool".
     .slice(0, IMPACT_GRAPH_PROBE_MAX_FILES)
 
   return { hypotheses, rejectedByScope }
@@ -2200,7 +2336,7 @@ function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scop
 
 function runImpactValidationQuery(root, file, bindings, glob) {
   return new Promise((resolve) => {
-    const escaped = impactBindingList(bindings).map(regexEscape)
+    const escaped = [...new Set(impactSymbolArray(bindings, IMPACT_VALIDATION_SYMBOL_CAP))].map(regexEscape)
     if (escaped.length < 1) {
       resolve({ ok: false, reason: "no_bindings", matches: [], scanComplete: true, elapsedMs: 0 })
       return
@@ -2278,70 +2414,135 @@ function impactDefinitionMatch(text, bindings) {
 
 function impactLineContainsBinding(text, bindings) {
   const line = String(text ?? "")
-  return impactBindingList(bindings).some((binding) => new RegExp(`\\b${regexEscape(binding)}\\b`).test(line))
+  return [...new Set(impactSymbolArray(bindings, IMPACT_VALIDATION_SYMBOL_CAP))]
+    .some((binding) => new RegExp(`\\b${regexEscape(binding)}\\b`).test(line))
 }
 
-async function validateImpactHypotheses(root, target, glob, impactStats, probeFiles, probeResults) {
+async function validateImpactHypotheses(root, target, glob, probeFiles, probeResults) {
   const scope = await impactExpansionScope(root, target)
+  const emptyStats = impactIndexShadowStats({
+    attempted: false, ok: false, reason: scope.kind === "blocked" ? scope.reason : "not_queried",
+    elapsedMs: 0, refreshDue: false, refreshDeferred: false, refresh: null, query: null,
+  }, probeFiles)
   if (scope.kind === "blocked") {
-    return { attempted: false, reason: scope.reason, hypotheses: [], validated: [], rejected: [], elapsedMs: 0, queryCount: 0, scopeRejected: 0, seedContexts: 0 }
+    return {
+      attempted: false, reason: scope.reason, hypotheses: [], validated: [], rejected: [], elapsedMs: 0,
+      queryCount: 0, scopeRejected: 0, seedContexts: 0, ownerSymbols: 0,
+      filterQueryUsed: false, filterQueryElapsedMs: null, refreshFallbackAttempted: false,
+      refreshFallbackElapsedMs: null, pairwiseConditioned: true, indexStats: emptyStats,
+    }
   }
 
   const seedContexts = await buildImpactSeedContexts(root, probeResults)
-  const built = buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scope)
-  const hypotheses = built.hypotheses
-  if (hypotheses.length < 1) {
+  const ownerSymbols = [...seedContexts.values()].reduce((sum, context) => sum + (context.ownerSymbols?.size ?? 0), 0)
+  let filterQueryUsed = false
+  let filterQueryElapsedMs = null
+  let refreshFallbackAttempted = false
+  let refreshFallbackElapsedMs = null
+  let refresh = null
+
+  async function queryTaskGraph(reason) {
+    const query = await runTaskFilteredImpactQuery(root, seedContexts)
+    filterQueryUsed = query != null
+    if (query) filterQueryElapsedMs = (filterQueryElapsedMs ?? 0) + (query.elapsedMs ?? 0)
+    return query ? impactStatsForTaskQuery(query, probeFiles, reason, refresh) : emptyStats
+  }
+
+  async function validateStats(stats) {
+    const built = buildImpactHypotheses(stats, probeFiles, seedContexts, root, scope)
+    const hypotheses = built.hypotheses
+    if (hypotheses.length < 1) {
+      return {
+        attempted: false,
+        reason: stats?.ok ? "no_scope_relevant_hypotheses" : "impact_index_unavailable",
+        hypotheses: [], validated: [], rejected: [], elapsedMs: 0, queryCount: 0,
+        scopeRejected: built.rejectedByScope,
+      }
+    }
+
+    const started = performance.now()
+    const checks = await Promise.all(hypotheses.map(async (hypothesis) => {
+      const validationTerms = [...new Set([...hypothesis.forwardSymbols, ...hypothesis.reverseBindings])]
+      const validation = await runImpactValidationQuery(root, hypothesis.file, validationTerms, glob)
+      const matches = validation.matches ?? []
+      const declarationMatches = matches.filter((match) => impactDefinitionMatch(match.text, hypothesis.forwardSymbols))
+      const reverseWitnessLines = new Set(
+        hypothesis.relations
+          .filter((relation) => relation.direction === "reverse" && evidenceFileKey(relation.witness_file) === evidenceFileKey(hypothesis.file) && Number.isInteger(relation.witness_line))
+          .map((relation) => relation.witness_line),
+      )
+      const reverseUsageMatches = matches.filter(
+        (match) => !reverseWitnessLines.has(match.line) && impactLineContainsBinding(match.text, hypothesis.reverseBindings),
+      )
+      const forwardValidated = hypothesis.forwardSymbols.length > 0 && declarationMatches.length > 0
+      const reverseValidated = hypothesis.reverseBindings.length > 0 && reverseUsageMatches.length > 0
+      const validated = validation.ok && (forwardValidated || reverseValidated)
+
+      return {
+        ...hypothesis,
+        validation,
+        validated,
+        validationKind: forwardValidated ? "forward_scope_definition" : reverseValidated ? "reverse_scope_usage" : null,
+        declarationMatches,
+        reverseUsageMatches,
+      }
+    }))
+
+    const validated = checks.filter((entry) => entry.validated).sort(
+      (a, b) =>
+        Number(b.validationKind === "forward_scope_definition") - Number(a.validationKind === "forward_scope_definition") ||
+        b.queries.size - a.queries.size || a.file.localeCompare(b.file),
+    )
     return {
-      attempted: false,
-      reason: impactStats?.ok ? "no_scope_relevant_hypotheses" : "impact_index_unavailable",
-      hypotheses: [], validated: [], rejected: [], elapsedMs: 0, queryCount: 0,
-      scopeRejected: built.rejectedByScope, seedContexts: seedContexts.size,
+      attempted: true,
+      reason: validated.length > 0 ? "validated_scope_conditioned" : "all_rejected",
+      hypotheses,
+      validated,
+      rejected: checks.filter((entry) => !entry.validated),
+      elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+      queryCount: checks.length,
+      scopeRejected: built.rejectedByScope,
     }
   }
 
-  const started = performance.now()
-  const checks = await Promise.all(hypotheses.map(async (hypothesis) => {
-    const validationTerms = [...new Set([...hypothesis.forwardSymbols, ...hypothesis.reverseBindings])]
-    const validation = await runImpactValidationQuery(root, hypothesis.file, validationTerms, glob)
-    const matches = validation.matches ?? []
-    const declarationMatches = matches.filter((match) => impactDefinitionMatch(match.text, hypothesis.forwardSymbols))
-    const reverseWitnessLines = new Set(
-      hypothesis.relations
-        .filter((relation) => relation.direction === "reverse" && evidenceFileKey(relation.witness_file) === evidenceFileKey(hypothesis.file) && Number.isInteger(relation.witness_line))
-        .map((relation) => relation.witness_line),
-    )
-    const reverseUsageMatches = matches.filter(
-      (match) => !reverseWitnessLines.has(match.line) && impactLineContainsBinding(match.text, hypothesis.reverseBindings),
-    )
-    const forwardValidated = hypothesis.forwardSymbols.length > 0 && declarationMatches.length > 0
-    const reverseValidated = hypothesis.reverseBindings.length > 0 && reverseUsageMatches.length > 0
-    const validated = validation.ok && (forwardValidated || reverseValidated)
+  let indexStats = await queryTaskGraph("impact_task_filtered")
+  const initialIndexStats = {
+    refreshDue: indexStats?.refreshDue === true,
+    staleSeedFiles: Number(indexStats?.staleSeedFiles ?? 0),
+    staleWitnessEdges: Number(indexStats?.staleWitnessEdges ?? 0),
+    reason: indexStats?.reason ?? null,
+    cacheAgeMs: indexStats?.cacheAgeMs ?? null,
+  }
+  let result = await validateStats(indexStats)
 
-    return {
-      ...hypothesis,
-      validation,
-      validated,
-      validationKind: forwardValidated ? "forward_scope_definition" : reverseValidated ? "reverse_scope_usage" : null,
-      declarationMatches,
-      reverseUsageMatches,
+  // A stale graph is only a hypothesis. We can reuse a source-validated edge
+  // when its import witness file is unchanged. If task-local routing misses and
+  // the helper reports age/fingerprint staleness (or no readable cache), do one
+  // synchronous refresh and one filtered retry.
+  if (result.validated.length < 1 && indexStats.refreshDue === true) {
+    refreshFallbackAttempted = true
+    refresh = await runImpactIndexRequest(root, { mode: "refresh" }, IMPACT_INDEX_REFRESH_TIMEOUT_MS)
+    refreshFallbackElapsedMs = refresh?.elapsedMs ?? null
+    if (refresh?.ok === true && refresh.response?.ready === true) {
+      indexStats = await queryTaskGraph("impact_refreshed_task_filtered")
+      indexStats.refresh = refresh
+      indexStats.refreshOk = true
+      indexStats.refreshElapsedMs = refresh.elapsedMs ?? null
+      result = await validateStats(indexStats)
     }
-  }))
+  }
 
-  const validated = checks.filter((entry) => entry.validated).sort(
-    (a, b) =>
-      Number(b.validationKind === "forward_scope_definition") - Number(a.validationKind === "forward_scope_definition") ||
-      b.queries.size - a.queries.size || a.file.localeCompare(b.file),
-  )
   return {
-    attempted: true,
-    reason: validated.length > 0 ? "validated_scope_conditioned" : "all_rejected",
-    hypotheses,
-    validated,
-    rejected: checks.filter((entry) => !entry.validated),
-    elapsedMs: Math.round((performance.now() - started) * 100) / 100,
-    queryCount: checks.length,
-    scopeRejected: built.rejectedByScope,
+    ...result,
     seedContexts: seedContexts.size,
+    ownerSymbols,
+    filterQueryUsed,
+    filterQueryElapsedMs,
+    refreshFallbackAttempted,
+    refreshFallbackElapsedMs,
+    initialIndexStats,
+    pairwiseConditioned: true,
+    indexStats,
   }
 }
 
@@ -4186,7 +4387,6 @@ export default {
           )
           const rankedFiles = rankDiscoveredFiles(discoveryResults)
           const probeFiles = selectProbeFiles(rankedFiles, discoveryResults)
-          const impactIndexShadowPromise = runImpactIndexShadow(root, probeFiles)
           const probeFileSet = new Set(probeFiles.map((entry) => entry.file))
           const allDiscoveredFilesProbed =
             rankedFiles.length === probeFileSet.size
@@ -4253,18 +4453,14 @@ export default {
             .sort((a, b) => a.queryIndex - b.queryIndex)
 
           const probeRankedFiles = rankProbedFiles(rankedFiles, probeResults)
-          const impactIndexShadow = impactIndexShadowStats(
-            await impactIndexShadowPromise,
-            rankedFiles,
-          )
           const impactValidation = await validateImpactHypotheses(
             root,
             target,
             glob,
-            impactIndexShadow,
             probeFiles,
             probeResults,
           )
+          const impactIndexShadow = impactValidation.indexStats
           const selectedFiles = selectEmitFilesWithImpact(
             probeRankedFiles,
             discoveryResults,
@@ -5044,7 +5240,7 @@ export default {
             all_discovered_files_probed: allDiscoveredFilesProbed,
             all_discovered_files_emitted: allDiscoveredFilesSelected,
             routing_active: routingActive,
-            route_strategy: "query_fair_lexical8_plus_scope_conditioned_impact",
+            route_strategy: "query_fair_lexical8_plus_task_local_impact",
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
@@ -5064,6 +5260,25 @@ export default {
             impact_rejected: impactValidation.rejected.length,
             impact_scope_conditioned: true,
             impact_scope_seed_contexts: impactValidation.seedContexts,
+            impact_scope_owner_symbols: impactValidation.ownerSymbols,
+            impact_pairwise_conditioned: impactValidation.pairwiseConditioned === true,
+            impact_filter_before_cap: impactIndexShadow.taskFiltersApplied === true,
+            impact_filter_query_elapsed_ms: impactValidation.filterQueryElapsedMs,
+            impact_refresh_fallback_attempted: impactValidation.refreshFallbackAttempted === true,
+            impact_refresh_fallback_elapsed_ms: impactValidation.refreshFallbackElapsedMs,
+            impact_pre_refresh_refresh_due: impactValidation.initialIndexStats?.refreshDue === true,
+            impact_pre_refresh_stale_seed_files: impactValidation.initialIndexStats?.staleSeedFiles ?? 0,
+            impact_pre_refresh_stale_witness_edges: impactValidation.initialIndexStats?.staleWitnessEdges ?? 0,
+            impact_pre_refresh_cache_age_ms: impactValidation.initialIndexStats?.cacheAgeMs ?? null,
+            impact_refresh_fallback_cause:
+              impactValidation.refreshFallbackAttempted !== true
+                ? null
+                : ((impactValidation.initialIndexStats?.staleSeedFiles ?? 0) > 0 ||
+                    (impactValidation.initialIndexStats?.staleWitnessEdges ?? 0) > 0)
+                  ? "fingerprint_stale"
+                  : impactValidation.initialIndexStats?.refreshDue === true
+                    ? "age_or_unavailable"
+                    : "validation_miss",
             impact_scope_relations_rejected: impactValidation.scopeRejected,
             impact_index_coverage_complete: impactIndexShadow.refreshComplete,
             impact_index_partial_reason: impactIndexShadow.partialReason,
@@ -5083,6 +5298,10 @@ export default {
               sample_line: entry.impact?.sample?.line ?? null,
             })),
             impact_index_refresh_due: impactIndexShadow.refreshDue,
+            impact_index_refresh_deferred: impactIndexShadow.refreshDeferred === true,
+            impact_index_stale_seed_files: impactIndexShadow.staleSeedFiles,
+            impact_index_stale_witness_edges: impactIndexShadow.staleWitnessEdges,
+            impact_index_bootstrap_cache_hit: impactIndexShadow.bootstrapCacheHit === true,
             impact_index_refresh_ok: impactIndexShadow.refreshOk,
             impact_index_refresh_reason: impactIndexShadow.refreshReason,
             impact_index_refresh_elapsed_ms: impactIndexShadow.refreshElapsedMs,
@@ -5272,7 +5491,7 @@ export default {
               all_discovered_files_probed: allDiscoveredFilesProbed,
               all_discovered_files_emitted: allDiscoveredFilesSelected,
               routing_active: routingActive,
-              route_strategy: "query_fair_lexical8_plus_scope_conditioned_impact",
+              route_strategy: "query_fair_lexical8_plus_task_local_impact",
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
@@ -5284,6 +5503,8 @@ export default {
             impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
             impact_validation_reason: impactValidation.reason,
             impact_validated: impactValidation.validated.length,
+            impact_scope_owner_symbols: impactValidation.ownerSymbols,
+            impact_pairwise_conditioned: impactValidation.pairwiseConditioned === true,
             impact_scope_relations_rejected: impactValidation.scopeRejected,
             impact_index_coverage_complete: impactIndexShadow.refreshComplete,
             impact_emitted_files: selectedImpactFiles.length,

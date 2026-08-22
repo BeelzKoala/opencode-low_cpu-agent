@@ -1,0 +1,9 @@
+{
+  "version": "v2.13-C2.1",
+  "protocol": "search-v2.13.4-owner-conditioned-impact",
+  "verdict": "PASS",
+  "pass": 4,
+  "fail": 0,
+  "total_wall_s": 120,
+  "source_sha256": "26c64339940bbbc8ab81eec36a273568c48264d32c7cefe5124d690ad1a4a13f"
+}

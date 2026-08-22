@@ -1,0 +1,9 @@
+{
+  "version": "v2.13-C2.2-R1.1",
+  "protocol": "search-v2.13.5-task-local-impact",
+  "verdict": "PASS",
+  "pass": 8,
+  "fail": 0,
+  "total_wall_s": 241,
+  "source_sha256": "91b46f990e29f9ababed64dc488fd05092cdd1ec5fbbdd2ab70e20272892c5a9"
+}
