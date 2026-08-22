@@ -1,0 +1,14 @@
+{
+  "version": "v2.12-B",
+  "protocol": "search-v2.12.1-probe-emit-router",
+  "goal": "probe more lexical candidates without increasing the model-facing file set",
+  "gates": [
+    {"name":"rank5_probe_promotion","expect":{"candidate_files":8,"probed_files":8,"emitted_files":4,"target_initial_rank":5,"target_probe_rank":1,"target_emitted":true}},
+    {"name":"probe_cap_emit_cap","expect":{"candidate_files":12,"probed_files":8,"emitted_files":4,"retained_unread_files":4,"probed_unemitted_files":4,"scan_complete":false}},
+    {"name":"four_query_fairness","expect":{"all_nonempty_queries_represented_in_probe":true,"all_nonempty_queries_represented_in_emit":true}},
+    {"name":"narrow_complete_regression","expect":{"candidate_files":1,"probed_files":1,"emitted_files":1,"complete":true}},
+    {"name":"dense_region_regression","expect":{"representation":"region","refinement_required":false}},
+    {"name":"hybrid_regression","expect":{"representation":"hybrid","complete":true}},
+    {"name":"line_cap_index_safety","expect":{"representation":"index","scan_complete":false,"index_reason":"line_scan_incomplete"}}
+  ]
+}

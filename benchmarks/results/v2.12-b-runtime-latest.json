@@ -1,0 +1,117 @@
+{
+  "version": "v2.12-B",
+  "protocol": "search-v2.12.1-probe-emit-router",
+  "verdict": "PASS",
+  "primary_win": {
+    "target": "e_target.py",
+    "initial_rank": 5,
+    "probe_rank": 1,
+    "previous_v2_12_a_emit_cap": 4,
+    "counterfactual_v2_12_a_miss": true,
+    "target_emitted": true,
+    "probed_files": 8,
+    "emitted_files": 4,
+    "output_bytes": 867,
+    "probe_elapsed_ms": 4.98
+  },
+  "gates": {
+    "rank5_probe_promotion": {
+      "candidate_files": 8,
+      "probed_files": 8,
+      "emitted_files": 4,
+      "representation": "ranked_raw",
+      "scan_complete": true,
+      "evidence_complete": false,
+      "complete": false,
+      "output_bytes": 867,
+      "probe_elapsed_ms": 4.98,
+      "elapsed_ms": 25.47
+    },
+    "probe_cap_emit_cap": {
+      "candidate_files": 12,
+      "probed_files": 8,
+      "emitted_files": 4,
+      "representation": "ranked_raw",
+      "scan_complete": false,
+      "evidence_complete": false,
+      "complete": false,
+      "output_bytes": 872,
+      "probe_elapsed_ms": 4.48,
+      "elapsed_ms": 15.18,
+      "retained_unread_files": 4,
+      "probed_unemitted_files": 4
+    },
+    "four_query_fairness": {
+      "candidate_files": 11,
+      "probed_files": 8,
+      "emitted_files": 4,
+      "representation": "ranked_raw",
+      "scan_complete": false,
+      "evidence_complete": false,
+      "complete": false,
+      "output_bytes": 1062,
+      "probe_elapsed_ms": 4.07,
+      "elapsed_ms": 15.15,
+      "emit_query_coverage": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "narrow_complete": {
+      "candidate_files": 1,
+      "probed_files": 1,
+      "emitted_files": 1,
+      "representation": "raw",
+      "scan_complete": true,
+      "evidence_complete": true,
+      "complete": true,
+      "output_bytes": 497,
+      "probe_elapsed_ms": 2.21,
+      "elapsed_ms": 10.11
+    },
+    "dense_region": {
+      "candidate_files": 1,
+      "probed_files": 1,
+      "emitted_files": 1,
+      "representation": "region",
+      "scan_complete": true,
+      "evidence_complete": false,
+      "complete": false,
+      "output_bytes": 1078,
+      "probe_elapsed_ms": 2.28,
+      "elapsed_ms": 22.96,
+      "refinement_required": false,
+      "region_sampled_hits": 8,
+      "region_retained_hits": 142
+    },
+    "hybrid": {
+      "candidate_files": 1,
+      "probed_files": 1,
+      "emitted_files": 1,
+      "representation": "hybrid",
+      "scan_complete": true,
+      "evidence_complete": true,
+      "complete": true,
+      "output_bytes": 831,
+      "probe_elapsed_ms": 2.02,
+      "elapsed_ms": 7.78,
+      "hybrid_ratio": 0.628,
+      "hybrid_variants": 1
+    },
+    "line_cap_index": {
+      "candidate_files": 1,
+      "probed_files": 1,
+      "emitted_files": 1,
+      "representation": "index",
+      "scan_complete": false,
+      "evidence_complete": false,
+      "complete": false,
+      "output_bytes": 625,
+      "probe_elapsed_ms": 3.87,
+      "elapsed_ms": 14.13,
+      "index_reason": "line_scan_incomplete"
+    }
+  }
+}

@@ -5,7 +5,9 @@ import path from "node:path"
 const MAX_QUERIES = 4
 const LINE_HIT_CAP_PER_QUERY = 1000
 const FILE_DISCOVERY_CAP_PER_QUERY = 5000
-const AUTO_REFINE_MAX_FILES = 4
+const PROBE_MAX_FILES = 8
+const EMIT_MAX_FILES = 4
+const PROBE_MATCH_SIGNAL_CAP = 3
 const ROUTE_BODY_BUDGET_BYTES = 700
 const CONTEXT_RADIUS = 2
 
@@ -53,7 +55,7 @@ const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.12.0-budgeted-region-router"
+const SEARCH_PROTOCOL = "search-v2.12.1-probe-emit-router"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -956,44 +958,127 @@ function rankDiscoveredFiles(discoveryResults) {
   )
 }
 
-function selectAutoRefineFiles(rankedFiles, discoveryResults) {
+function selectFairFiles(rankedFiles, queryResults, limit) {
   const selected = new Set()
   const coveredQueries = new Set()
-  const activeQueries = (discoveryResults ?? [])
-    .filter((result) => Array.isArray(result?.files) && result.files.length > 0)
+  const activeQueries = (queryResults ?? [])
+    .map((result) => ({
+      queryIndex: result.queryIndex,
+      files: Array.isArray(result?.files)
+        ? [...new Set(result.files)]
+        : [...new Set((result?.matches ?? []).map((match) => match.file))],
+    }))
+    .filter((result) => result.files.length > 0)
     .sort(
       (a, b) =>
         a.files.length - b.files.length || a.queryIndex - b.queryIndex,
     )
 
-  // Cover every non-empty query first, starting with the rarest query. With
-  // MAX_QUERIES=4 and AUTO_REFINE_MAX_FILES=4 this guarantees one direct
-  // lexical candidate per query whenever discovery saw one.
+  // Fairness is a reservation rule, not a relevance score. Reserve one direct
+  // candidate for every non-empty query first, then fill the remaining slots
+  // from the caller-provided relevance order.
   for (const result of activeQueries) {
-    if (selected.size >= AUTO_REFINE_MAX_FILES) break
+    if (selected.size >= limit) break
     if (coveredQueries.has(result.queryIndex)) continue
 
+    const fileKeys = new Set(result.files.map((file) => evidenceFileKey(file)))
     const candidate = rankedFiles.find(
       (entry) =>
-        entry.queries.has(result.queryIndex) && !selected.has(entry.file),
+        fileKeys.has(evidenceFileKey(entry.file)) &&
+        !selected.has(entry.file),
     )
 
     if (candidate) {
       selected.add(candidate.file)
-      for (const queryIndex of candidate.queries) {
+      for (const queryIndex of candidate.queries ?? []) {
         coveredQueries.add(queryIndex)
       }
     }
   }
 
   for (const entry of rankedFiles) {
-    if (selected.size >= AUTO_REFINE_MAX_FILES) break
+    if (selected.size >= limit) break
     if (selected.has(entry.file)) continue
     selected.add(entry.file)
-    for (const queryIndex of entry.queries) coveredQueries.add(queryIndex)
+    for (const queryIndex of entry.queries ?? []) coveredQueries.add(queryIndex)
   }
 
   return rankedFiles.filter((entry) => selected.has(entry.file))
+}
+
+function selectProbeFiles(rankedFiles, discoveryResults) {
+  return selectFairFiles(rankedFiles, discoveryResults, PROBE_MAX_FILES)
+}
+
+function declarationHint(text) {
+  const line = String(text ?? "").trim()
+  if (!line) return 0
+
+  return /^(?:export\s+)?(?:async\s+)?(?:def|class|function|interface|type|enum|struct|trait|fn)\b/.test(
+    line,
+  )
+    ? 1
+    : 0
+}
+
+function rankProbedFiles(rankedFiles, probeResults) {
+  const byFile = new Map(
+    (rankedFiles ?? []).map((entry, index) => [
+      evidenceFileKey(entry.file),
+      {
+        ...entry,
+        initialRank: index + 1,
+        probeLineHits: 0,
+        probeExactMatches: 0,
+        probeDefinitionHints: 0,
+      },
+    ]),
+  )
+
+  for (const result of probeResults ?? []) {
+    for (const match of result?.matches ?? []) {
+      const entry = byFile.get(evidenceFileKey(match.file))
+      if (!entry) continue
+
+      entry.probeLineHits += 1
+      entry.probeExactMatches += Array.isArray(match.exactSpans)
+        ? match.exactSpans.length
+        : 0
+      entry.probeDefinitionHints += declarationHint(match.text)
+    }
+  }
+
+  // Probe evidence is deliberately weak. Coverage/path still dominate. The
+  // extra line scan only breaks otherwise-ambiguous candidates using a bounded
+  // definition hint and a capped exact-match signal; raw hit volume can never
+  // grow without bound into a relevance score.
+  return [...byFile.values()].sort(
+    (a, b) =>
+      b.coverage - a.coverage ||
+      b.pathAffinity - a.pathAffinity ||
+      b.probeDefinitionHints - a.probeDefinitionHints ||
+      Math.min(PROBE_MATCH_SIGNAL_CAP, b.probeExactMatches) -
+        Math.min(PROBE_MATCH_SIGNAL_CAP, a.probeExactMatches) ||
+      a.initialRank - b.initialRank ||
+      a.file.localeCompare(b.file),
+  )
+}
+
+function selectEmitFiles(probedFiles, discoveryResults) {
+  return selectFairFiles(probedFiles, discoveryResults, EMIT_MAX_FILES)
+}
+
+function filterQueryResultsToFiles(results, selectedFiles) {
+  const allowed = new Set(
+    (selectedFiles ?? []).map((entry) => evidenceFileKey(entry.file)),
+  )
+
+  return (results ?? []).map((result) => ({
+    ...result,
+    matches: (result.matches ?? []).filter((match) =>
+      allowed.has(evidenceFileKey(match.file)),
+    ),
+  }))
 }
 
 function discoverySummaryFor(results) {
@@ -1031,7 +1116,7 @@ function renderRouteMap(rankedFiles, selectedFiles, bodyBudgetBytes) {
   const retained = Math.max(0, rankedFiles.length - selectedSet.size)
 
   push(
-    `ROUTE selected=${selectedSet.size} retained=${retained}`,
+    `ROUTE emitted=${selectedSet.size} retained=${retained}`,
   )
 
   for (const entry of selectedFiles) {
@@ -1043,7 +1128,7 @@ function renderRouteMap(rankedFiles, selectedFiles, bodyBudgetBytes) {
     if (!push(`  ${entry.file} [${q}]`)) break
   }
 
-  if (retained > 0) push(`  +${retained} lexical candidates retained_unread`)
+  if (retained > 0) push(`  +${retained} lexical candidates retained_unemitted`)
 
   return { body, bodyBytes, retained }
 }
@@ -2584,7 +2669,7 @@ function querySummaryFor(results) {
       ? ` error=${JSON.stringify(clipLine(result.error, 240))}`
       : ""
 
-    return `Q${result.queryIndex + 1} selected_line_hits=${count} selected_scan=${state}${errorDetail}`
+    return `Q${result.queryIndex + 1} probed_line_hits=${count} probe_scan=${state}${errorDetail}`
   })
 }
 
@@ -3106,15 +3191,15 @@ export default {
         description:
           "Search the active project with 1 to 4 regular expressions in one call. " +
           "Search first performs repository-wide file discovery, ranks lexical candidate files with fairness separated from relevance, " +
-          "and automatically refines up to four candidates in the same tool call. " +
+          "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
           "Returns bounded line-numbered evidence and explicit completeness metadata. " +
           "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
-          "for the requested regex/path/glob. scan_complete=true is stronger: every matching line " +
-          "was scanned, which is only possible when all discovered files were refined. " +
-          "A ROUTE block is heuristic routing only; retained_unread files remain lexical candidates " +
+          "for the requested regex/path/glob. scan_complete=true is stronger: every discovered file " +
+          "was probed and every matching line was scanned. " +
+          "A ROUTE block is heuristic routing only; retained_unemitted files remain lexical candidates " +
           "and must not be treated as irrelevant or absent. " +
           "Completeness is lexical: scan_complete=true means all matches for the requested " +
-          "regex/path/glob were scanned, not that a semantic category is exhaustively absent. " +
+          "regex/path/glob were scanned across the probed universe, not that a semantic category is exhaustively absent. " +
           "evidence_complete=true means every discovered hit line is represented, not that " +
           "the surrounding function or file is fully shown. representation=focused adds bounded " +
           "containing-scope context chosen from structurally relevant non-module matches but still " +
@@ -3122,7 +3207,7 @@ export default {
           "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
           "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
           "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
-          "evidence itself cannot fit or complete; broad repository routing is auto-refined before returning.",
+          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning.",
         input: {
           type: "object",
           properties: {
@@ -3286,20 +3371,13 @@ export default {
             (result) => result.scanComplete,
           )
           const rankedFiles = rankDiscoveredFiles(discoveryResults)
-          const selectedFiles = selectAutoRefineFiles(
-            rankedFiles,
-            discoveryResults,
-          )
-          const selectedFileSet = new Set(
-            selectedFiles.map((entry) => entry.file),
-          )
-          const allDiscoveredFilesSelected =
-            rankedFiles.length === selectedFileSet.size
-          const routingActive =
-            !discoveryComplete || !allDiscoveredFilesSelected
+          const probeFiles = selectProbeFiles(rankedFiles, discoveryResults)
+          const probeFileSet = new Set(probeFiles.map((entry) => entry.file))
+          const allDiscoveredFilesProbed =
+            rankedFiles.length === probeFileSet.size
 
           const queryPlan = queries.map((query, index) => {
-            const targets = selectedFiles
+            const targets = probeFiles
               .filter((entry) => entry.queries.has(index))
               .map((entry) => entry.file)
               .sort()
@@ -3347,7 +3425,7 @@ export default {
             }
           }
 
-          const results = queryPlan
+          const probeResults = queryPlan
             .map((item) => {
               if (item.cached) {
                 return reindexQueryResult(item.cached, item.index, true)
@@ -3359,21 +3437,38 @@ export default {
             .filter(Boolean)
             .sort((a, b) => a.queryIndex - b.queryIndex)
 
+          const probeRankedFiles = rankProbedFiles(rankedFiles, probeResults)
+          const selectedFiles = selectEmitFiles(probeRankedFiles, discoveryResults)
+          const selectedFileSet = new Set(
+            selectedFiles.map((entry) => entry.file),
+          )
+          const allDiscoveredFilesSelected =
+            rankedFiles.length === selectedFileSet.size
+          const routingActive =
+            !discoveryComplete || !allDiscoveredFilesSelected
+          const results = filterQueryResultsToFiles(probeResults, selectedFiles)
+
+          const probeHits = mergeHits(probeResults)
           const hits = mergeHits(results)
           const exactSpanHits = [...hits.values()].reduce(
             (total, hit) => total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
             0,
           )
-          const selectedScanComplete = results.every(
+          const probedExactSpanHits = [...probeHits.values()].reduce(
+            (total, hit) =>
+              total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
+            0,
+          )
+          const selectedScanComplete = probeResults.every(
             (result) => result.scanComplete,
           )
           const scanComplete =
             discoveryComplete &&
-            allDiscoveredFilesSelected &&
+            allDiscoveredFilesProbed &&
             selectedScanComplete
           const querySummary = [
             ...discoverySummaryFor(discoveryResults),
-            ...querySummaryFor(results),
+            ...querySummaryFor(probeResults),
           ]
           const callBudgetBytes = Math.min(MAX_OUTPUT_BYTES, remainingEvidenceBytes)
           const provisionalRoute = routingActive
@@ -3402,13 +3497,15 @@ export default {
 
           const rawRendered = await renderEvidence(root, hits, bodyBudget)
           const selectedEvidenceComplete = rawRendered.shown.size === hits.size
-          const rawEvidenceComplete = scanComplete && selectedEvidenceComplete
+          const rawEvidenceComplete =
+            scanComplete && allDiscoveredFilesSelected && selectedEvidenceComplete
           const rawComplete = scanComplete && rawEvidenceComplete
           const rawReasons = []
 
           if (!discoveryComplete) rawReasons.push("lexical_discovery_incomplete")
-          else if (!allDiscoveredFilesSelected) rawReasons.push("ranked_subset")
+          else if (!allDiscoveredFilesProbed) rawReasons.push("probe_subset")
           else if (!selectedScanComplete) rawReasons.push("scan_incomplete")
+          else if (!allDiscoveredFilesSelected) rawReasons.push("budgeted_emit_subset")
           if (!selectedEvidenceComplete) rawReasons.push("output_budget")
 
           const rawHeader = [
@@ -3560,13 +3657,13 @@ export default {
                   ? "ranked_hybrid"
                   : "hybrid"
                 const hybridHeader = [
-                  `SEARCH representation=${publicHybridRepresentation} complete=${scanComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete} selected_evidence_complete=true matches_complete=${scanComplete} selected_witnesses_complete=true context_complete=false context_sampled=${contextSampled} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
+                  `SEARCH representation=${publicHybridRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} selected_witnesses_complete=true context_complete=false context_sampled=${contextSampled} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
                   ...querySummary,
                 ]
 
                 if (routingActive) {
                   hybridHeader.push(
-                    `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset" : "lexical_discovery_incomplete"}`,
+                    `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
                   )
                 }
 
@@ -3601,8 +3698,8 @@ export default {
                   resultBytes = hybridResultBytes
                   bodyBytes = hybridRendered.bodyBytes
                   shownHits = hits.size
-                  evidenceComplete = scanComplete
-                  complete = scanComplete
+                  evidenceComplete = scanComplete && allDiscoveredFilesSelected
+                  complete = scanComplete && allDiscoveredFilesSelected
                   distillReason = "selected"
                 }
               }
@@ -3696,13 +3793,13 @@ export default {
                       ? "ranked_focused"
                       : "focused"
                     const focusedHeader = [
-                      `SEARCH representation=${publicFocusedRepresentation} complete=${scanComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete} selected_evidence_complete=true matches_complete=${scanComplete} context_complete=false context_mode=scope_guided_dedup candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${shownNow.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawUncovered.skippedPriorLines > 0} full_scopes=${focusedRendered.fullScopes} partial_scopes=${focusedRendered.partialScopes}`,
+                      `SEARCH representation=${publicFocusedRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} context_complete=false context_mode=scope_guided_dedup candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${shownNow.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawUncovered.skippedPriorLines > 0} full_scopes=${focusedRendered.fullScopes} partial_scopes=${focusedRendered.partialScopes}`,
                       ...querySummary,
                     ]
 
                     if (routingActive) {
                       focusedHeader.push(
-                        `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset" : "lexical_discovery_incomplete"}`,
+                        `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
                       )
                     }
                     const focusedContent = [
@@ -3733,8 +3830,8 @@ export default {
                       bodyBytes =
                         rawUncovered.bodyBytes + focusedRendered.bodyBytes
                       shownHits = shownNow.size
-                      evidenceComplete = scanComplete
-                      complete = scanComplete
+                      evidenceComplete = scanComplete && allDiscoveredFilesSelected
+                      complete = scanComplete && allDiscoveredFilesSelected
                       distillReason = "ir_complete"
                       focusedReason = "selected"
                       focusedFacts = new Set([
@@ -3794,7 +3891,7 @@ export default {
 
               if (routingActive) {
                 regionHeader.push(
-                  `INCOMPLETE reasons=${discoveryComplete ? "ranked_subset,region_sampled" : "lexical_discovery_incomplete,region_sampled"}`,
+                  `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete,region_sampled" : !allDiscoveredFilesProbed ? "probe_subset,region_sampled" : "budgeted_emit_subset,region_sampled"}`,
                 )
               } else {
                 regionHeader.push("INCOMPLETE reasons=region_sampled")
@@ -3918,16 +4015,20 @@ export default {
             const selectedTurnEvidenceComplete =
               selectedEvidenceComplete && accountedHits
             const turnEvidenceComplete =
-              scanComplete && selectedTurnEvidenceComplete
+              scanComplete &&
+              allDiscoveredFilesSelected &&
+              selectedTurnEvidenceComplete
             const turnComplete = scanComplete && turnEvidenceComplete
             const rawNovelReasons = []
 
             if (!discoveryComplete) {
               rawNovelReasons.push("lexical_discovery_incomplete")
-            } else if (!allDiscoveredFilesSelected) {
-              rawNovelReasons.push("ranked_subset")
+            } else if (!allDiscoveredFilesProbed) {
+              rawNovelReasons.push("probe_subset")
             } else if (!selectedScanComplete) {
               rawNovelReasons.push("scan_incomplete")
+            } else if (!allDiscoveredFilesSelected) {
+              rawNovelReasons.push("budgeted_emit_subset")
             }
             if (!selectedTurnEvidenceComplete) {
               rawNovelReasons.push("output_budget")
@@ -4095,19 +4196,39 @@ export default {
             line_hit_cap_per_query: LINE_HIT_CAP_PER_QUERY,
             lexical_discovery_complete: discoveryComplete,
             selected_scan_complete: selectedScanComplete,
+            probe_scan_complete: selectedScanComplete,
+            all_discovered_files_probed: allDiscoveredFilesProbed,
+            all_discovered_files_emitted: allDiscoveredFilesSelected,
             routing_active: routingActive,
-            route_strategy: "query_fair_coverage_path",
+            route_strategy: "query_fair_probe_then_evidence_emit",
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
+            probe_elapsed_ms: refineElapsedMs,
+            probe_files: probeFiles.map((entry) => ({
+              file: entry.file,
+              queries: [...entry.queries].sort((a, b) => a - b),
+              initial_rank:
+                rankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
+            })),
+            probed_files: probeFileSet.size,
+            emitted_files: selectedFileSet.size,
             selected_files: selectedFiles.map((entry) => ({
               file: entry.file,
               queries: [...entry.queries].sort((a, b) => a - b),
               coverage: entry.coverage,
               path_affinity: entry.pathAffinity,
               rarity: entry.rarity,
+              initial_rank: entry.initialRank ?? null,
+              probe_line_hits: entry.probeLineHits ?? 0,
+              probe_exact_matches: entry.probeExactMatches ?? 0,
+              probe_definition_hints: entry.probeDefinitionHints ?? 0,
+              probe_rank:
+                probeRankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
             })),
-            retained_unread_files: routeRendered.retained,
+            retained_unread_files: Math.max(0, rankedFiles.length - probeFileSet.size),
+            retained_unemitted_files: routeRendered.retained,
+            probed_unemitted_files: Math.max(0, probeFileSet.size - selectedFileSet.size),
             discovery_files_by_query: discoveryResults.map((result) => ({
               query_index: result.queryIndex,
               files: result.files?.length ?? 0,
@@ -4126,7 +4247,9 @@ export default {
             representation,
             source_representation: sourceRepresentation,
             unique_hits: hits.size,
+            probed_unique_hits: probeHits.size,
             exact_span_hits: exactSpanHits,
+            probed_exact_span_hits: probedExactSpanHits,
             distill_input_hits: distillInput.length,
             shown_hits: shownHits,
             scan_complete: scanComplete,
@@ -4236,13 +4359,22 @@ export default {
               scan_complete: scanComplete,
               lexical_discovery_complete: discoveryComplete,
               selected_scan_complete: selectedScanComplete,
+              probe_scan_complete: selectedScanComplete,
+              all_discovered_files_probed: allDiscoveredFilesProbed,
+              all_discovered_files_emitted: allDiscoveredFilesSelected,
               routing_active: routingActive,
-              route_strategy: "query_fair_coverage_path",
+              route_strategy: "query_fair_probe_then_evidence_emit",
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
+              probe_elapsed_ms: refineElapsedMs,
+              probed_files: probeFileSet.size,
+              emitted_files: selectedFileSet.size,
+              probe_files: probeFiles.map((entry) => entry.file),
               selected_files: selectedFiles.map((entry) => entry.file),
-              retained_unread_files: routeRendered.retained,
+              retained_unread_files: Math.max(0, rankedFiles.length - probeFileSet.size),
+              retained_unemitted_files: routeRendered.retained,
+              probed_unemitted_files: Math.max(0, probeFileSet.size - selectedFileSet.size),
               reused_query_count: reusedQueryCount,
               executed_query_count: executedQueryCount,
               refinement_required: refinementRequired,

@@ -27,7 +27,7 @@ File-level `rg --files-with-matches`, direct lexical candidate retention, query-
 same-call refinement, separate discovery/line completeness and separate route/evidence
 novelty ledgers.
 
-### v2.12-A — Budgeted region router — CURRENT
+### v2.12-A — Budgeted region router — DONE
 
 - fairness is separate from relevance;
 - route scores stay in telemetry, not model-facing text;
@@ -35,7 +35,7 @@ novelty ledgers.
 - dense evidence auto-routes to sampled AST scopes before INDEX;
 - route-only novelty does not bypass evidence no-progress.
 
-### v2.12-B — Probe-more / emit-less — NEXT, ONLY AFTER A PASSES
+### v2.12-B — Probe-more / emit-less — CURRENT
 
 - probe 6–8 lexical files inside the tool;
 - emit only the best evidence regions under the evidence budget;
