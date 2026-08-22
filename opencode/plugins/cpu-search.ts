@@ -36,6 +36,14 @@ const IMPACT_INDEX_MAX_STDOUT_BYTES = 128 * 1024
 const IMPACT_INDEX_MAX_SEEDS = PROBE_MAX_FILES
 const IMPACT_INDEX_MAX_NEIGHBORS = 24
 const IMPACT_INDEX_REFRESH_TTL_MS = 120_000
+const IMPACT_GRAPH_PROBE_MAX_FILES = 2
+const IMPACT_GRAPH_EMIT_MAX_FILES = 1
+const IMPACT_BINDINGS_PER_CANDIDATE = 4
+const IMPACT_VALIDATION_TIMEOUT_MS = 350
+const IMPACT_VALIDATION_HIT_CAP = 8
+const IMPACT_SCOPE_IDENTIFIER_CAP = 160
+const IMPACT_SCOPE_WINDOW_RADIUS = 12
+const IMPACT_SCOPE_MAX_LINES = 180
 const HYBRID_MIN_SAVINGS_RATIO = 0.75
 const HYBRID_CONTEXT_RADIUS = 1
 const HYBRID_CONTEXT_SAMPLES_PER_GROUP = 3
@@ -62,7 +70,7 @@ const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.13.0-impact-shadow"
+const SEARCH_PROTOCOL = "search-v2.13.3-evidence-conditioned-impact-fixes"
 const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -1120,24 +1128,32 @@ function renderRouteMap(rankedFiles, selectedFiles, bodyBudgetBytes) {
     return true
   }
 
-  const selectedSet = new Set(selectedFiles.map((entry) => entry.file))
-  const retained = Math.max(0, rankedFiles.length - selectedSet.size)
-
-  push(
-    `ROUTE emitted=${selectedSet.size} retained=${retained}`,
-  )
+  const lexicalSelected = (selectedFiles ?? []).filter((entry) => entry?.origin !== "impact")
+  const retained = Math.max(0, rankedFiles.length - lexicalSelected.length)
+  push(`ROUTE emitted=${selectedFiles.length} retained=${retained}`)
 
   for (const entry of selectedFiles) {
+    if (entry?.origin === "impact") {
+      const binding = (entry.impact?.bindings ?? []).join(",") || "-"
+      const via = entry.impact?.seed ?? "-"
+      const direction = entry.impact?.direction ?? "-"
+      const validation = entry.impact?.validationKind ?? "-"
+      if (!push(`  ${entry.file} [IMPACT via=${via} direction=${direction} binding=${binding} validated=${validation}]`)) break
+      const sample = entry.impact?.sample
+      if (Number.isInteger(sample?.line)) {
+        if (!push(`    > ${sample.line} | ${clipLine(sample.text, 220)}`)) break
+      }
+      continue
+    }
+
     const q = [...entry.queries]
       .sort((a, b) => a - b)
       .map((value) => `Q${value + 1}`)
       .join(",")
-
     if (!push(`  ${entry.file} [${q}]`)) break
   }
 
   if (retained > 0) push(`  +${retained} lexical candidates retained_unemitted`)
-
   return { body, bodyBytes, retained }
 }
 
@@ -1718,7 +1734,15 @@ async function runImpactIndexShadow(root, seedFiles) {
   )].slice(0, IMPACT_INDEX_MAX_SEEDS)
 
   if (seeds.length === 0) {
-    return { attempted: false, ok: false, reason: "no_seed_files", seeds, elapsedMs: 0, refresh: null, query: null }
+    return {
+      attempted: false,
+      ok: false,
+      reason: "no_seed_files",
+      seeds,
+      elapsedMs: 0,
+      refresh: null,
+      query: null,
+    }
   }
 
   const started = performance.now()
@@ -1727,28 +1751,49 @@ async function runImpactIndexShadow(root, seedFiles) {
   let refresh = null
 
   if (refreshDue) {
-    refresh = await runImpactIndexRequest(root, { mode: "refresh" }, IMPACT_INDEX_REFRESH_TIMEOUT_MS)
-    if (refresh.ok && refresh.response?.mode === "refresh" && refresh.response?.ready === true && refresh.response?.refresh_complete === true) {
+    refresh = await runImpactIndexRequest(
+      root,
+      { mode: "refresh" },
+      IMPACT_INDEX_REFRESH_TIMEOUT_MS,
+    )
+    // The graph is heuristic routing data. A partial-but-ready cache is useful
+    // and should respect the TTL; completeness is tracked separately.
+    if (
+      refresh.ok &&
+      refresh.response?.mode === "refresh" &&
+      refresh.response?.ready === true
+    ) {
       impactIndexRefreshAt.set(root, nowMs())
     }
   }
 
   const query = await runImpactIndexRequest(
     root,
-    { mode: "neighbors", seed_files: seeds, max_neighbors: IMPACT_INDEX_MAX_NEIGHBORS },
+    {
+      mode: "neighbors",
+      seed_files: seeds,
+      max_neighbors: IMPACT_INDEX_MAX_NEIGHBORS,
+    },
     IMPACT_INDEX_QUERY_TIMEOUT_MS,
   )
-  const querySafe = query.ok && query.response?.mode === "neighbors" && query.response?.ready === true && Array.isArray(query.response?.neighbors)
+
+  const querySafe =
+    query.ok &&
+    query.response?.mode === "neighbors" &&
+    query.response?.ready === true &&
+    Array.isArray(query.response?.neighbors)
 
   return {
     attempted: true,
     ok: querySafe,
     reason: querySafe
       ? refreshDue
-        ? refresh?.ok === true && refresh.response?.refresh_complete === true
-          ? "shadow_refreshed"
-          : "shadow_stale_after_refresh_failure"
-        : "shadow_warm"
+        ? refresh?.ok === true && refresh.response?.ready === true
+          ? refresh.response?.coverage_complete === false
+            ? "impact_refreshed_partial"
+            : "impact_refreshed"
+          : "impact_stale_after_refresh_failure"
+        : "impact_warm"
       : query.reason ?? "query_unavailable",
     seeds,
     elapsedMs: Math.round((performance.now() - started) * 100) / 100,
@@ -1759,9 +1804,15 @@ async function runImpactIndexShadow(root, seedFiles) {
 }
 
 function impactIndexShadowStats(result, lexicalFiles) {
-  const lexical = new Set((lexicalFiles ?? []).map((entry) => evidenceFileKey(typeof entry === "string" ? entry : entry?.file)))
-  const neighbors = result?.ok && Array.isArray(result?.query?.response?.neighbors) ? result.query.response.neighbors : []
-  const lexicalMisses = neighbors.filter((neighbor) => typeof neighbor?.file === "string" && !lexical.has(evidenceFileKey(neighbor.file)))
+  const lexical = new Set((lexicalFiles ?? []).map((entry) =>
+    evidenceFileKey(typeof entry === "string" ? entry : entry?.file),
+  ))
+  const neighbors = result?.ok && Array.isArray(result?.query?.response?.neighbors)
+    ? result.query.response.neighbors
+    : []
+  const lexicalMisses = neighbors.filter((neighbor) =>
+    typeof neighbor?.file === "string" && !lexical.has(evidenceFileKey(neighbor.file)),
+  )
   const refresh = result?.refresh?.response ?? null
   const query = result?.query?.response ?? null
 
@@ -1771,7 +1822,13 @@ function impactIndexShadowStats(result, lexicalFiles) {
     reason: result?.reason ?? "unknown",
     elapsedMs: result?.elapsedMs ?? 0,
     refreshDue: result?.refreshDue ?? false,
-    refreshOk: result?.refresh?.ok === true && refresh?.mode === "refresh" && refresh?.ready === true && refresh?.refresh_complete === true,
+    refreshOk:
+      result?.refresh?.ok === true &&
+      refresh?.mode === "refresh" &&
+      refresh?.ready === true,
+    refreshComplete: refresh?.coverage_complete ?? refresh?.refresh_complete ?? null,
+    partialReason: query?.partial_reason ?? refresh?.partial_reason ?? null,
+    inventoryKind: query?.inventory_kind ?? refresh?.inventory_kind ?? null,
     refreshReason: result?.refresh?.reason ?? null,
     refreshElapsedMs: result?.refresh?.elapsedMs ?? null,
     queryElapsedMs: result?.query?.elapsedMs ?? null,
@@ -1782,8 +1839,12 @@ function impactIndexShadowStats(result, lexicalFiles) {
     filesRemoved: refresh?.files_removed ?? null,
     importsTotal: query?.imports_total ?? refresh?.imports_total ?? null,
     edgesTotal: query?.edges_total ?? refresh?.edges_total ?? null,
-    resolvedImports: refresh?.resolved_imports ?? null,
-    unresolvedImports: refresh?.unresolved_imports ?? null,
+    resolvedImports: query?.local_resolved ?? refresh?.local_resolved ?? refresh?.resolved_imports ?? null,
+    unresolvedImports: query?.local_unresolved ?? refresh?.local_unresolved ?? null,
+    ambiguousImports: query?.local_ambiguous ?? refresh?.local_ambiguous ?? null,
+    externalPackages: query?.external_package ?? refresh?.external_package ?? null,
+    unsupportedAliases: query?.unsupported_alias ?? refresh?.unsupported_alias ?? null,
+    unsupportedDynamic: query?.unsupported_dynamic ?? refresh?.unsupported_dynamic ?? null,
     neighborsTotal: query?.neighbors_total ?? null,
     neighborsShown: neighbors.length,
     lexicalMisses: lexicalMisses.length,
@@ -1799,9 +1860,584 @@ function impactIndexShadowStats(result, lexicalFiles) {
       witness_line: neighbor.witness_line,
       spec: neighbor.spec,
       bindings: Array.isArray(neighbor.bindings) ? neighbor.bindings : [],
+      source_symbols: Array.isArray(neighbor.source_symbols) ? neighbor.source_symbols : [],
       witness: neighbor.witness ?? null,
     })),
   }
+}
+
+function regexEscape(value) {
+  return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function impactBindingList(values) {
+  return [...new Set(values ?? [])]
+    .filter(
+      (value) =>
+        typeof value === "string" &&
+        /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) &&
+        value.length <= 80,
+    )
+    .slice(0, IMPACT_BINDINGS_PER_CANDIDATE)
+}
+
+function impactLanguage(file) {
+  const base = path.basename(String(file ?? "")).toLowerCase()
+  if (base === "dockerfile" || base.startsWith("dockerfile.") || base.endsWith(".dockerfile")) return "docker"
+  const ext = path.extname(base).slice(1)
+  if (ext === "py") return "python"
+  if (["js", "jsx", "mjs", "cjs"].includes(ext)) return "javascript"
+  if (["ts", "tsx", "mts", "cts"].includes(ext)) return "typescript"
+  if (["html", "htm"].includes(ext)) return "html"
+  if (ext === "css") return "css"
+  if (["xml", "xsd", "xsl", "xslt"].includes(ext)) return "xml"
+  if (ext === "sql") return "sql"
+  return "other"
+}
+
+function impactIdentifiers(text) {
+  const out = new Set()
+  const stop = new Set([
+    "and", "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+    "def", "default", "do", "else", "except", "export", "extends", "false", "finally", "for",
+    "from", "function", "if", "import", "in", "interface", "let", "new", "none", "null", "of",
+    "pass", "return", "static", "super", "switch", "this", "throw", "true", "try", "type", "var",
+    "while", "with", "yield",
+  ])
+  const pattern = /[A-Za-z_$][A-Za-z0-9_$]*/g
+  for (const match of String(text ?? "").matchAll(pattern)) {
+    const value = match[0]
+    // One-character local aliases are common in Python/JS/TS (for example
+    // `import { handle as h } ...`). Candidate matching remains exact and is
+    // followed by source validation, so retaining them is safer than silently
+    // losing a real dependency edge.
+    if (value.length < 1 || stop.has(value.toLowerCase())) continue
+    out.add(value)
+    if (out.size >= IMPACT_SCOPE_IDENTIFIER_CAP) break
+  }
+  return out
+}
+
+function impactIndent(line) {
+  const match = String(line ?? "").match(/^[ \t]*/)
+  return match ? match[0].replace(/\t/g, "    ").length : 0
+}
+
+function impactWindowRange(lines, lineNo, radius = IMPACT_SCOPE_WINDOW_RADIUS) {
+  const center = Math.max(0, Math.min(lines.length - 1, lineNo - 1))
+  return {
+    start: Math.max(0, center - radius),
+    end: Math.min(lines.length - 1, center + radius),
+  }
+}
+
+function impactPythonRange(lines, lineNo) {
+  const center = Math.max(0, Math.min(lines.length - 1, lineNo - 1))
+  const hitIndent = impactIndent(lines[center])
+  const defPattern = /^\s*(?:async\s+def|def|class)\s+[A-Za-z_][A-Za-z0-9_]*\b/
+  let start = -1
+  let baseIndent = -1
+
+  for (let i = center; i >= Math.max(0, center - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+    const line = lines[i]
+    if (!defPattern.test(line)) continue
+    const indent = impactIndent(line)
+    if (indent <= hitIndent) {
+      start = i
+      baseIndent = indent
+      break
+    }
+  }
+
+  if (start < 0) return impactWindowRange(lines, lineNo)
+  let end = Math.min(lines.length - 1, start + IMPACT_SCOPE_MAX_LINES - 1)
+  for (let i = start + 1; i < lines.length && i <= end; i += 1) {
+    const trimmed = lines[i].trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    if (impactIndent(lines[i]) <= baseIndent && !/^\s*@/.test(lines[i])) {
+      end = i - 1
+      break
+    }
+  }
+  return { start, end }
+}
+
+function impactBraceRange(lines, lineNo) {
+  const center = Math.max(0, Math.min(lines.length - 1, lineNo - 1))
+  let balance = 0
+  let start = -1
+  for (let i = center; i >= Math.max(0, center - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+    const line = lines[i]
+    for (let j = line.length - 1; j >= 0; j -= 1) {
+      if (line[j] === "}") balance += 1
+      else if (line[j] === "{") {
+        if (balance === 0) {
+          start = i
+          break
+        }
+        balance -= 1
+      }
+    }
+    if (start >= 0) break
+  }
+  if (start < 0) return impactWindowRange(lines, lineNo)
+
+  balance = 0
+  let end = Math.min(lines.length - 1, start + IMPACT_SCOPE_MAX_LINES - 1)
+  outer: for (let i = start; i < lines.length && i <= end; i += 1) {
+    for (const ch of lines[i]) {
+      if (ch === "{") balance += 1
+      else if (ch === "}") {
+        balance -= 1
+        if (balance <= 0) {
+          end = i
+          break outer
+        }
+      }
+    }
+  }
+  return { start, end }
+}
+
+function impactRangeForLanguage(lines, lineNo, language) {
+  if (language === "python") return impactPythonRange(lines, lineNo)
+  if (["javascript", "typescript", "css"].includes(language)) return impactBraceRange(lines, lineNo)
+  return impactWindowRange(lines, lineNo)
+}
+
+function impactMergeRanges(ranges) {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end)
+  const merged = []
+  for (const range of sorted) {
+    const last = merged[merged.length - 1]
+    if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end)
+    else merged.push({ ...range })
+  }
+  return merged
+}
+
+async function buildImpactSeedContexts(root, probeResults) {
+  const byFile = new Map()
+  for (const hit of mergeHits(probeResults).values()) {
+    const file = evidenceFileKey(hit.file)
+    let entry = byFile.get(file)
+    if (!entry) {
+      entry = { file, hitLines: new Set(), fallbackText: [] }
+      byFile.set(file, entry)
+    }
+    entry.hitLines.add(hit.line)
+    entry.fallbackText.push(hit.text ?? "")
+  }
+
+  const contexts = new Map()
+  await Promise.all([...byFile.values()].map(async (entry) => {
+    const language = impactLanguage(entry.file)
+    const resolved = path.resolve(root, entry.file)
+    let lines = null
+    if (resolved === root || resolved.startsWith(root + path.sep)) {
+      try {
+        const source = await readFile(resolved, "utf8")
+        if (bytes(source) <= MAX_CONTEXT_FILE_BYTES) lines = source.split(/\r?\n/)
+      } catch {}
+    }
+
+    const ranges = []
+    const chunks = []
+    if (lines) {
+      for (const lineNo of [...entry.hitLines].slice(0, 12)) {
+        ranges.push(impactRangeForLanguage(lines, lineNo, language))
+      }
+      for (const range of impactMergeRanges(ranges)) {
+        chunks.push(lines.slice(range.start, range.end + 1).join("\n"))
+      }
+    } else {
+      chunks.push(...entry.fallbackText)
+    }
+
+    const text = chunks.join("\n")
+    contexts.set(entry.file, {
+      file: entry.file,
+      language,
+      identifiers: impactIdentifiers(text),
+      ranges: impactMergeRanges(ranges),
+      text,
+      hitLines: entry.hitLines,
+    })
+  }))
+  return contexts
+}
+
+function impactIntersects(values, identifiers) {
+  for (const value of impactBindingList(values)) {
+    if (identifiers?.has(value)) return true
+  }
+  return false
+}
+
+function impactMemberSymbols(context, bindings) {
+  const out = new Set()
+  for (const binding of impactBindingList(bindings)) {
+    const pattern = new RegExp(`\\b${regexEscape(binding)}\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][A-Za-z0-9_$]*)`, "g")
+    for (const match of context?.text?.matchAll(pattern) ?? []) {
+      out.add(match[1])
+      if (out.size >= IMPACT_BINDINGS_PER_CANDIDATE) return [...out]
+    }
+  }
+  return [...out]
+}
+
+async function impactExpansionScope(root, target) {
+  if (target === "." || target === "./" || target === "") return { kind: "root", root }
+  const candidate = path.resolve(root, target)
+  let resolved
+  let info
+  try {
+    resolved = await realpath(candidate)
+    info = await stat(resolved)
+  } catch {
+    return { kind: "blocked", reason: "target_unavailable" }
+  }
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return { kind: "blocked", reason: "target_outside_root" }
+  if (info.isFile()) return { kind: "blocked", reason: "explicit_file_scope" }
+  if (!info.isDirectory()) return { kind: "blocked", reason: "target_not_directory" }
+  return { kind: "directory", root: resolved }
+}
+
+function impactFileAllowedByScope(root, file, scope) {
+  if (!scope || scope.kind === "blocked") return false
+  const resolved = path.resolve(root, evidenceFileKey(file))
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return false
+  if (scope.kind === "root") return true
+  return resolved === scope.root || resolved.startsWith(scope.root + path.sep)
+}
+
+function buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scope) {
+  if (!impactStats?.ok || !Array.isArray(impactStats?.candidates)) return { hypotheses: [], rejectedByScope: 0 }
+
+  const lexical = new Set((probeFiles ?? []).map((entry) => evidenceFileKey(entry.file)))
+  const seedQueries = new Map((probeFiles ?? []).map((entry) => [evidenceFileKey(entry.file), new Set(entry.queries ?? [])]))
+  const grouped = new Map()
+  let rejectedByScope = 0
+
+  for (const candidate of impactStats.candidates) {
+    const file = evidenceFileKey(candidate?.file)
+    const seed = evidenceFileKey(candidate?.seed)
+    if (!file || !seed || lexical.has(file)) continue
+    // Resource/config edges are indexed but remain shadow-only in C1.
+    if (candidate?.confidence !== "exact_local") continue
+    if (!impactFileAllowedByScope(root, file, scope)) continue
+
+    const context = seedContexts.get(seed)
+    if (!context) {
+      rejectedByScope += 1
+      continue
+    }
+
+    const localBindings = impactBindingList(candidate?.bindings)
+    const sourceSymbols = impactBindingList(candidate?.source_symbols)
+    let relevant = false
+    let forwardSymbols = []
+    let reverseBindings = []
+
+    if (candidate.direction === "forward" && impactIntersects(localBindings, context.identifiers)) {
+      forwardSymbols = sourceSymbols.length > 0
+        ? sourceSymbols
+        : impactMemberSymbols(context, localBindings)
+      relevant = forwardSymbols.length > 0
+    } else if (candidate.direction === "reverse" && impactIntersects(sourceSymbols, context.identifiers)) {
+      reverseBindings = localBindings
+      relevant = reverseBindings.length > 0
+    }
+
+    if (!relevant) {
+      rejectedByScope += 1
+      continue
+    }
+
+    let entry = grouped.get(file)
+    if (!entry) {
+      entry = {
+        file,
+        queries: new Set(),
+        relations: [],
+        forwardSymbols: new Set(),
+        reverseBindings: new Set(),
+        displayBindings: new Set(),
+        hasForward: false,
+        hasReverse: false,
+      }
+      grouped.set(file, entry)
+    }
+
+    for (const queryIndex of seedQueries.get(seed) ?? []) entry.queries.add(queryIndex)
+    for (const symbol of forwardSymbols) entry.forwardSymbols.add(symbol)
+    for (const binding of reverseBindings) entry.reverseBindings.add(binding)
+    for (const value of [...localBindings, ...sourceSymbols]) entry.displayBindings.add(value)
+    entry.hasForward ||= candidate.direction === "forward"
+    entry.hasReverse ||= candidate.direction === "reverse"
+    entry.relations.push({ ...candidate, file, seed, bindings: localBindings, source_symbols: sourceSymbols })
+  }
+
+  const hypotheses = [...grouped.values()]
+    .map((entry) => ({
+      ...entry,
+      forwardSymbols: [...entry.forwardSymbols].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
+      reverseBindings: [...entry.reverseBindings].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
+      displayBindings: [...entry.displayBindings].sort().slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
+    }))
+    .filter((entry) => entry.forwardSymbols.length > 0 || entry.reverseBindings.length > 0)
+    .sort(
+      (a, b) =>
+        Number(b.hasForward) - Number(a.hasForward) ||
+        b.queries.size - a.queries.size ||
+        (b.forwardSymbols.length + b.reverseBindings.length) - (a.forwardSymbols.length + a.reverseBindings.length) ||
+        a.file.localeCompare(b.file),
+    )
+    .slice(0, IMPACT_GRAPH_PROBE_MAX_FILES)
+
+  return { hypotheses, rejectedByScope }
+}
+
+function runImpactValidationQuery(root, file, bindings, glob) {
+  return new Promise((resolve) => {
+    const escaped = impactBindingList(bindings).map(regexEscape)
+    if (escaped.length < 1) {
+      resolve({ ok: false, reason: "no_bindings", matches: [], scanComplete: true, elapsedMs: 0 })
+      return
+    }
+    const pattern = escaped.length === 1 ? escaped[0] : `(?:${escaped.join("|")})`
+    const args = ["--json", "--color", "never", "--max-columns", "500", "--max-columns-preview"]
+    for (const exclude of EXCLUDES) args.push("-g", exclude)
+    if (glob) args.push("-g", glob)
+    args.push("--", pattern, file)
+
+    const started = performance.now()
+    const child = spawn("rg", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] })
+    const matches = []
+    let stdout = ""
+    let stderr = ""
+    let timedOut = false
+    let capped = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ...result, pattern, matches, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
+    }
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, IMPACT_VALIDATION_TIMEOUT_MS)
+
+    function consume(line) {
+      if (!line.trim() || capped) return
+      let event
+      try { event = JSON.parse(line) } catch { return }
+      if (event?.type !== "match") return
+      const matchFile = event.data?.path?.text
+      const lineNo = event.data?.line_number
+      if (typeof matchFile !== "string" || !Number.isInteger(lineNo)) return
+      if (matches.length >= IMPACT_VALIDATION_HIT_CAP) { capped = true; child.kill("SIGTERM"); return }
+      matches.push({ file: matchFile, line: lineNo, text: event.data?.lines?.text ?? "", exactMatches: Array.isArray(event.data?.submatches) ? event.data.submatches.length : 0 })
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8")
+      while (true) {
+        const pos = stdout.indexOf("\n")
+        if (pos < 0) break
+        consume(stdout.slice(0, pos))
+        stdout = stdout.slice(pos + 1)
+      }
+    })
+    child.stderr.on("data", (chunk) => { if (stderr.length < 2000) stderr += chunk.toString("utf8") })
+    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", scanComplete: false, error: String(error?.message ?? error) }))
+    child.on("close", (code) => {
+      if (!capped && stdout.trim()) consume(stdout)
+      if (timedOut) return finish({ ok: false, reason: "timeout", scanComplete: false, error: stderr.trim() || null })
+      if (capped) return finish({ ok: true, reason: "hit_cap", scanComplete: false, error: null })
+      if (code !== 0 && code !== 1) return finish({ ok: false, reason: "exit_error", scanComplete: false, error: stderr.trim() || `rg exited with status ${code}` })
+      finish({ ok: true, reason: "complete", scanComplete: true, error: null })
+    })
+  })
+}
+
+function impactDefinitionMatch(text, bindings) {
+  const line = String(text ?? "").trim()
+  if (!line) return false
+  for (const binding of bindings ?? []) {
+    const name = regexEscape(binding)
+    const patterns = [
+      new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:def|class|function|interface|type|enum)\\s+${name}\\b`),
+      new RegExp(`^(?:export\\s+)?(?:const|let|var)\\s+${name}\\b`),
+      new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?(?:fn|struct|enum|trait|type|const|static)\\s+${name}\\b`),
+    ]
+    if (patterns.some((pattern) => pattern.test(line))) return true
+  }
+  return false
+}
+
+function impactLineContainsBinding(text, bindings) {
+  const line = String(text ?? "")
+  return impactBindingList(bindings).some((binding) => new RegExp(`\\b${regexEscape(binding)}\\b`).test(line))
+}
+
+async function validateImpactHypotheses(root, target, glob, impactStats, probeFiles, probeResults) {
+  const scope = await impactExpansionScope(root, target)
+  if (scope.kind === "blocked") {
+    return { attempted: false, reason: scope.reason, hypotheses: [], validated: [], rejected: [], elapsedMs: 0, queryCount: 0, scopeRejected: 0, seedContexts: 0 }
+  }
+
+  const seedContexts = await buildImpactSeedContexts(root, probeResults)
+  const built = buildImpactHypotheses(impactStats, probeFiles, seedContexts, root, scope)
+  const hypotheses = built.hypotheses
+  if (hypotheses.length < 1) {
+    return {
+      attempted: false,
+      reason: impactStats?.ok ? "no_scope_relevant_hypotheses" : "impact_index_unavailable",
+      hypotheses: [], validated: [], rejected: [], elapsedMs: 0, queryCount: 0,
+      scopeRejected: built.rejectedByScope, seedContexts: seedContexts.size,
+    }
+  }
+
+  const started = performance.now()
+  const checks = await Promise.all(hypotheses.map(async (hypothesis) => {
+    const validationTerms = [...new Set([...hypothesis.forwardSymbols, ...hypothesis.reverseBindings])]
+    const validation = await runImpactValidationQuery(root, hypothesis.file, validationTerms, glob)
+    const matches = validation.matches ?? []
+    const declarationMatches = matches.filter((match) => impactDefinitionMatch(match.text, hypothesis.forwardSymbols))
+    const reverseWitnessLines = new Set(
+      hypothesis.relations
+        .filter((relation) => relation.direction === "reverse" && evidenceFileKey(relation.witness_file) === evidenceFileKey(hypothesis.file) && Number.isInteger(relation.witness_line))
+        .map((relation) => relation.witness_line),
+    )
+    const reverseUsageMatches = matches.filter(
+      (match) => !reverseWitnessLines.has(match.line) && impactLineContainsBinding(match.text, hypothesis.reverseBindings),
+    )
+    const forwardValidated = hypothesis.forwardSymbols.length > 0 && declarationMatches.length > 0
+    const reverseValidated = hypothesis.reverseBindings.length > 0 && reverseUsageMatches.length > 0
+    const validated = validation.ok && (forwardValidated || reverseValidated)
+
+    return {
+      ...hypothesis,
+      validation,
+      validated,
+      validationKind: forwardValidated ? "forward_scope_definition" : reverseValidated ? "reverse_scope_usage" : null,
+      declarationMatches,
+      reverseUsageMatches,
+    }
+  }))
+
+  const validated = checks.filter((entry) => entry.validated).sort(
+    (a, b) =>
+      Number(b.validationKind === "forward_scope_definition") - Number(a.validationKind === "forward_scope_definition") ||
+      b.queries.size - a.queries.size || a.file.localeCompare(b.file),
+  )
+  return {
+    attempted: true,
+    reason: validated.length > 0 ? "validated_scope_conditioned" : "all_rejected",
+    hypotheses,
+    validated,
+    rejected: checks.filter((entry) => !entry.validated),
+    elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+    queryCount: checks.length,
+    scopeRejected: built.rejectedByScope,
+    seedContexts: seedContexts.size,
+  }
+}
+
+function selectFairReservedFiles(rankedFiles, queryResults, limit) {
+  const selected = new Set()
+  const coveredQueries = new Set()
+  const activeQueries = (queryResults ?? [])
+    .map((result) => ({
+      queryIndex: result.queryIndex,
+      files: Array.isArray(result?.files)
+        ? [...new Set(result.files)]
+        : [...new Set((result?.matches ?? []).map((match) => match.file))],
+    }))
+    .filter((result) => result.files.length > 0)
+    .sort((a, b) => a.files.length - b.files.length || a.queryIndex - b.queryIndex)
+
+  for (const result of activeQueries) {
+    if (selected.size >= limit) break
+    if (coveredQueries.has(result.queryIndex)) continue
+    const fileKeys = new Set(result.files.map((file) => evidenceFileKey(file)))
+    const candidate = rankedFiles.find(
+      (entry) => fileKeys.has(evidenceFileKey(entry.file)) && !selected.has(entry.file),
+    )
+    if (!candidate) continue
+    selected.add(candidate.file)
+    for (const queryIndex of candidate.queries ?? []) coveredQueries.add(queryIndex)
+  }
+
+  return rankedFiles.filter((entry) => selected.has(entry.file))
+}
+
+function impactEmitEntry(entry) {
+  const primary = entry.relations?.[0] ?? {}
+  const sample = entry.validationKind === "forward_scope_definition"
+    ? entry.declarationMatches?.[0]
+    : entry.reverseUsageMatches?.[0]
+  return {
+    file: entry.file,
+    origin: "impact",
+    queries: new Set(entry.queries ?? []),
+    coverage: 0,
+    pathAffinity: 0,
+    rarity: 0,
+    impact: {
+      seed: primary.seed ?? null,
+      direction: entry.validationKind === "forward_scope_definition" ? "forward" : "reverse",
+      kind: primary.kind ?? null,
+      bindings: entry.displayBindings ?? [],
+      validationKind: entry.validationKind,
+      sample: sample ?? null,
+    },
+  }
+}
+
+function selectEmitFilesWithImpact(probedFiles, discoveryResults, validatedImpact) {
+  const selected = []
+  const selectedKeys = new Set()
+
+  const reserve = selectFairReservedFiles(probedFiles, discoveryResults, EMIT_MAX_FILES)
+  for (const entry of reserve) {
+    if (selected.length >= EMIT_MAX_FILES) break
+    selected.push({ ...entry, origin: "lexical" })
+    selectedKeys.add(evidenceFileKey(entry.file))
+  }
+
+  let impactEmitted = 0
+  for (const entry of validatedImpact ?? []) {
+    if (selected.length >= EMIT_MAX_FILES || impactEmitted >= IMPACT_GRAPH_EMIT_MAX_FILES) break
+    const key = evidenceFileKey(entry.file)
+    if (selectedKeys.has(key)) continue
+    selected.push(impactEmitEntry(entry))
+    selectedKeys.add(key)
+    impactEmitted += 1
+  }
+
+  for (const entry of probedFiles ?? []) {
+    if (selected.length >= EMIT_MAX_FILES) break
+    const key = evidenceFileKey(entry.file)
+    if (selectedKeys.has(key)) continue
+    selected.push({ ...entry, origin: "lexical" })
+    selectedKeys.add(key)
+  }
+
+  return selected
+}
+
+function impactEvidenceFactsForSelected(selectedFiles) {
+  const facts = new Set()
+  for (const entry of selectedFiles ?? []) {
+    if (entry?.origin !== "impact") continue
+    const sample = entry?.impact?.sample
+    if (typeof entry?.file === "string" && Number.isInteger(sample?.line)) {
+      facts.add(hitLineFact(entry.file, sample.line))
+    }
+  }
+  return facts
 }
 
 function integerList(values) {
@@ -3617,19 +4253,40 @@ export default {
             .sort((a, b) => a.queryIndex - b.queryIndex)
 
           const probeRankedFiles = rankProbedFiles(rankedFiles, probeResults)
-          const selectedFiles = selectEmitFiles(probeRankedFiles, discoveryResults)
           const impactIndexShadow = impactIndexShadowStats(
             await impactIndexShadowPromise,
             rankedFiles,
           )
+          const impactValidation = await validateImpactHypotheses(
+            root,
+            target,
+            glob,
+            impactIndexShadow,
+            probeFiles,
+            probeResults,
+          )
+          const selectedFiles = selectEmitFilesWithImpact(
+            probeRankedFiles,
+            discoveryResults,
+            impactValidation.validated,
+          )
           const selectedFileSet = new Set(
-            selectedFiles.map((entry) => entry.file),
+            selectedFiles.map((entry) => evidenceFileKey(entry.file)),
+          )
+          const selectedLexicalFiles = selectedFiles.filter(
+            (entry) => entry?.origin !== "impact",
+          )
+          const selectedLexicalFileSet = new Set(
+            selectedLexicalFiles.map((entry) => evidenceFileKey(entry.file)),
+          )
+          const selectedImpactFiles = selectedFiles.filter(
+            (entry) => entry?.origin === "impact",
           )
           const allDiscoveredFilesSelected =
-            rankedFiles.length === selectedFileSet.size
+            rankedFiles.length === selectedLexicalFileSet.size
           const routingActive =
-            !discoveryComplete || !allDiscoveredFilesSelected
-          const results = filterQueryResultsToFiles(probeResults, selectedFiles)
+            !discoveryComplete || !allDiscoveredFilesSelected || selectedImpactFiles.length > 0
+          const results = filterQueryResultsToFiles(probeResults, selectedLexicalFiles)
 
           const probeHits = mergeHits(probeResults)
           const hits = mergeHits(results)
@@ -4289,9 +4946,13 @@ export default {
             finalFacts.add(fact)
           }
 
+          for (const fact of impactEvidenceFactsForSelected(selectedFiles)) {
+            finalFacts.add(fact)
+          }
+
           const routeFacts = routeFactsForRanking(
             rankedFiles,
-            selectedFileSet,
+            selectedLexicalFileSet,
             discoveryComplete,
             target,
             glob,
@@ -4383,15 +5044,44 @@ export default {
             all_discovered_files_probed: allDiscoveredFilesProbed,
             all_discovered_files_emitted: allDiscoveredFilesSelected,
             routing_active: routingActive,
-            route_strategy: "query_fair_probe_then_evidence_emit",
+            route_strategy: "query_fair_lexical8_plus_scope_conditioned_impact",
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
             probe_elapsed_ms: refineElapsedMs,
-            impact_index_shadow_attempted: impactIndexShadow.attempted,
-            impact_index_shadow_ok: impactIndexShadow.ok,
-            impact_index_shadow_reason: impactIndexShadow.reason,
-            impact_index_shadow_elapsed_ms: impactIndexShadow.elapsedMs,
+            impact_index_attempted: impactIndexShadow.attempted,
+            impact_index_ok: impactIndexShadow.ok,
+            impact_index_reason: impactIndexShadow.reason,
+            impact_index_elapsed_ms: impactIndexShadow.elapsedMs,
+            impact_graph_probe_cap: IMPACT_GRAPH_PROBE_MAX_FILES,
+            impact_graph_emit_cap: IMPACT_GRAPH_EMIT_MAX_FILES,
+            impact_validation_attempted: impactValidation.attempted,
+            impact_validation_reason: impactValidation.reason,
+            impact_validation_elapsed_ms: impactValidation.elapsedMs,
+            impact_validation_queries: impactValidation.queryCount,
+            impact_hypotheses: impactValidation.hypotheses.length,
+            impact_validated: impactValidation.validated.length,
+            impact_rejected: impactValidation.rejected.length,
+            impact_scope_conditioned: true,
+            impact_scope_seed_contexts: impactValidation.seedContexts,
+            impact_scope_relations_rejected: impactValidation.scopeRejected,
+            impact_index_coverage_complete: impactIndexShadow.refreshComplete,
+            impact_index_partial_reason: impactIndexShadow.partialReason,
+            impact_index_inventory_kind: impactIndexShadow.inventoryKind,
+            impact_index_local_resolved: impactIndexShadow.resolvedImports,
+            impact_index_local_unresolved: impactIndexShadow.unresolvedImports,
+            impact_index_local_ambiguous: impactIndexShadow.ambiguousImports,
+            impact_index_external_packages: impactIndexShadow.externalPackages,
+            impact_index_unsupported_aliases: impactIndexShadow.unsupportedAliases,
+            impact_emitted_files: selectedImpactFiles.length,
+            impact_emitted: selectedImpactFiles.map((entry) => ({
+              file: entry.file,
+              seed: entry.impact?.seed ?? null,
+              direction: entry.impact?.direction ?? null,
+              bindings: entry.impact?.bindings ?? [],
+              validation_kind: entry.impact?.validationKind ?? null,
+              sample_line: entry.impact?.sample?.line ?? null,
+            })),
             impact_index_refresh_due: impactIndexShadow.refreshDue,
             impact_index_refresh_ok: impactIndexShadow.refreshOk,
             impact_index_refresh_reason: impactIndexShadow.refreshReason,
@@ -4411,32 +5101,43 @@ export default {
             impact_index_lexical_misses: impactIndexShadow.lexicalMisses,
             impact_index_forward_neighbors: impactIndexShadow.forwardNeighbors,
             impact_index_reverse_neighbors: impactIndexShadow.reverseNeighbors,
-            impact_index_shadow_candidates: impactIndexShadow.candidates,
-            impact_index_routing_unchanged: true,
+            impact_index_candidates: impactIndexShadow.candidates,
+            impact_index_routing_active: selectedImpactFiles.length > 0,
             probe_files: probeFiles.map((entry) => ({
               file: entry.file,
               queries: [...entry.queries].sort((a, b) => a - b),
               initial_rank:
                 rankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
             })),
-            probed_files: probeFileSet.size,
+            lexical_probed_files: probeFileSet.size,
+            impact_probed_files: impactValidation.queryCount,
+            probed_files: probeFileSet.size + impactValidation.queryCount,
+            lexical_emitted_files: selectedLexicalFileSet.size,
+            impact_emitted_files_count: selectedImpactFiles.length,
             emitted_files: selectedFileSet.size,
             selected_files: selectedFiles.map((entry) => ({
               file: entry.file,
-              queries: [...entry.queries].sort((a, b) => a - b),
+              origin: entry.origin ?? "lexical",
+              queries: [...(entry.queries ?? [])].sort((a, b) => a - b),
               coverage: entry.coverage,
               path_affinity: entry.pathAffinity,
               rarity: entry.rarity,
-              initial_rank: entry.initialRank ?? null,
-              probe_line_hits: entry.probeLineHits ?? 0,
-              probe_exact_matches: entry.probeExactMatches ?? 0,
-              probe_definition_hints: entry.probeDefinitionHints ?? 0,
+              initial_rank: entry.origin === "impact" ? null : entry.initialRank ?? null,
+              probe_line_hits: entry.origin === "impact" ? null : entry.probeLineHits ?? 0,
+              probe_exact_matches: entry.origin === "impact" ? null : entry.probeExactMatches ?? 0,
+              probe_definition_hints: entry.origin === "impact" ? null : entry.probeDefinitionHints ?? 0,
               probe_rank:
-                probeRankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
+                entry.origin === "impact"
+                  ? null
+                  : probeRankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
+              impact_seed: entry.impact?.seed ?? null,
+              impact_direction: entry.impact?.direction ?? null,
+              impact_bindings: entry.impact?.bindings ?? [],
+              impact_validation_kind: entry.impact?.validationKind ?? null,
             })),
             retained_unread_files: Math.max(0, rankedFiles.length - probeFileSet.size),
             retained_unemitted_files: routeRendered.retained,
-            probed_unemitted_files: Math.max(0, probeFileSet.size - selectedFileSet.size),
+            probed_unemitted_files: Math.max(0, probeFileSet.size - selectedLexicalFileSet.size),
             discovery_files_by_query: discoveryResults.map((result) => ({
               query_index: result.queryIndex,
               files: result.files?.length ?? 0,
@@ -4571,24 +5272,32 @@ export default {
               all_discovered_files_probed: allDiscoveredFilesProbed,
               all_discovered_files_emitted: allDiscoveredFilesSelected,
               routing_active: routingActive,
-              route_strategy: "query_fair_probe_then_evidence_emit",
+              route_strategy: "query_fair_lexical8_plus_scope_conditioned_impact",
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
               probe_elapsed_ms: refineElapsedMs,
-            impact_index_shadow_ok: impactIndexShadow.ok,
-            impact_index_shadow_reason: impactIndexShadow.reason,
+            impact_index_ok: impactIndexShadow.ok,
+            impact_index_reason: impactIndexShadow.reason,
             impact_index_lexical_misses: impactIndexShadow.lexicalMisses,
             impact_index_neighbors_shown: impactIndexShadow.neighborsShown,
             impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
-            impact_index_routing_unchanged: true,
-              probed_files: probeFileSet.size,
+            impact_validation_reason: impactValidation.reason,
+            impact_validated: impactValidation.validated.length,
+            impact_scope_relations_rejected: impactValidation.scopeRejected,
+            impact_index_coverage_complete: impactIndexShadow.refreshComplete,
+            impact_emitted_files: selectedImpactFiles.length,
+            impact_index_routing_active: selectedImpactFiles.length > 0,
+              lexical_probed_files: probeFileSet.size,
+              impact_probed_files: impactValidation.queryCount,
+              probed_files: probeFileSet.size + impactValidation.queryCount,
+              lexical_emitted_files: selectedLexicalFileSet.size,
               emitted_files: selectedFileSet.size,
               probe_files: probeFiles.map((entry) => entry.file),
               selected_files: selectedFiles.map((entry) => entry.file),
               retained_unread_files: Math.max(0, rankedFiles.length - probeFileSet.size),
               retained_unemitted_files: routeRendered.retained,
-              probed_unemitted_files: Math.max(0, probeFileSet.size - selectedFileSet.size),
+              probed_unemitted_files: Math.max(0, probeFileSet.size - selectedLexicalFileSet.size),
               reused_query_count: reusedQueryCount,
               executed_query_count: executedQueryCount,
               refinement_required: refinementRequired,

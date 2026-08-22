@@ -1,0 +1,17 @@
+{
+  "version": "v2.13-C1",
+  "protocol": "search-v2.13.3-evidence-conditioned-impact-fixes",
+  "verdict": "PASS",
+  "pass": 6,
+  "fail": 0,
+  "source_sha256": "000238fbab3ebf52b0e4e9639201bb88bc890802514c2bf2bb56a64947ccd34a",
+  "invariants": {
+    "python_first_class": true,
+    "js_ts_second_class": true,
+    "resource_edges_shadow_only": true,
+    "scope_conditioned_graph": true,
+    "partial_graph_not_complete": true,
+    "lexical_probe_8_preserved": true,
+    "emit_4_preserved": true
+  }
+}

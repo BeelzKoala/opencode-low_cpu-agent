@@ -1,0 +1,17 @@
+{
+  "version": "v2.13-C1",
+  "protocol": "search-v2.13.2-evidence-conditioned-impact",
+  "verdict": "FAIL",
+  "pass": 4,
+  "fail": 2,
+  "source_sha256": "c50545d61c32084013a6532992a1f5d33e4ce91d933f9e57970284b9487faff8",
+  "invariants": {
+    "python_first_class": true,
+    "js_ts_second_class": true,
+    "resource_edges_shadow_only": true,
+    "scope_conditioned_graph": true,
+    "partial_graph_not_complete": true,
+    "lexical_probe_8_preserved": true,
+    "emit_4_preserved": true
+  }
+}

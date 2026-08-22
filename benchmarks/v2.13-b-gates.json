@@ -1,0 +1,17 @@
+{
+  "version": "v2.13-B",
+  "protocol": "search-v2.13.1-impact-guarded",
+  "invariants": {
+    "lexical_probe_slots": 8,
+    "graph_probe_slots": 2,
+    "total_internal_probe_max": 10,
+    "model_emit_max": 4,
+    "graph_emit_max": 1,
+    "direct_query_fairness_precedes_graph": true,
+    "graph_requires_exact_local_edge": true,
+    "forward_requires_definition_validation": true,
+    "reverse_requires_usage_beyond_import_witness": true,
+    "explicit_file_scope_disables_graph_expansion": true,
+    "impact_index_fail_open": true
+  }
+}

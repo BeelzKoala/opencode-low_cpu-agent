@@ -1,0 +1,22 @@
+{
+  "version": "v2.13-B",
+  "protocol": "search-v2.13.1-impact-guarded",
+  "verdict": "PASS",
+  "source_sha256": "23c4c55df3034c319e7fc4a31423b3817a79ce1bec11fcab464a0b66f9de43ae",
+  "wins": {
+    "forward_nonlexical_recovered": true,
+    "reverse_import_only_rejected": true,
+    "lexical_probe_slots_preserved": true,
+    "graph_probe_slots_used": true,
+    "total_internal_probe_max_observed": 10,
+    "model_emit_cap_preserved": true,
+    "graph_emit_cap_observed": 1,
+    "four_query_fairness_precedes_graph": true,
+    "v2_12_rank5_recovery_preserved": true
+  },
+  "timing_ms": {
+    "forward_validation": 2.51,
+    "forward_search_total": 28.97,
+    "ten_probe_search_total": 17.39
+  }
+}

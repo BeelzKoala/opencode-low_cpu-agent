@@ -1,0 +1,21 @@
+{
+  "version": "v2.13-C1",
+  "protocol": "search-v2.13.2-evidence-conditioned-impact",
+  "language_priority": {
+    "tier_1": ["python"],
+    "tier_2": ["javascript", "typescript", "html", "css"],
+    "tier_3_index_only": ["xml", "docker", "sql", "rust", "c_cpp"]
+  },
+  "invariants": {
+    "lexical_probe_slots": 8,
+    "graph_probe_slots": 2,
+    "model_emit_max": 4,
+    "graph_emit_max": 1,
+    "forward_requires_scope_binding_and_target_definition": true,
+    "reverse_requires_scope_symbol_and_real_caller_usage": true,
+    "resource_edges_shadow_only": true,
+    "git_aware_inventory": true,
+    "partial_index_is_ready_but_not_complete": true,
+    "impact_fail_open": true
+  }
+}
