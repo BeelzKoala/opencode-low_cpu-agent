@@ -5,7 +5,7 @@ Experimental low-CPU local coding-agent runtime for OpenCode.
 ## Current architecture
 
 - OpenCode V2 global plugin
-- one model-facing `search` tool
+- two model-facing tools: bounded `search` + semantic `execute_patch`
 - turn-scoped search/model governor
 - dynamic per-session project root
 - ripgrep file-level lexical discovery (`--files-with-matches`)
@@ -19,6 +19,10 @@ Experimental low-CPU local coding-agent runtime for OpenCode.
 - task-local one-hop Impact Index with source validation and refresh-on-miss
 - atomic per-turn Scout handoff snapshots with source fingerprints
 - guarded Patch Executor with detached-worktree mutation, structural edits and rollback gates
+- bounded model-facing execution loop with `patch-receipt-v1` handoff to verification
+- deterministic `patch-compiler-v1` that lowers semantic mutations into frozen `edit-script-v2`
+- independent `invariant-verifier-v1` that replays lowered edits and proves AST/scope/cardinality invariants before `PATCH_READY`
+- `causal-execution-fsm-v1` exposes at most one next-step tool and carries an `edit-capsule-v1` plus typed proof obligations between stages
 - Rust structural evidence distiller
 - ast-grep/tree-sitter structural backend
 - llama.cpp local inference
@@ -53,8 +57,12 @@ Roadmap:
 - v2.13-C2.2 task-local Impact Index — DONE
 - v2.13-C3 Scout handoff/freeze — DONE
 - v2.14-A shadow Patch Executor — DONE
-- v2.14-B guarded transactional mutation — CURRENT
-- v2.15 deterministic review/verification — AFTER EXECUTOR
+- v2.14-B guarded transactional mutation — DONE
+- v2.14-C real-task execution loop — DONE / exposed EditScript ergonomics miss
+- v2.14-C3 semantic Mutation Compiler — DONE
+- v2.15-A deterministic invariant verification — DONE / verifier core proven on adversarial gates
+- v2.15-B causal execution FSM + edit capsules + typed proof obligations — CURRENT
+- v2.15-C targeted project verification/review policy — NEXT
 
 The Scout discovery plane is frozen after v2.13-C3. New discovery heuristics require a
 reproducible benchmark failure that cannot be solved in the execution or verification
@@ -77,6 +85,8 @@ rust/
     src/main.rs
     src/impact_index.rs
     src/patch_executor.rs
+    src/patch_compiler.rs
+    src/invariant_verifier.rs
 
 llama/
   run-north.example.sh

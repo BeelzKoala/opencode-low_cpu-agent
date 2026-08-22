@@ -1,0 +1,55 @@
+{
+  "version": "v2.14-C-R2",
+  "execution_protocol": "execution-loop-v1",
+  "search_protocol": "search-v2.13.6-scout-handoff",
+  "executor_protocol": "patch-executor-v2",
+  "edit_protocol": "edit-script-v2",
+  "receipt_protocol": "patch-receipt-v1",
+  "verdict": "FAIL",
+  "pass": 3,
+  "fail": 3,
+  "total_wall_s": 571.31,
+  "plugin_sha256": "a897cbe993bdfed7f9943c02ffed67412c223b728f8f661afe449b1c5bd0ba30",
+  "executor_sha256": "3bdab9936c84c873d136d8befd335316c4059032891cdc76aa73d56495ec5141",
+  "wins": {
+    "real_patch_tasks_passed": 2,
+    "real_patch_tasks_total": 4,
+    "max_model_calls_success": 4,
+    "avg_model_calls_success": 4.0,
+    "bounded_retry_recovered": true,
+    "localization_miss_rescout": true,
+    "duplicate_plan_suppressed": false,
+    "main_checkout_unchanged": true,
+    "patch_receipt_verified": false,
+    "two_tool_context": null
+  },
+  "failed_fixtures": [
+    "/tmp/v214c-r1-one-file-ys9ekz0d",
+    "/tmp/v214c-r1-two-file-ykyb5otk",
+    "/tmp/v214c-r1-duplicate-rfi8s4es"
+  ],
+  "cases": {
+    "structural_ast_change": {
+      "task_success": true,
+      "model_calls": 4,
+      "patch_attempts": 1,
+      "structural_edits": 1,
+      "changed_lines": 2
+    },
+    "bounded_retry_recovers": {
+      "task_success": true,
+      "model_calls": 4,
+      "patch_attempts": 2,
+      "first_failure": "precondition_not_unique",
+      "recovered": true
+    },
+    "localization_miss_returns_rescout": {
+      "controlled_stop": true,
+      "model_calls": 3,
+      "patch_attempts": 1,
+      "reason": "file_outside_handoff",
+      "action": "rescout",
+      "repo_unchanged": true
+    }
+  }
+}

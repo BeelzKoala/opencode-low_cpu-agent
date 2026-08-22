@@ -1,0 +1,78 @@
+{
+  "version": "v2.14-C3",
+  "execution_protocol": "execution-loop-v1",
+  "compiler_protocol": "patch-compiler-v1",
+  "mutation_protocol": "mutation-plan-v1",
+  "search_protocol": "search-v2.13.6-scout-handoff",
+  "executor_protocol": "patch-executor-v2",
+  "edit_protocol": "edit-script-v2",
+  "receipt_protocol": "patch-receipt-v1",
+  "verdict": "PASS",
+  "pass": 6,
+  "fail": 0,
+  "total_wall_s": 239.196,
+  "plugin_sha256": "8ac432bcdc6f07e0cec0f46f60c065ab8045fe676c9be561b2cd5d5910fe2fa2",
+  "executor_sha256": "3bdab9936c84c873d136d8befd335316c4059032891cdc76aa73d56495ec5141",
+  "compiler_sha256": "4cd1ef971b1fa400c85a52aa9966a5ccaa5b9bd4853f4a9843d04e3d2d74fde3",
+  "wins": {
+    "real_semantic_tasks_passed": 3,
+    "real_semantic_tasks_total": 3,
+    "max_model_calls_success": 3,
+    "avg_model_calls_success": 3.0,
+    "all_real_tasks_single_patch_attempt": true,
+    "one_semantic_rename_lowered_to_three_edits": true,
+    "noop_normalized_without_model_retry": true,
+    "duplicate_mutation_dropped": true,
+    "ambiguous_symbol_fail_closed": true,
+    "main_checkout_unchanged": true,
+    "patch_receipt_verified": true,
+    "two_tool_context": true
+  },
+  "failed_fixtures": [],
+  "cases": {
+    "one_file_business_change": {
+      "task_success": true,
+      "model_calls": 3,
+      "patch_attempts": 1,
+      "semantic_mutations": 1,
+      "lowered_edits": 1,
+      "changed_lines": 2
+    },
+    "structural_expr_change": {
+      "task_success": true,
+      "model_calls": 3,
+      "patch_attempts": 1,
+      "semantic_mutations": 1,
+      "lowered_edits": 1,
+      "changed_lines": 2
+    },
+    "coordinated_rename": {
+      "task_success": true,
+      "model_calls": 3,
+      "patch_attempts": 1,
+      "semantic_mutations": 1,
+      "lowered_edits": 3,
+      "changed_files": [
+        "api.py",
+        "service.py"
+      ],
+      "changed_lines": 6
+    },
+    "compiler_drops_noop": {
+      "normalized": true,
+      "dropped_noops": 1,
+      "lowered_edits": 1,
+      "checks_generated": 1
+    },
+    "compiler_deduplicates": {
+      "deduplicated": true,
+      "dropped_duplicates": 1,
+      "lowered_edits": 1
+    },
+    "compiler_blocks_ambiguous_symbol": {
+      "blocked": true,
+      "reason": "symbol_ambiguous",
+      "lowered_edits": 0
+    }
+  }
+}

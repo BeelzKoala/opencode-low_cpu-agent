@@ -1,0 +1,19 @@
+{
+  "version": "v2.15-B",
+  "execution_fsm_protocol": "causal-execution-fsm-v1",
+  "edit_capsule_protocol": "edit-capsule-v1",
+  "proof_obligation_protocol": "proof-obligation-v1",
+  "goal": "minimize model action entropy while making mutation and verification transitions evidence-driven",
+  "gates": [
+    "model-visible frontier contains at most one actionable tool per execution state",
+    "LOCATE exposes only search; MUTATE/REPAIR expose only execute_patch; DONE/SAFE_FAIL expose no tools",
+    "ready Scout handoff may transition to MUTATE only after edit-capsule-v1 contextualizes every handoff file with strong fingerprints",
+    "edit capsule is persisted with source scope/evidence context and SHA-256 and is linked from the patch receipt",
+    "proof-obligation-v1 maps verifier checks to repair, rescout or fatal dispositions instead of treating every verifier failure as terminal",
+    "fatal proof failures include changed-file escape, replay mismatch, parse failure and verification worktree cleanup failure",
+    "rename syntactic closure failure returns to LOCATE; repairable conservation/cardinality failures permit at most one bounded repair",
+    "patch-executor-v2, patch-compiler-v1 and invariant-verifier-v1 sources remain byte-identical",
+    "three real repositories must complete search -> execute_patch -> final in exactly three model calls with one search and one patch attempt",
+    "private_repo, django and typescript main checkouts remain unchanged"
+  ]
+}

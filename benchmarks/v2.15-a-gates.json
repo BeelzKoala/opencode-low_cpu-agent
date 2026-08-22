@@ -1,0 +1,20 @@
+{
+  "version": "v2.15-A",
+  "protocol": "invariant-verifier-v1",
+  "verification_protocol": "verification-receipt-v1",
+  "goal": "prove patches against independent deterministic invariants before PATCH_READY",
+  "gates": [
+    "model-facing action surface remains exactly search + execute_patch",
+    "patch-executor-v2 and patch-compiler-v1 sources remain byte-identical to v2.14-C3",
+    "actual patched bytes must equal deterministic replay of compiler-lowered edits",
+    "actual changed-file set must equal compiler-declared changed files and stay inside Scout handoff",
+    "all changed supported-language files parse before and after",
+    "untouched top-level AST siblings are byte-identical and top-level node kinds/count are conserved",
+    "semantic target definition cardinality is preserved for replace operations and transitions exactly for rename",
+    "rename identifier delta is balanced and tracked-source identifier closure (git-grep prefilter + ast-grep validation) is empty after patch",
+    "rename is rejected if git-tracked old-symbol occurrences exist outside compiler-declared changed files",
+    "verification runs in a disposable detached worktree and always cleans it",
+    "PATCH_READY is impossible without verification-receipt-v1",
+    "real end-to-end rename probes run against private_repo, django and typescript without mutating their main checkouts"
+  ]
+}

@@ -80,8 +80,45 @@ const SCOUT_HANDOFF_PROTOCOL = "scout-handoff-v1"
 const SCOUT_HANDOFF_HASH_MAX_BYTES = 8 * 1024 * 1024
 const SCOUT_HANDOFF_MAX_LINES_PER_FILE = 32
 
+// v2.14-C action-plane integration. Search semantics remain frozen; this layer
+// only exposes the already-guarded Rust executor to the model with a bounded
+// retry contract and a machine-readable receipt for the future verifier.
+const PATCH_COMPILER_PROTOCOL = "patch-compiler-v1"
+const PATCH_MUTATION_PROTOCOL = "mutation-plan-v1"
+const PATCH_TOOL_PROTOCOL = "semantic-mutation-tool-v1"
+const PATCH_PERMISSION_ACTION = "execute_patch"
+const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v2"
+const PATCH_EDIT_PROTOCOL = "edit-script-v2"
+const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
+const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
+const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v1"
+const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
+const PATCH_COMPILER_TIMEOUT_MS = 2500
+const PATCH_COMPILER_MAX_STDOUT_BYTES = 256 * 1024
+const PATCH_EXECUTOR_TIMEOUT_MS = 5000
+const PATCH_EXECUTOR_MAX_STDOUT_BYTES = 256 * 1024
+const INVARIANT_VERIFIER_TIMEOUT_MS = 5000
+const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
+const MAX_PATCH_ATTEMPTS_PER_TURN = 2
+
+// v2.15-B: explicit causal controller. The model never chooses between tools
+// when deterministic preconditions already identify the only valid next action.
+const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
+const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.4-permission-scoped"
+const EDIT_CAPSULE_PROTOCOL = "edit-capsule-v1"
+const PROOF_OBLIGATION_PROTOCOL = "proof-obligation-v1"
+const EXEC_STATE_LOCATE = "locate"
+const EXEC_STATE_MUTATE = "mutate"
+const EXEC_STATE_REPAIR = "repair"
+const EXEC_STATE_DONE = "done"
+const EXEC_STATE_SAFE_FAIL = "safe_fail"
+const EDIT_CAPSULE_MAX_BYTES = 4600
+const EDIT_CAPSULE_MAX_SCOPES = 4
+const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
+const EDIT_CAPSULE_WINDOW_RADIUS = 6
+
 const SEARCH_PROTOCOL = "search-v2.13.6-scout-handoff"
-const AGENT_PROTOCOL = "cpu-agent-v2.3.3-global"
+const AGENT_PROTOCOL = "cpu-agent-v2.6.4-permission-scoped-frontier"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -446,6 +483,18 @@ function getSessionState(sessionID) {
       scoutSearches: [],
       scoutFiles: new Map(),
       scoutHandoffPath: null,
+      patchAttempts: 0,
+      executedPatches: 0,
+      patchSignatures: new Set(),
+      patchAccepted: false,
+      patchReceiptPath: null,
+      executionState: EXEC_STATE_LOCATE,
+      executionReason: "session_start",
+      executionEvent: "session_start",
+      editCapsulePath: null,
+      editCapsuleHash: null,
+      proofObligations: [],
+      pendingRescout: null,
       lastSeen: now,
     }
 
@@ -475,7 +524,60 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.scoutSearches = []
   state.scoutFiles = new Map()
   state.scoutHandoffPath = null
+  state.patchAttempts = 0
+  state.executedPatches = 0
+  state.patchSignatures.clear()
+  state.patchAccepted = false
+  state.patchReceiptPath = null
+  state.executionState = EXEC_STATE_LOCATE
+  state.executionReason = "turn_start"
+  state.executionEvent = "turn_start"
+  state.editCapsulePath = null
+  state.editCapsuleHash = null
+  state.proofObligations = []
+  state.pendingRescout = null
   state.lastSeen = nowMs()
+}
+
+function transitionExecutionState(current, event) {
+  if (event === "turn_start") return EXEC_STATE_LOCATE
+  if (event === "scout_ready") return EXEC_STATE_MUTATE
+  if (event === "scout_needs_evidence") return EXEC_STATE_LOCATE
+  if (event === "patch_retry") return EXEC_STATE_REPAIR
+  if (event === "patch_rescout") return EXEC_STATE_LOCATE
+  if (event === "patch_ready") return EXEC_STATE_DONE
+  if (event === "verification_repair") return EXEC_STATE_REPAIR
+  if (event === "verification_rescout") return EXEC_STATE_LOCATE
+  if (event === "fatal") return EXEC_STATE_SAFE_FAIL
+  return current
+}
+
+function allowedToolsForExecutionState(executionState) {
+  if (executionState === EXEC_STATE_LOCATE) return ["search"]
+  if (executionState === EXEC_STATE_MUTATE || executionState === EXEC_STATE_REPAIR) return ["execute_patch"]
+  return []
+}
+
+function applyExecutionEvent(state, event, reason, details = null) {
+  if (!state) return null
+  const next = transitionExecutionState(state.executionState, event)
+  state.executionState = next
+  state.executionReason = reason ?? event
+  state.executionEvent = event
+  if (event !== "patch_rescout" && event !== "verification_rescout") state.pendingRescout = null
+  else state.pendingRescout = details ?? { reason: reason ?? event }
+  state.lastSeen = nowMs()
+  return next
+}
+
+function toolAllowedForExecutionState(state, toolName) {
+  if (!state) return false
+  return allowedToolsForExecutionState(state.executionState).includes(toolName)
+}
+
+function nextActionForExecutionState(state) {
+  const tools = allowedToolsForExecutionState(state?.executionState)
+  return tools[0] ?? "report_result"
 }
 
 function normalizeSessionID(event) {
@@ -1910,6 +2012,344 @@ function runDistiller(root, hits) {
       })
     }
   })
+}
+
+
+function patchCompilerBinary() {
+  const override = process.env.OPENCODE_PATCH_COMPILER
+  if (typeof override === "string" && override.length > 0) return override
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-patch-compiler")
+}
+
+function patchExecutorBinary() {
+  const override = process.env.OPENCODE_PATCH_EXECUTOR
+  if (typeof override === "string" && override.length > 0) return override
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-patch-executor")
+}
+
+function invariantVerifierBinary() {
+  const override = process.env.OPENCODE_INVARIANT_VERIFIER
+  if (typeof override === "string" && override.length > 0) return override
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-invariant-verifier")
+}
+
+function patchPlanSignature(compiled) {
+  return createHash("sha256")
+    .update(JSON.stringify({ edits: compiled?.edits ?? [], checks: compiled?.checks ?? [] }))
+    .digest("hex")
+    .slice(0, 24)
+}
+
+const PATCH_COMPILER_RETRY_REASONS = new Set([
+  "mutation_contract_invalid",
+  "mutation_kind_invalid",
+  "mutation_file_invalid",
+  "symbol_not_found",
+  "symbol_ambiguous",
+  "expression_pattern_invalid",
+  "expression_not_found",
+  "expression_ambiguous",
+  "rename_context_ambiguous",
+  "rename_scope_too_large",
+  "lowered_edit_budget_exceeded",
+  "no_effect_plan",
+])
+
+const PATCH_COMPILER_RESCOUT_REASONS = new Set([
+  "handoff_not_ready",
+  "handoff_scope_empty",
+  "handoff_file_invalid",
+  "handoff_file_unavailable",
+  "file_outside_handoff",
+  "evidence_anchor_missing",
+  "rename_scope_incomplete",
+])
+
+const PATCH_RETRY_REASONS = new Set([
+  "edit_contract_invalid",
+  "check_contract_invalid",
+  "precondition_not_unique",
+  "ast_pattern_invalid",
+  "ast_metavariables_unsupported",
+  "ast_precondition_ambiguous",
+  "ast_precondition_not_found",
+  "no_effect",
+  "candidate_syntax_invalid",
+  "postcondition_failed",
+  "changed_file_budget_exceeded",
+  "changed_line_budget_exceeded",
+  "patch_budget_exceeded",
+])
+
+const PATCH_RESCOUT_REASONS = new Set([
+  "handoff_not_ready",
+  "handoff_scope_too_large",
+  "handoff_scope_empty",
+  "handoff_file_invalid",
+  "handoff_fingerprint_weak",
+  "handoff_fingerprint_missing",
+  "handoff_file_unavailable",
+  "stale_fingerprint",
+  "file_outside_handoff",
+  "check_file_outside_handoff",
+  "evidence_anchor_missing",
+  "edit_outside_evidence_radius",
+  "worktree_baseline_missing",
+  "worktree_baseline_mismatch",
+  "source_changed_during_execution",
+])
+
+function proofObligationsForMutations(mutations) {
+  const obligations = [
+    { id: "changed_file_set", check_kind: "changed_file_set", disposition: "fatal" },
+    { id: "replay_exact", check_kind: "replay_exact", disposition: "fatal" },
+    { id: "ast_parse", check_kind: "ast_parse", disposition: "fatal" },
+    { id: "top_level_conservation", check_kind: "top_level_conservation", disposition: "repair" },
+    { id: "target_cardinality", check_kind: "target_cardinality", disposition: "repair" },
+  ]
+  if ((mutations ?? []).some((mutation) => mutation?.kind === "rename_symbol")) {
+    obligations.push(
+      { id: "rename_identifier_delta", check_kind: "rename_identifier_delta", disposition: "repair" },
+      { id: "rename_syntactic_closure", check_kind: "rename_global_closure", disposition: "rescout" },
+    )
+  }
+  return obligations.map((obligation) => ({ protocol: PROOF_OBLIGATION_PROTOCOL, ...obligation }))
+}
+
+function assessProofObligations(verificationResponse, obligations) {
+  const checks = Array.isArray(verificationResponse?.checks) ? verificationResponse.checks : []
+  const byKind = new Map()
+  for (const check of checks) {
+    if (!check || typeof check.kind !== "string") continue
+    if (!byKind.has(check.kind)) byKind.set(check.kind, [])
+    byKind.get(check.kind).push(check)
+  }
+
+  const failed = []
+  for (const obligation of obligations ?? []) {
+    const rows = byKind.get(obligation.check_kind) ?? []
+    const pass = rows.length > 0 && rows.every((row) => row?.pass === true)
+    if (!pass) failed.push({
+      id: obligation.id,
+      check_kind: obligation.check_kind,
+      disposition: obligation.disposition,
+      details: rows.filter((row) => row?.pass !== true).map((row) => ({ file: row?.file ?? null, detail: row?.detail ?? null })),
+    })
+  }
+  if (verificationResponse?.worktree_cleaned !== true) {
+    failed.push({ id: "worktree_cleanup", check_kind: "worktree_cleaned", disposition: "fatal", details: [] })
+  }
+
+  let disposition = "pass"
+  if (failed.some((item) => item.disposition === "fatal")) disposition = "fatal"
+  else if (failed.some((item) => item.disposition === "rescout")) disposition = "rescout"
+  else if (failed.length > 0) disposition = "repair"
+
+  return {
+    protocol: PROOF_OBLIGATION_PROTOCOL,
+    ok: failed.length === 0,
+    disposition,
+    obligations: obligations ?? [],
+    failed,
+  }
+}
+
+function compactProofFailure(assessment) {
+  return (assessment?.failed ?? []).map((item) => item.id).join(",") || "unknown"
+}
+
+function runJsonBinary(binary, root, request, protocol, timeoutMs, stdoutLimit) {
+  return new Promise((resolve) => {
+    if (!binary) {
+      resolve({ ok: false, reason: "binary_path_unavailable", elapsedMs: 0 })
+      return
+    }
+    const started = performance.now()
+    const child = spawn(binary, [], { cwd: root, stdio: ["pipe", "pipe", "pipe"] })
+    const stdout = []
+    const stderr = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
+    }
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, timeoutMs)
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+      if (stdoutBytes > stdoutLimit) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+      stdout.push(Buffer.from(chunk))
+    })
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= 4096) return
+      const remaining = 4096 - stderrBytes
+      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
+      stderr.push(Buffer.from(kept))
+      stderrBytes += kept.length
+    })
+    child.stdin.on("error", () => {})
+    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", error: String(error?.message ?? error) }))
+    child.on("close", (code, signal) => {
+      if (settled) return
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
+      if (timedOut) return finish({ ok: false, reason: "timeout", error: stderrText || null })
+      if (outputLimited) return finish({ ok: false, reason: "stdout_limit", error: stderrText || null })
+      if (code !== 0) return finish({ ok: false, reason: "exit_error", exitCode: code, signal: signal ?? null, error: stderrText || null })
+      let response
+      try {
+        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
+      } catch (error) {
+        return finish({ ok: false, reason: "invalid_json", error: String(error?.message ?? error) })
+      }
+      if (response?.protocol !== protocol) {
+        return finish({ ok: false, reason: "protocol_mismatch", response })
+      }
+      finish({ ok: true, reason: "ok", response })
+    })
+    try {
+      child.stdin.end(JSON.stringify(request))
+    } catch (error) {
+      child.kill("SIGKILL")
+      finish({ ok: false, reason: "stdin_error", error: String(error?.message ?? error) })
+    }
+  })
+}
+
+function runPatchCompiler(root, request) {
+  return runJsonBinary(
+    patchCompilerBinary(),
+    root,
+    request,
+    PATCH_COMPILER_PROTOCOL,
+    PATCH_COMPILER_TIMEOUT_MS,
+    PATCH_COMPILER_MAX_STDOUT_BYTES,
+  )
+}
+
+function runPatchExecutor(root, request) {
+  return runJsonBinary(
+    patchExecutorBinary(),
+    root,
+    request,
+    PATCH_EXECUTOR_PROTOCOL,
+    PATCH_EXECUTOR_TIMEOUT_MS,
+    PATCH_EXECUTOR_MAX_STDOUT_BYTES,
+  )
+}
+
+function runInvariantVerifier(root, request) {
+  return runJsonBinary(
+    invariantVerifierBinary(),
+    root,
+    request,
+    INVARIANT_VERIFIER_PROTOCOL,
+    INVARIANT_VERIFIER_TIMEOUT_MS,
+    INVARIANT_VERIFIER_MAX_STDOUT_BYTES,
+  )
+}
+
+async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment) {
+  const patch = typeof executorResponse?.patch === "string" ? executorResponse.patch : null
+  if (!patch || !sessionID || !state?.turnID) return null
+
+  const dir = path.join(root, ".opencode", "patches")
+  const key = scoutOpaqueKey(`${sessionID}:${state.turnID}`)
+  const patchPath = path.join(dir, `${key}.diff`)
+  const receiptPath = path.join(dir, `${key}.json`)
+  const verificationPath = path.join(dir, `${key}.verify.json`)
+  const nonce = `${process.pid}.${nowMs()}`
+  const patchTemp = `${patchPath}.${nonce}.tmp`
+  const receiptTemp = `${receiptPath}.${nonce}.tmp`
+  const verificationTemp = `${verificationPath}.${nonce}.tmp`
+  const receipt = {
+    protocol: PATCH_RECEIPT_PROTOCOL,
+    verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
+    verification_receipt: path.relative(root, verificationPath),
+    execution_protocol: EXECUTION_LOOP_PROTOCOL,
+    compiler_protocol: PATCH_COMPILER_PROTOCOL,
+    mutation_protocol: PATCH_MUTATION_PROTOCOL,
+    executor_protocol: PATCH_EXECUTOR_PROTOCOL,
+    edit_protocol: PATCH_EDIT_PROTOCOL,
+    search_protocol: SEARCH_PROTOCOL,
+    turn_key: scoutOpaqueKey(state.turnID),
+    generated_at_ms: nowMs(),
+    scout_handoff: state.scoutHandoffPath,
+    edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
+    edit_capsule: state.editCapsulePath,
+    edit_capsule_sha256: state.editCapsuleHash,
+    execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+    proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+    proof_obligations: proofAssessment?.obligations ?? [],
+    proof_disposition: proofAssessment?.disposition ?? null,
+    patch_path: path.relative(root, patchPath),
+    patch_sha256: createHash("sha256").update(patch).digest("hex"),
+    attempts_used: state.patchAttempts,
+    mutations_requested: compilerResponse?.mutations_requested ?? null,
+    mutations_effective: compilerResponse?.mutations_effective ?? null,
+    compiler_dropped_noops: compilerResponse?.dropped_noops ?? null,
+    compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? null,
+    compiler_lowered_edits: compilerResponse?.lowered_edits ?? null,
+    compiler_checks_generated: compilerResponse?.checks_generated ?? null,
+    changed_files: executorResponse.changed_files ?? [],
+    changed_lines: executorResponse.changed_lines ?? 0,
+    patch_bytes: executorResponse.patch_bytes ?? bytes(patch),
+    changes: executorResponse.changes ?? [],
+    syntax_checked_files: executorResponse.syntax_checked_files ?? [],
+    postconditions_checked: executorResponse.postconditions_checked ?? 0,
+    structural_edits: executorResponse.structural_edits ?? 0,
+    git_diff_check: executorResponse.git_diff_check === true,
+    git_apply_check: executorResponse.git_apply_check === true,
+    repo_mutated: executorResponse.repo_mutated === true,
+    invariant_verifier_protocol: verificationResponse?.protocol ?? null,
+    invariants_total: verificationResponse?.invariants_total ?? null,
+    invariants_passed: verificationResponse?.invariants_passed ?? null,
+    invariants_failed: verificationResponse?.invariants_failed ?? null,
+  }
+
+  try {
+    await mkdir(dir, { recursive: true })
+    const verificationReceipt = {
+      protocol: VERIFICATION_RECEIPT_PROTOCOL,
+      generated_at_ms: nowMs(),
+      patch_receipt: path.relative(root, receiptPath),
+      patch_sha256: receipt.patch_sha256,
+      edit_capsule: state.editCapsulePath,
+      edit_capsule_sha256: state.editCapsuleHash,
+      proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+      proof_assessment: proofAssessment,
+      verifier: verificationResponse,
+    }
+    await writeFile(patchTemp, patch, "utf8")
+    await writeFile(receiptTemp, JSON.stringify(receipt, null, 2) + "\n", "utf8")
+    await writeFile(verificationTemp, JSON.stringify(verificationReceipt, null, 2) + "\n", "utf8")
+    await rename(patchTemp, patchPath)
+    await rename(receiptTemp, receiptPath)
+    await rename(verificationTemp, verificationPath)
+    return { path: path.relative(root, receiptPath), verificationPath: path.relative(root, verificationPath), receipt, verificationReceipt }
+  } catch {
+    await rm(patchTemp, { force: true }).catch(() => {})
+    await rm(receiptTemp, { force: true }).catch(() => {})
+    await rm(verificationTemp, { force: true }).catch(() => {})
+    await rm(patchPath, { force: true }).catch(() => {})
+    await rm(receiptPath, { force: true }).catch(() => {})
+    await rm(verificationPath, { force: true }).catch(() => {})
+    return null
+  }
 }
 
 
@@ -3521,6 +3961,179 @@ function focusedScopesFromGroups(groups) {
     )
 }
 
+async function buildEditCapsule(root, sessionID, state, groups, scoutHandoff) {
+  if (!state || !sessionID || scoutHandoff?.status !== "ready") return null
+
+  const files = [...state.scoutFiles.values()]
+    .map(serializeScoutFile)
+    .sort((a, b) => a.file.localeCompare(b.file))
+  const rankedStructuralScopes = focusedScopesFromGroups(groups)
+  const scopes = []
+  const chosenScopeKeys = new Set()
+
+  function fallbackScope(file) {
+    const evidence = (file.evidence_lines ?? []).filter((line) => Number.isInteger(line) && line > 0)
+    const anchor = evidence[0] ?? 1
+    return {
+      file: file.file,
+      start: Math.max(1, anchor - EDIT_CAPSULE_WINDOW_RADIUS),
+      end: Math.max(anchor, anchor + EDIT_CAPSULE_WINDOW_RADIUS),
+      symbolKind: "evidence_window",
+      symbolName: "<evidence>",
+      hitLines: new Set(evidence),
+      anchors: new Set(),
+      roles: new Set(["evidence"]),
+      queries: new Set(),
+      hitCount: evidence.length,
+      roleScore: 1,
+    }
+  }
+
+  // Fairness is semantic here: every handoff file gets at least one capsule
+  // scope before a second scope from any file can consume the bounded budget.
+  for (const file of files.slice(0, EDIT_CAPSULE_MAX_SCOPES)) {
+    const structural = rankedStructuralScopes.find((scope) => scope.file === file.file)
+    const scope = structural ?? fallbackScope(file)
+    scopes.push(scope)
+    chosenScopeKeys.add(`${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`)
+  }
+  for (const scope of rankedStructuralScopes) {
+    if (scopes.length >= EDIT_CAPSULE_MAX_SCOPES) break
+    const key = `${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`
+    if (chosenScopeKeys.has(key)) continue
+    scopes.push(scope)
+    chosenScopeKeys.add(key)
+  }
+
+  const cache = new Map()
+  const rendered = []
+  const capsuleScopes = []
+  let usedBytes = 0
+  let fullScopes = 0
+  let windowScopes = 0
+  let truncated = false
+
+  function push(line) {
+    const cost = bytes(line + "\n")
+    if (usedBytes + cost > EDIT_CAPSULE_MAX_BYTES) {
+      truncated = true
+      return false
+    }
+    rendered.push(line)
+    usedBytes += cost
+    return true
+  }
+
+  for (const scope of scopes) {
+    const lines = await loadLines(root, scope.file, cache)
+    if (!lines || lines.length < 1) continue
+    const start = Math.max(1, Math.min(scope.start, lines.length))
+    const end = Math.max(start, Math.min(scope.end, lines.length))
+    const full = files.length === 1 && end - start + 1 <= EDIT_CAPSULE_FULL_SCOPE_MAX_LINES
+    const selected = []
+
+    if (full) {
+      for (let line = start; line <= end; line++) selected.push(line)
+      fullScopes += 1
+    } else {
+      const wanted = new Set()
+      for (let line = start; line <= Math.min(end, start + 2); line++) wanted.add(line)
+      for (const hitLine of scope.hitLines ?? []) {
+        if (!Number.isInteger(hitLine)) continue
+        const lo = Math.max(start, hitLine - EDIT_CAPSULE_WINDOW_RADIUS)
+        const hi = Math.min(end, hitLine + EDIT_CAPSULE_WINDOW_RADIUS)
+        for (let line = lo; line <= hi; line++) wanted.add(line)
+      }
+      selected.push(...[...wanted].sort((a, b) => a - b))
+      windowScopes += 1
+    }
+
+    if (selected.length < 1) continue
+    const scopeHeader =
+      `CAPSULE_SCOPE ${scope.file}:${start}-${end} symbol=${JSON.stringify(scope.symbolName)} ` +
+      `kind=${scope.symbolKind} context=${full ? "full" : "evidence_window"}`
+    if (!push(scopeHeader)) break
+
+    const source = []
+    let previous = null
+    for (const lineNo of selected) {
+      if (previous !== null && lineNo > previous + 1) {
+        if (!push("  … omitted …")) break
+        source.push("… omitted …")
+      }
+      const text = clipLine(lines[lineNo - 1])
+      const row = `  ${String(lineNo).padStart(5)} | ${text}`
+      if (!push(row)) break
+      source.push(`${lineNo} | ${text}`)
+      previous = lineNo
+    }
+
+    capsuleScopes.push({
+      file: scope.file,
+      symbol_kind: scope.symbolKind,
+      symbol_name: scope.symbolName,
+      start_line: start,
+      end_line: end,
+      evidence_lines: [...(scope.hitLines ?? [])].filter(Number.isInteger).sort((a, b) => a - b),
+      context: full ? "full" : "evidence_window",
+      source: source.join("\n"),
+    })
+    if (truncated) break
+  }
+
+  const strongFingerprints = files.length > 0 && files.every((file) => file.fingerprint?.strong === true)
+  const contextFiles = new Set(capsuleScopes.map((scope) => scope.file))
+  const allHandoffFilesContextualized = files.length > 0 && files.every((file) => contextFiles.has(file.file))
+  const mutationReady = strongFingerprints && allHandoffFilesContextualized
+  const capsule = {
+    protocol: EDIT_CAPSULE_PROTOCOL,
+    search_protocol: SEARCH_PROTOCOL,
+    scout_handoff_protocol: SCOUT_HANDOFF_PROTOCOL,
+    scout_handoff: scoutHandoff.path,
+    generated_at_ms: nowMs(),
+    mutation_ready: mutationReady,
+    readiness_reason: mutationReady ? "scout_ready_with_structural_context" : "handoff_context_incomplete",
+    all_handoff_files_contextualized: allHandoffFilesContextualized,
+    coverage: fullScopes === capsuleScopes.length ? "full_scope" : fullScopes > 0 ? "mixed" : "evidence_window",
+    files,
+    scopes: capsuleScopes,
+    bytes: usedBytes,
+    truncated,
+  }
+  const json = JSON.stringify(capsule, null, 2) + "\n"
+  const hash = createHash("sha256").update(json).digest("hex")
+  const dir = path.join(root, ".opencode", "edit-capsules")
+  const key = scoutOpaqueKey(`${sessionID}:${state.turnID}:edit-capsule`)
+  const finalPath = path.join(dir, `${key}.json`)
+  const tempPath = `${finalPath}.${process.pid}.${nowMs()}.tmp`
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(tempPath, json, "utf8")
+    await rename(tempPath, finalPath)
+  } catch {
+    await rm(tempPath, { force: true }).catch(() => {})
+    return null
+  }
+
+  const rel = path.relative(root, finalPath)
+  state.editCapsulePath = rel
+  state.editCapsuleHash = hash
+  const header =
+    `EDIT_CAPSULE protocol=${EDIT_CAPSULE_PROTOCOL} mutation_ready=${mutationReady} ` +
+    `coverage=${capsule.coverage} scopes=${capsuleScopes.length} path=${rel} sha256=${hash}`
+  return {
+    protocol: EDIT_CAPSULE_PROTOCOL,
+    path: rel,
+    sha256: hash,
+    mutationReady,
+    coverage: capsule.coverage,
+    scopes: capsuleScopes.length,
+    bytes: usedBytes,
+    truncated,
+    text: [header, ...rendered].join("\n"),
+  }
+}
+
 async function renderFocusedSupplement(
   root,
   groups,
@@ -4482,7 +5095,8 @@ export default {
           "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
           "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
           "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
-          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning.",
+          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
+          "When Scout reaches a ready handoff, the tool also emits edit-capsule-v1 with bounded structural scope context; the causal controller then exposes only execute_patch.",
         input: {
           type: "object",
           properties: {
@@ -4530,6 +5144,20 @@ export default {
 
           if (state && !state.turnID) {
             resetTurnState(state, `implicit:${sessionID}:${nowMs()}`, nowMs())
+          }
+
+          if (state && !toolAllowedForExecutionState(state, "search")) {
+            return {
+              content: `SEARCH_BLOCKED reason=causal_frontier state=${state.executionState} action=${nextActionForExecutionState(state)}`,
+              metadata: {
+                protocol: SEARCH_PROTOCOL,
+                blocked: true,
+                reason: "causal_frontier",
+                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+                execution_state: state.executionState,
+                next_action: nextActionForExecutionState(state),
+              },
+            }
           }
 
           let attemptIndex = null
@@ -5501,6 +6129,18 @@ export default {
             noProgressBlocked,
           })
 
+          let editCapsule = null
+          if (scoutHandoff?.status === "ready") {
+            editCapsule = await buildEditCapsule(root, sessionID, state, distillGroupsForIndex, scoutHandoff)
+            if (editCapsule?.mutationReady === true) {
+              applyExecutionEvent(state, "scout_ready", "edit_capsule_ready")
+            } else {
+              applyExecutionEvent(state, "scout_needs_evidence", "edit_capsule_unavailable")
+            }
+          } else {
+            applyExecutionEvent(state, "scout_needs_evidence", `scout_handoff_${scoutHandoff?.status ?? "missing"}`)
+          }
+
           const elapsedMs = Math.round((performance.now() - started) * 100) / 100
 
           await writeProjectTrace(root, "search-trace.jsonl", {
@@ -5530,6 +6170,13 @@ export default {
             scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
             scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
             scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
+            edit_capsule_protocol: editCapsule?.protocol ?? null,
+            edit_capsule_path: editCapsule?.path ?? null,
+            edit_capsule_sha256: editCapsule?.sha256 ?? null,
+            edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
+            edit_capsule_coverage: editCapsule?.coverage ?? null,
+            execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_state: state?.executionState ?? null,
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
@@ -5759,8 +6406,12 @@ export default {
             turn_evidence_bytes: state?.evidenceBytes ?? null,
           })
 
+          const actionableContent = editCapsule?.mutationReady === true
+            ? `${content}\n\n${editCapsule.text}\nNEXT_ACTION=execute_patch reason=edit_capsule_ready search_locked=true`
+            : content
+
           return {
-            content,
+            content: actionableContent,
             metadata: {
               protocol: SEARCH_PROTOCOL,
               project_root: root,
@@ -5788,6 +6439,15 @@ export default {
               scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
               scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
               scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
+              edit_capsule_protocol: editCapsule?.protocol ?? null,
+              edit_capsule_path: editCapsule?.path ?? null,
+              edit_capsule_sha256: editCapsule?.sha256 ?? null,
+              edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
+              edit_capsule_coverage: editCapsule?.coverage ?? null,
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              patch_permission_action: PATCH_PERMISSION_ACTION,
+              execution_state: state?.executionState ?? null,
+              next_action: nextActionForExecutionState(state),
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,
@@ -5839,9 +6499,398 @@ export default {
       })
     }))
 
+    await track(ctx.tool.transform((tools) => {
+      tools.add({
+        name: "execute_patch",
+        description:
+          "Submit exactly ONE semantic mutation against the latest Scout edit-capsule. Arguments are FLAT: file, kind, symbol and the kind-specific fields; do not wrap them in a mutations array. " +
+          "replace_body supplies body; replace_expr supplies before+after; rename_symbol supplies new_name and optional scope=handoff. " +
+          "The deterministic compiler expands the semantic mutation into guarded physical edits, removes mechanical ambiguity and generates checks. " +
+          "Use the edit-capsule-v1 emitted by search; do not search again while mutation is enabled. " +
+          "PATCH_READY persists a verified receipt; PATCH_RETRY means revise semantic intent once; PATCH_RESCOUT reopens search through the causal controller.",
+        input: {
+          type: "object",
+          properties: {
+            file: { type: "string", minLength: 1, maxLength: 4096 },
+            kind: { type: "string", enum: ["replace_body", "replace_expr", "rename_symbol"] },
+            symbol: { type: "string", minLength: 1, maxLength: 256 },
+            body: { type: "string", maxLength: 16384 },
+            before: { type: "string", maxLength: 16384 },
+            after: { type: "string", maxLength: 16384 },
+            new_name: { type: "string", maxLength: 256 },
+            scope: { type: "string", enum: ["handoff"] },
+          },
+          required: ["file", "kind", "symbol"],
+          additionalProperties: false,
+        },
+        options: {
+          codemode: false,
+          permission: PATCH_PERMISSION_ACTION,
+        },
+
+        execute: async (input, toolContext) => {
+          const started = performance.now()
+          const sessionID =
+            typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
+              ? toolContext.sessionID
+              : null
+          const state = getSessionState(sessionID)
+          const root = await rootForTool(ctx, toolContext, sessionID, state)
+
+          const trace = async (record) => {
+            await writeProjectTrace(root, "executor-trace.jsonl", {
+              ts: nowMs(),
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              sessionID,
+              turnID: state?.turnID ?? null,
+              project_root: root,
+              patch_attempt: state?.patchAttempts ?? null,
+              executed_patches: state?.executedPatches ?? null,
+              turn_model_calls: state?.modelCalls ?? null,
+              scout_handoff_path: state?.scoutHandoffPath ?? null,
+              edit_capsule_path: state?.editCapsulePath ?? null,
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state?.executionState ?? null,
+              execution_reason: state?.executionReason ?? null,
+              ...record,
+              tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+            })
+          }
+
+          if (!root || !state) {
+            await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
+            return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
+          }
+          if (!toolAllowedForExecutionState(state, "execute_patch")) {
+            const next = nextActionForExecutionState(state)
+            const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
+            await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
+            return {
+              content: `${action === "rescout" ? "PATCH_RESCOUT" : "PATCH_STOP"} reason=causal_frontier state=${state.executionState} action=${next}`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action,
+                reason: "causal_frontier",
+                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+                execution_state: state.executionState,
+                next_action: next,
+              },
+            }
+          }
+          if (!state.scoutHandoffPath) {
+            applyExecutionEvent(state, "patch_rescout", "scout_handoff_missing", { reason: "scout_handoff_missing" })
+            await trace({ admitted: false, reason: "scout_handoff_missing", action: "rescout" })
+            return {
+              content: "PATCH_RESCOUT reason=scout_handoff_missing action=search_first",
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "scout_handoff_missing" },
+            }
+          }
+          if (state.patchAccepted) {
+            applyExecutionEvent(state, "patch_ready", "patch_already_accepted")
+            await trace({ admitted: false, reason: "patch_already_accepted", action: "stop", receipt_path: state.patchReceiptPath })
+            return {
+              content: `PATCH_STOP reason=patch_already_accepted receipt=${state.patchReceiptPath ?? "unknown"} action=use_receipt`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
+            }
+          }
+          if (state.patchAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
+            applyExecutionEvent(state, "fatal", "patch_attempt_budget")
+            await trace({ admitted: false, reason: "patch_attempt_budget", action: "stop" })
+            return {
+              content: `PATCH_STOP reason=patch_attempt_budget attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_attempt_budget" },
+            }
+          }
+
+          state.patchAttempts += 1
+          state.lastSeen = nowMs()
+
+          const mutation = {
+            file: input?.file,
+            kind: input?.kind,
+            symbol: input?.symbol,
+            ...(typeof input?.body === "string" ? { body: input.body } : {}),
+            ...(typeof input?.before === "string" ? { before: input.before } : {}),
+            ...(typeof input?.after === "string" ? { after: input.after } : {}),
+            ...(typeof input?.new_name === "string" ? { new_name: input.new_name } : {}),
+            ...(typeof input?.scope === "string" ? { scope: input.scope } : {}),
+          }
+          const mutations = [mutation]
+          const compiled = await runPatchCompiler(root, {
+            root,
+            handoff: state.scoutHandoffPath,
+            mutation_protocol: PATCH_MUTATION_PROTOCOL,
+            mutations,
+          })
+          if (!compiled.ok) {
+            const reason = `compiler_${compiled.reason}`
+            applyExecutionEvent(state, "fatal", reason)
+            await trace({ admitted: false, reason, action: "stop", compiler_elapsed_ms: compiled.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=${reason} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+          const compilerResponse = compiled.response
+          if (compilerResponse?.ok !== true) {
+            const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
+            const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
+            const canRetry = PATCH_COMPILER_RETRY_REASONS.has(reason) && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+            const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+            if (needsRescout) {
+              applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
+            } else if (canRetry) {
+              applyExecutionEvent(state, "patch_retry", reason)
+            } else {
+              applyExecutionEvent(state, "fatal", reason)
+            }
+            await trace({
+              admitted: false,
+              reason,
+              action,
+              compiler_elapsed_ms: compiled.elapsedMs,
+              compiler_mutation_index: compilerResponse?.mutation_index ?? null,
+              compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+              compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+              executor_run: false,
+            })
+            if (needsRescout) {
+              return {
+                content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
+              }
+            }
+            if (canRetry) {
+              return {
+                content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+              }
+            }
+            return {
+              content: `PATCH_STOP reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+
+          const signature = patchPlanSignature(compilerResponse)
+          if (state.patchSignatures.has(signature)) {
+            applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
+            await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
+            return {
+              content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
+            }
+          }
+          state.patchSignatures.add(signature)
+          state.executedPatches += 1
+
+          const result = await runPatchExecutor(root, {
+            root,
+            handoff: state.scoutHandoffPath,
+            mode: "guarded",
+            edit_protocol: PATCH_EDIT_PROTOCOL,
+            edits: compilerResponse?.edits ?? [],
+            checks: compilerResponse?.checks ?? [],
+          })
+
+          if (!result.ok) {
+            const reason = `executor_${result.reason}`
+            applyExecutionEvent(state, "fatal", reason)
+            await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=${reason} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+
+          const response = result.response
+          if (response?.admitted === true) {
+            const proofObligations = proofObligationsForMutations(mutations)
+            state.proofObligations = proofObligations
+            const verified = await runInvariantVerifier(root, {
+              root,
+              handoff: state.scoutHandoffPath,
+              patch: response?.patch ?? "",
+              compiler_protocol: PATCH_COMPILER_PROTOCOL,
+              mutation_protocol: PATCH_MUTATION_PROTOCOL,
+              mutations,
+              changed_files: compilerResponse?.changed_files ?? [],
+              edits: compilerResponse?.edits ?? [],
+            })
+            if (!verified.ok) {
+              const reason = `verifier_${verified.reason}`
+              applyExecutionEvent(state, "fatal", reason)
+              await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_STOP reason=${reason} action=report_blocked`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+              }
+            }
+            const verificationResponse = verified.response
+            const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
+            if (!proofAssessment.ok) {
+              const failedProofs = compactProofFailure(proofAssessment)
+              const canRepair = proofAssessment.disposition === "repair" && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+              if (proofAssessment.disposition === "rescout") {
+                applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
+                  reason: "proof_obligation_failed",
+                  failed: proofAssessment.failed,
+                })
+                await trace({ admitted: false, reason: "proof_obligation_failed", action: "rescout", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+                return {
+                  content: `PATCH_RESCOUT reason=proof_obligation_failed failed=${failedProofs} action=refine_search`,
+                  metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+                }
+              }
+              if (canRepair) {
+                applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
+                await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+                return {
+                  content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                  metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+                }
+              }
+              applyExecutionEvent(state, "fatal", "proof_obligation_failed")
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            const persisted = await writePatchReceipt(root, sessionID, state, response, compilerResponse, verificationResponse, proofAssessment)
+            if (!persisted) {
+              applyExecutionEvent(state, "fatal", "receipt_write_failed")
+              await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+              return {
+                content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
+              }
+            }
+            state.patchAccepted = true
+            state.patchReceiptPath = persisted.path
+            applyExecutionEvent(state, "patch_ready", "verification_passed")
+            await trace({
+              admitted: true,
+              reason: null,
+              action: "ready",
+              plan_signature: signature,
+              compiler_elapsed_ms: compiled.elapsedMs,
+              compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
+              compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
+              compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+              compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+              compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+              executor_elapsed_ms: result.elapsedMs,
+              verifier_elapsed_ms: verified.elapsedMs,
+              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+              invariants_total: verificationResponse?.invariants_total ?? 0,
+              invariants_passed: verificationResponse?.invariants_passed ?? 0,
+              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+              proof_obligations: proofAssessment.obligations.map((item) => item.id),
+              proof_disposition: proofAssessment.disposition,
+              verification_receipt: persisted.verificationPath,
+              receipt_path: persisted.path,
+              patch_path: persisted.receipt.patch_path,
+              patch_sha256: persisted.receipt.patch_sha256,
+              changed_files: response.changed_files ?? [],
+              changed_lines: response.changed_lines ?? 0,
+              patch_bytes: response.patch_bytes ?? 0,
+              structural_edits: response.structural_edits ?? 0,
+              repo_mutated: response.repo_mutated === true,
+            })
+            return {
+              content:
+                `PATCH_READY receipt=${persisted.path} changed_files=${(response.changed_files ?? []).length} ` +
+                `changed_lines=${response.changed_lines ?? 0} semantic_mutations=${compilerResponse?.mutations_effective ?? 0} ` +
+                `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
+                `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
+                `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
+                `capsule=${state.editCapsulePath ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "ready",
+                receipt_protocol: PATCH_RECEIPT_PROTOCOL,
+                receipt_path: persisted.path,
+                verification_receipt: persisted.verificationPath,
+                verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
+                invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+                invariants_total: verificationResponse?.invariants_total ?? 0,
+                invariants_passed: verificationResponse?.invariants_passed ?? 0,
+                proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+                proof_obligations: proofAssessment.obligations,
+                edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
+                edit_capsule_path: state.editCapsulePath,
+                edit_capsule_sha256: state.editCapsuleHash,
+                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+                execution_state: state.executionState,
+                compiler_protocol: PATCH_COMPILER_PROTOCOL,
+                mutation_protocol: PATCH_MUTATION_PROTOCOL,
+                patch_tool_protocol: PATCH_TOOL_PROTOCOL,
+                semantic_mutations: compilerResponse?.mutations_effective ?? 0,
+                lowered_edits: compilerResponse?.lowered_edits ?? 0,
+                changed_files: response.changed_files ?? [],
+                changed_lines: response.changed_lines ?? 0,
+                patch_bytes: response.patch_bytes ?? 0,
+                truncated: false,
+              },
+            }
+          }
+
+          const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
+          const canRetry = PATCH_RETRY_REASONS.has(reason) && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+          const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
+          const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+          if (needsRescout) {
+            applyExecutionEvent(state, "patch_rescout", reason, { reason, allowed_files: response?.allowed_files ?? [] })
+          } else if (canRetry) {
+            applyExecutionEvent(state, "patch_retry", reason)
+          } else {
+            applyExecutionEvent(state, "fatal", reason)
+          }
+          await trace({
+            admitted: false,
+            reason,
+            action,
+            plan_signature: signature,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+            executor_elapsed_ms: result.elapsedMs,
+            allowed_files: response?.allowed_files ?? [],
+            changed_files: response?.changed_files ?? [],
+          })
+
+          if (needsRescout) {
+            return {
+              content: `PATCH_RESCOUT reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
+            }
+          }
+          if (canRetry) {
+            return {
+              content: `PATCH_RETRY reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+            }
+          }
+          return {
+            content: `PATCH_STOP reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        },
+      })
+    }))
+
     await track(ctx.session.hook("context", async (event) => {
+      if (!event?.tools || typeof event.tools !== "object") {
+        throw new Error("CPU_AGENT tool_surface_missing")
+      }
+
+      // Stable model-facing surface. This filter is deliberately idempotent:
+      // search and execute_patch are never removed based on FSM state, so a
+      // reused mutable event.tools object cannot lose the next state's schema.
       for (const name of Object.keys(event.tools)) {
-        if (name !== "search") delete event.tools[name]
+        if (name !== "search" && name !== "execute_patch") {
+          delete event.tools[name]
+        }
       }
 
       if (event.agent === "compaction") return
@@ -5865,6 +6914,40 @@ export default {
       } else if (!state.turnID) {
         resetTurnState(state, `implicit:${sessionID}:${nowMs()}`, nowMs())
       }
+
+      const materializedToolNames = Object.keys(event.tools).sort()
+      const requiredSurface = ["execute_patch", "search"]
+      const missingSurface = requiredSurface.filter(
+        (name) => !Object.prototype.hasOwnProperty.call(event.tools, name),
+      )
+
+      if (missingSurface.length > 0) {
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: nowMs(),
+          protocol: AGENT_PROTOCOL,
+          kind: "model_blocked",
+          reason: "permission_materialized_tool_missing",
+          sessionID,
+          turnID: state.turnID,
+          project_root: root,
+          tool_frontier_protocol: TOOL_FRONTIER_PROTOCOL,
+          execution_state: state.executionState,
+          missing_tools: missingSurface,
+          materialized_tools: materializedToolNames,
+        })
+
+        throw new Error(
+          `CPU_AGENT permission_materialized_tool_missing state=${state.executionState} ` +
+          `missing=${missingSurface.join(",")}`,
+        )
+      }
+
+      const allowedTools = allowedToolsForExecutionState(state.executionState)
+      const allowedSet = new Set(allowedTools)
+      for (const name of Object.keys(event.tools)) {
+        if (!allowedSet.has(name)) delete event.tools[name]
+      }
+      const frontierToolNames = Object.keys(event.tools).sort()
 
       const elapsed = Math.max(0, nowMs() - state.turnStartedAt)
 
@@ -5937,8 +7020,26 @@ export default {
           event.tools && typeof event.tools === "object"
             ? Object.keys(event.tools).length
             : null,
+        tool_names:
+          event.tools && typeof event.tools === "object"
+            ? Object.keys(event.tools).sort()
+            : [],
+        execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+        tool_frontier_protocol: TOOL_FRONTIER_PROTOCOL,
+        materialized_tool_surface: materializedToolNames,
+        tool_frontier_names: frontierToolNames,
+        execution_state: state.executionState,
+        execution_reason: state.executionReason,
+        execution_event: state.executionEvent,
+        next_action: nextActionForExecutionState(state),
+        edit_capsule_path: state.editCapsulePath,
+        edit_capsule_sha256: state.editCapsuleHash,
+        pending_rescout: state.pendingRescout,
         turn_search_attempts: state.searchAttempts,
         turn_executed_searches: state.executedSearches,
+        turn_patch_attempts: state.patchAttempts,
+        turn_executed_patches: state.executedPatches,
+        turn_patch_accepted: state.patchAccepted,
         turn_evidence_bytes: state.evidenceBytes,
       })
     }))

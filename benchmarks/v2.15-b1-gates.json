@@ -1,0 +1,13 @@
+{
+  "version": "v2.15-B1",
+  "patch_tool_protocol": "semantic-mutation-tool-v1",
+  "goal": "remove model-only container syntax from the mutation ABI without changing compiler, executor, verifier or causal FSM",
+  "gates": [
+    "execute_patch exposes exactly one flat semantic mutation: file/kind/symbol plus kind-specific fields",
+    "tool schema has no model-facing mutations array",
+    "plugin wraps the flat mutation into mutation-plan-v1 internally before patch-compiler-v1",
+    "patch-executor-v2, patch-compiler-v1 and invariant-verifier-v1 remain frozen",
+    "three real repositories emit a parsed execute_patch event with flat arguments",
+    "three real repositories retain locate -> mutate -> done, one search, one patch attempt and verified receipts"
+  ]
+}

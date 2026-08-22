@@ -1,0 +1,24 @@
+{
+  "version": "v2.14-C3",
+  "protocol": "patch-compiler-v1",
+  "mutation_protocol": "mutation-plan-v1",
+  "goal": "Move format-sensitive patch construction out of the local model and into deterministic compilation while preserving the frozen guarded executor.",
+  "gates": [
+    "one-file business change succeeds through one semantic replace_body mutation",
+    "structural expression change succeeds despite source trivia through replace_expr",
+    "one semantic rename_symbol lowers to coordinated edits across two Scout-authorized files",
+    "identity/no-op mutation is removed deterministically without consuming a model retry",
+    "duplicate semantic mutation is canonicalized away before executor invocation",
+    "ambiguous semantic symbol fails closed before any low-level edit is emitted"
+  ],
+  "invariants": {
+    "model_facing_tools": 2,
+    "executor_protocol_frozen": "patch-executor-v2",
+    "search_protocol_frozen": "search-v2.13.6-scout-handoff",
+    "max_semantic_mutations": 4,
+    "max_lowered_edits": 4,
+    "max_changed_files": 2,
+    "rename_scope": "scout_handoff_evidence_local",
+    "model_supplied_postconditions": false
+  }
+}

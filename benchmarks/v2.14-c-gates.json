@@ -1,0 +1,18 @@
+{
+  "version": "v2.14-C",
+  "execution_protocol": "execution-loop-v1",
+  "executor_protocol": "patch-executor-v2",
+  "edit_protocol": "edit-script-v2",
+  "receipt_protocol": "patch-receipt-v1",
+  "goal": "prove the real Scout -> model edit plan -> guarded Executor loop without widening Scout discovery or mutating the main checkout",
+  "gates": [
+    "the model context exposes only search and execute_patch tools",
+    "patch automatically consumes the latest per-turn scout-handoff-v1 and cannot run before Scout",
+    "at most two distinct patch attempts execute per user turn; duplicate plans are stopped before another executor run",
+    "retryable edit-plan failures return compact PATCH_RETRY evidence and can succeed on one bounded retry",
+    "localization/scope failures return PATCH_RESCOUT and never widen writable scope inside Executor",
+    "successful execution persists an immutable patch plus patch-receipt-v1 while the main checkout stays unchanged",
+    "real one-file exact, AST-structural and coordinated two-file tasks produce gold-valid patches",
+    "search-v2.13.6 Scout semantics and patch-executor-v2 mutation budgets remain unchanged"
+  ]
+}
