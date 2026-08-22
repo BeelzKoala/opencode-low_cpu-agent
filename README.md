@@ -16,6 +16,9 @@ Experimental low-CPU local coding-agent runtime for OpenCode.
 - budgeted region routing for dense evidence before model-facing INDEX fallback
 - focused-context cost guard and compact model-visible route metadata
 - separate routing and evidence novelty ledgers
+- task-local one-hop Impact Index with source validation and refresh-on-miss
+- atomic per-turn Scout handoff snapshots with source fingerprints
+- guarded Patch Executor with detached-worktree mutation, structural edits and rollback gates
 - Rust structural evidence distiller
 - ast-grep/tree-sitter structural backend
 - llama.cpp local inference
@@ -39,14 +42,25 @@ Proven:
   line search would be too broad
 - Rust evidence-distiller standalone smoke test
 - pressure-based structural evidence distillation inside `search`
+- v2.13-A/B/C guarded non-lexical recovery
+- v2.13-C2.2 task-local Impact Index routing — 8/8 runtime gates PASS
+- v2.13-C3 Scout handoff/freeze — 4/4 runtime gates PASS
 
 Roadmap:
 
 - v2.12-A budgeted region router — DONE
-- v2.12-B probe-more / emit-less — CURRENT
-- v2.13 incremental symbol/file graph only if benchmark misses justify it
+- v2.12-B probe-more / emit-less — DONE
+- v2.13-C2.2 task-local Impact Index — DONE
+- v2.13-C3 Scout handoff/freeze — DONE
+- v2.14-A shadow Patch Executor — DONE
+- v2.14-B guarded transactional mutation — CURRENT
+- v2.15 deterministic review/verification — AFTER EXECUTOR
 
-See `docs/ARCHITECTURE_PLAN.md`, `benchmarks/v2.12-a-gates.json`, and `benchmarks/v2.12-b-gates.json`.
+The Scout discovery plane is frozen after v2.13-C3. New discovery heuristics require a
+reproducible benchmark failure that cannot be solved in the execution or verification
+stages.
+
+See `docs/ARCHITECTURE_PLAN.md` and the `benchmarks/*-gates.json` records.
 
 ## Layout
 
@@ -61,6 +75,8 @@ rust/
     Cargo.lock
     rust-toolchain.toml
     src/main.rs
+    src/impact_index.rs
+    src/patch_executor.rs
 
 llama/
   run-north.example.sh

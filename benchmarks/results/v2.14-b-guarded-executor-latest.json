@@ -1,0 +1,24 @@
+{
+  "version": "v2.14-B",
+  "protocol": "patch-executor-v2",
+  "mode": "guarded",
+  "edit_protocol": "edit-script-v2",
+  "verdict": "PASS",
+  "pass": 9,
+  "fail": 0,
+  "total_wall_s": 0.827,
+  "source_sha256": "3bdab9936c84c873d136d8befd335316c4059032891cdc76aa73d56495ec5141",
+  "wins": {
+    "detached_worktree_mutation": true,
+    "main_worktree_unchanged": true,
+    "structural_ast_edit": true,
+    "partial_handoff_rejected": true,
+    "stale_fingerprint_rejected": true,
+    "scope_escape_rejected": true,
+    "head_baseline_mismatch_rejected": true,
+    "syntax_failure_rollback": true,
+    "postcondition_failure_rollback": true,
+    "changed_line_budget_rejected": true,
+    "max_executor_elapsed_ms": 29.21
+  }
+}

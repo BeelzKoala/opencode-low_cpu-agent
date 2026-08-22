@@ -1,0 +1,22 @@
+{
+  "version": "v2.14-A",
+  "protocol": "patch-executor-v1",
+  "mode": "shadow",
+  "verdict": "PASS",
+  "pass": 7,
+  "fail": 0,
+  "total_wall_s": 0.376,
+  "source_sha256": "339e8522ccde8b0e076b985c1cb0bd31a4a2e6fc8929cf498711bc5fac960004",
+  "wins": {
+    "ready_handoff_to_patch": true,
+    "repo_byte_identity_preserved": true,
+    "git_apply_check": true,
+    "partial_handoff_rejected": true,
+    "stale_fingerprint_rejected": true,
+    "scope_escape_rejected": true,
+    "ambiguous_precondition_rejected": true,
+    "syntax_break_rejected": true,
+    "far_edit_rejected": true,
+    "max_executor_elapsed_ms": 20.55
+  }
+}

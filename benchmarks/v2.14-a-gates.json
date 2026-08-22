@@ -1,0 +1,28 @@
+{
+  "version": "v2.14-A",
+  "protocol": "patch-executor-v1",
+  "mode": "shadow",
+  "goal": "turn a ready Scout handoff into a mechanically valid candidate patch without mutating the repository",
+  "invariants": {
+    "accepted_handoff_protocol": "scout-handoff-v1",
+    "accepted_handoff_status": "ready",
+    "edit_ir": "replace_exact",
+    "max_edits": 4,
+    "max_evidence_distance_lines": 96,
+    "strong_sha256_required": true,
+    "writable_scope_is_handoff_files": true,
+    "candidate_must_parse": true,
+    "git_apply_check_required": true,
+    "repository_mutation": false,
+    "edit_protocol": "edit-script-v1"
+  },
+  "gates": [
+    "ready handoff produces an applicable in-memory patch while source bytes stay unchanged",
+    "partial or blocked handoff has no patch authority",
+    "stale Scout fingerprint rejects execution",
+    "files outside the Scout handoff cannot enter the candidate patch",
+    "exact replacement preconditions must match exactly once",
+    "syntax-breaking candidates are rejected by the existing ast-grep/tree-sitter backend",
+    "edits farther than 96 lines from carried Scout evidence are rejected"
+  ]
+}

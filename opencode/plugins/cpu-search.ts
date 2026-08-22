@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process"
-import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
 const MAX_QUERIES = 4
@@ -73,8 +74,14 @@ const ROUTE_LEDGER_MAX_FACTS_PER_TURN = 4000
 const CONTEXTUALIZED_HITS_MAX_PER_TURN = 4000
 const MAX_CONSECUTIVE_NO_PROGRESS = 2
 
-const SEARCH_PROTOCOL = "search-v2.13.5-task-local-impact"
-const AGENT_PROTOCOL = "cpu-agent-v2.3.2-global"
+// Final Scout boundary. Search semantics stay bounded; the new work is a
+// deterministic, machine-readable handoff for the next execution stage.
+const SCOUT_HANDOFF_PROTOCOL = "scout-handoff-v1"
+const SCOUT_HANDOFF_HASH_MAX_BYTES = 8 * 1024 * 1024
+const SCOUT_HANDOFF_MAX_LINES_PER_FILE = 32
+
+const SEARCH_PROTOCOL = "search-v2.13.6-scout-handoff"
+const AGENT_PROTOCOL = "cpu-agent-v2.3.3-global"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -135,6 +142,253 @@ async function writeProjectTrace(root, fileName, record) {
   }
 }
 
+function scoutOpaqueKey(value) {
+  return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 20)
+}
+
+function scoutFingerprintKey(fingerprint) {
+  if (!fingerprint) return null
+  if (fingerprint.kind === "sha256" && typeof fingerprint.sha256 === "string") {
+    return `sha256:${fingerprint.sha256}`
+  }
+  if (Number.isFinite(fingerprint.size) && Number.isFinite(fingerprint.mtime_ms)) {
+    return `stat:${fingerprint.size}:${fingerprint.mtime_ms}`
+  }
+  return null
+}
+
+function scoutNormalizeWitnessText(text) {
+  return String(text ?? "").replace(/\r?\n$/, "")
+}
+
+async function scoutFileFingerprint(root, rawFile, witnesses = []) {
+  const file = evidenceFileKey(rawFile)
+  if (!file) return null
+  const resolved = path.resolve(root, file)
+  if (resolved === root || !resolved.startsWith(root + path.sep)) return null
+
+  try {
+    const info = await stat(resolved)
+    if (!info.isFile()) return null
+    const base = { size: info.size, mtime_ms: Math.trunc(info.mtimeMs) }
+    if (info.size > SCOUT_HANDOFF_HASH_MAX_BYTES) {
+      return { kind: "size_mtime", strong: false, ...base }
+    }
+    const body = await readFile(resolved)
+    const lines = body.toString("utf8").split(/\r?\n/)
+    let evidenceFresh = true
+    let witnessesChecked = 0
+    for (const witness of witnesses) {
+      if (!Number.isInteger(witness?.line) || typeof witness?.text !== "string") continue
+      witnessesChecked += 1
+      if (scoutNormalizeWitnessText(lines[witness.line - 1] ?? "") !== scoutNormalizeWitnessText(witness.text)) {
+        evidenceFresh = false
+        break
+      }
+    }
+    return {
+      kind: "sha256",
+      strong: true,
+      sha256: createHash("sha256").update(body).digest("hex"),
+      evidence_fresh: evidenceFresh,
+      witnesses_checked: witnessesChecked,
+      ...base,
+    }
+  } catch {
+    return null
+  }
+}
+
+async function writeScoutHandoff(root, sessionID, bundle) {
+  if (!root || !sessionID) return null
+  const dir = path.join(root, ".opencode", "scout-handoffs")
+  const finalPath = path.join(dir, `${scoutOpaqueKey(sessionID)}.json`)
+  const tempPath = `${finalPath}.${process.pid}.${nowMs()}.tmp`
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(tempPath, JSON.stringify(bundle, null, 2) + "\n", "utf8")
+    await rename(tempPath, finalPath)
+    return path.relative(root, finalPath)
+  } catch {
+    await rm(tempPath, { force: true }).catch(() => {})
+    return null
+  }
+}
+
+function scoutEvidenceWitnesses(hits, selectedFiles) {
+  const selected = new Set((selectedFiles ?? []).map((entry) => evidenceFileKey(entry?.file)))
+  const witnesses = new Map()
+  const push = (file, line, text) => {
+    if (!file || !selected.has(file) || !Number.isInteger(line) || typeof text !== "string") return
+    if (!witnesses.has(file)) witnesses.set(file, [])
+    const values = witnesses.get(file)
+    if (values.length < SCOUT_HANDOFF_MAX_LINES_PER_FILE) values.push({ line, text })
+  }
+  for (const hit of hits?.values?.() ?? []) push(evidenceFileKey(hit?.file), hit?.line, hit?.text)
+  for (const entry of selectedFiles ?? []) {
+    push(evidenceFileKey(entry?.file), entry?.impact?.sample?.line, entry?.impact?.sample?.text)
+  }
+  return witnesses
+}
+
+function scoutEvidenceLines(hits, selectedFiles) {
+  const selected = new Set((selectedFiles ?? []).map((entry) => evidenceFileKey(entry?.file)))
+  const lines = new Map()
+  for (const hit of hits?.values?.() ?? []) {
+    const file = evidenceFileKey(hit?.file)
+    if (!file || !selected.has(file) || !Number.isInteger(hit?.line)) continue
+    if (!lines.has(file)) lines.set(file, new Set())
+    lines.get(file).add(hit.line)
+  }
+  for (const entry of selectedFiles ?? []) {
+    const file = evidenceFileKey(entry?.file)
+    const line = entry?.impact?.sample?.line
+    if (!file || !Number.isInteger(line)) continue
+    if (!lines.has(file)) lines.set(file, new Set())
+    lines.get(file).add(line)
+  }
+  return lines
+}
+
+function serializeScoutFile(entry) {
+  return {
+    file: entry.file,
+    origins: [...entry.origins].sort(),
+    queries: [...entry.queries].sort((a, b) => a - b),
+    evidence_lines: [...entry.evidenceLines].sort((a, b) => a - b).slice(0, SCOUT_HANDOFF_MAX_LINES_PER_FILE),
+    evidence_lines_truncated: entry.evidenceLines.size > SCOUT_HANDOFF_MAX_LINES_PER_FILE,
+    fingerprint: entry.fingerprint,
+    changed_during_scout: entry.changedDuringScout === true,
+    impact: [...entry.impact.values()].sort((a, b) =>
+      String(a.seed).localeCompare(String(b.seed)) ||
+      String(a.direction).localeCompare(String(b.direction)) ||
+      String(a.validation_kind).localeCompare(String(b.validation_kind)),
+    ),
+  }
+}
+
+async function updateScoutHandoff(root, sessionID, state, snapshot) {
+  if (!state || !sessionID) return null
+  const started = performance.now()
+  const lineMap = scoutEvidenceLines(snapshot.hits, snapshot.selectedFiles)
+  const witnessMap = scoutEvidenceWitnesses(snapshot.hits, snapshot.selectedFiles)
+  const fingerprints = await Promise.all((snapshot.selectedFiles ?? []).map(async (selected) => {
+    const file = evidenceFileKey(selected?.file)
+    return {
+      selected,
+      file,
+      fingerprint: await scoutFileFingerprint(root, selected?.file, witnessMap.get(file) ?? []),
+    }
+  }))
+
+  for (const item of fingerprints) {
+    if (!item.file) continue
+    let entry = state.scoutFiles.get(item.file)
+    if (!entry) {
+      entry = {
+        file: item.file, origins: new Set(), queries: new Set(), evidenceLines: new Set(),
+        fingerprint: item.fingerprint, changedDuringScout: false, impact: new Map(),
+      }
+      state.scoutFiles.set(item.file, entry)
+    } else {
+      const before = scoutFingerprintKey(entry.fingerprint)
+      const after = scoutFingerprintKey(item.fingerprint)
+      if (before && after && before !== after) entry.changedDuringScout = true
+      if (item.fingerprint) entry.fingerprint = item.fingerprint
+    }
+
+    entry.origins.add(item.selected?.origin === "impact" ? "impact" : "lexical")
+    for (const query of item.selected?.queries ?? []) {
+      if (Number.isInteger(query)) entry.queries.add(query)
+    }
+    for (const line of lineMap.get(item.file) ?? []) entry.evidenceLines.add(line)
+
+    if (item.selected?.origin === "impact") {
+      const relation = {
+        seed: evidenceFileKey(item.selected?.impact?.seed),
+        direction: item.selected?.impact?.direction ?? null,
+        bindings: [...new Set(item.selected?.impact?.bindings ?? [])].slice(0, IMPACT_BINDINGS_PER_CANDIDATE),
+        validation_kind: item.selected?.impact?.validationKind ?? null,
+        sample_line: Number.isInteger(item.selected?.impact?.sample?.line) ? item.selected.impact.sample.line : null,
+      }
+      const key = JSON.stringify(relation)
+      entry.impact.set(key, relation)
+    }
+  }
+
+  state.scoutSearches.push({
+    attempt_index: snapshot.attemptIndex,
+    queries: snapshot.queries,
+    path: snapshot.target,
+    glob: snapshot.glob ?? null,
+    representation: snapshot.representation,
+    source_representation: snapshot.sourceRepresentation,
+    lexical_discovery_complete: snapshot.discoveryComplete,
+    scan_complete: snapshot.scanComplete,
+    selected_scan_complete: snapshot.selectedScanComplete,
+    evidence_complete: snapshot.evidenceComplete,
+    selected_evidence_complete: snapshot.selectedEvidenceComplete,
+    refinement_required: snapshot.refinementRequired,
+    retained_unread_files: snapshot.retainedUnreadFiles,
+    retained_unemitted_files: snapshot.retainedUnemittedFiles,
+    selected_files: (snapshot.selectedFiles ?? []).map((entry) => evidenceFileKey(entry?.file)).filter(Boolean),
+    impact_index_coverage_complete: snapshot.impactIndexCoverageComplete,
+    no_progress: snapshot.noProgress === true,
+    no_progress_blocked: snapshot.noProgressBlocked === true,
+  })
+
+  if (state.scoutSearches.length > MAX_EXECUTED_SEARCHES_PER_TURN) state.scoutSearches.shift()
+
+  const files = [...state.scoutFiles.values()].map(serializeScoutFile).sort((a, b) => a.file.localeCompare(b.file))
+  const latest = state.scoutSearches[state.scoutSearches.length - 1] ?? null
+  const blockingReasons = []
+  const partialReasons = []
+
+  if (files.length < 1) blockingReasons.push("no_localized_files")
+  if (latest?.refinement_required === true) blockingReasons.push("refinement_required")
+  if (files.some((entry) => !entry.fingerprint)) blockingReasons.push("fingerprint_unavailable")
+  if (files.some((entry) => entry.fingerprint?.strong !== true)) blockingReasons.push("weak_fingerprint")
+  if (files.some((entry) => entry.fingerprint?.evidence_fresh === false)) blockingReasons.push("evidence_changed_before_handoff")
+  if (files.some((entry) => entry.changed_during_scout === true)) blockingReasons.push("file_changed_during_scout")
+
+  if (latest?.lexical_discovery_complete === false) partialReasons.push("lexical_discovery_incomplete")
+  if ((latest?.retained_unread_files ?? 0) > 0) partialReasons.push("retained_unread_files")
+  if ((latest?.retained_unemitted_files ?? 0) > 0) partialReasons.push("retained_unemitted_files")
+  if (latest?.evidence_complete === false) partialReasons.push("evidence_incomplete")
+  if (latest?.impact_index_coverage_complete === false) partialReasons.push("impact_index_partial")
+
+  const status = blockingReasons.length > 0 ? "blocked" : partialReasons.length > 0 ? "partial" : "ready"
+  const bundle = {
+    protocol: SCOUT_HANDOFF_PROTOCOL,
+    search_protocol: SEARCH_PROTOCOL,
+    session_key: scoutOpaqueKey(sessionID),
+    turn_key: scoutOpaqueKey(state.turnID ?? ""),
+    generated_at_ms: nowMs(),
+    status,
+    blocking_reasons: [...new Set(blockingReasons)],
+    partial_reasons: [...new Set(partialReasons)],
+    budgets: {
+      model_calls: state.modelCalls,
+      search_attempts: state.searchAttempts,
+      executed_searches: state.executedSearches,
+      evidence_bytes: state.evidenceBytes,
+    },
+    searches: state.scoutSearches,
+    files,
+  }
+  const handoffPath = await writeScoutHandoff(root, sessionID, bundle)
+  state.scoutHandoffPath = handoffPath
+  return {
+    protocol: SCOUT_HANDOFF_PROTOCOL,
+    path: handoffPath,
+    status,
+    files: files.length,
+    blockingReasons: bundle.blocking_reasons,
+    partialReasons: bundle.partial_reasons,
+    elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+  }
+}
+
 const sessionStates = new Map()
 
 function dropSessionState(sessionID) {
@@ -189,6 +443,9 @@ function getSessionState(sessionID) {
       ledgerSaturated: false,
       queryCacheMatches: 0,
       seenUsageMessages: new Set(),
+      scoutSearches: [],
+      scoutFiles: new Map(),
+      scoutHandoffPath: null,
       lastSeen: now,
     }
 
@@ -215,6 +472,9 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.ledgerSaturated = false
   state.queryCacheMatches = 0
   state.seenUsageMessages.clear()
+  state.scoutSearches = []
+  state.scoutFiles = new Map()
+  state.scoutHandoffPath = null
   state.lastSeen = nowMs()
 }
 
@@ -5219,6 +5479,28 @@ export default {
             state.lastSeen = nowMs()
           }
 
+          const scoutHandoff = await updateScoutHandoff(root, sessionID, state, {
+            attemptIndex,
+            queries,
+            target,
+            glob,
+            representation,
+            sourceRepresentation,
+            selectedFiles,
+            hits,
+            discoveryComplete,
+            scanComplete,
+            selectedScanComplete,
+            evidenceComplete,
+            selectedEvidenceComplete,
+            refinementRequired,
+            retainedUnreadFiles: Math.max(0, rankedFiles.length - probeFileSet.size),
+            retainedUnemittedFiles: routeRendered.retained,
+            impactIndexCoverageComplete: impactIndexShadow.refreshComplete,
+            noProgress,
+            noProgressBlocked,
+          })
+
           const elapsedMs = Math.round((performance.now() - started) * 100) / 100
 
           await writeProjectTrace(root, "search-trace.jsonl", {
@@ -5241,6 +5523,13 @@ export default {
             all_discovered_files_emitted: allDiscoveredFilesSelected,
             routing_active: routingActive,
             route_strategy: "query_fair_lexical8_plus_task_local_impact",
+            scout_handoff_protocol: scoutHandoff?.protocol ?? SCOUT_HANDOFF_PROTOCOL,
+            scout_handoff_path: scoutHandoff?.path ?? null,
+            scout_handoff_status: scoutHandoff?.status ?? null,
+            scout_handoff_files: scoutHandoff?.files ?? null,
+            scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
+            scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
+            scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
@@ -5492,6 +5781,13 @@ export default {
               all_discovered_files_emitted: allDiscoveredFilesSelected,
               routing_active: routingActive,
               route_strategy: "query_fair_lexical8_plus_task_local_impact",
+              scout_handoff_protocol: scoutHandoff?.protocol ?? SCOUT_HANDOFF_PROTOCOL,
+              scout_handoff_path: scoutHandoff?.path ?? null,
+              scout_handoff_status: scoutHandoff?.status ?? null,
+              scout_handoff_files: scoutHandoff?.files ?? null,
+              scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
+              scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
+              scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
               refine_elapsed_ms: refineElapsedMs,

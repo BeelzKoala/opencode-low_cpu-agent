@@ -1,0 +1,36 @@
+{
+  "version": "v2.14-B",
+  "protocol": "patch-executor-v2",
+  "mode": "guarded",
+  "goal": "perform bounded real mutations only inside a disposable detached Git worktree and export a patch after deterministic gates pass",
+  "invariants": {
+    "accepted_handoff_protocol": "scout-handoff-v1",
+    "accepted_handoff_status": "ready",
+    "edit_protocol": "edit-script-v2",
+    "edit_ir": ["replace_exact", "replace_ast"],
+    "max_edits": 4,
+    "max_changed_files": 2,
+    "max_changed_lines": 120,
+    "max_evidence_distance_lines": 96,
+    "strong_sha256_required": true,
+    "writable_scope_is_handoff_files": true,
+    "worktree": "git worktree add --detach",
+    "main_worktree_mutation": false,
+    "ast_metavariables": false,
+    "candidate_must_parse": true,
+    "deterministic_postconditions": ["contains_exact", "not_contains_exact"],
+    "git_diff_check_required": true,
+    "git_apply_check_required": true
+  },
+  "gates": [
+    "ready handoff mutates a disposable detached worktree and exports an applicable patch while main source bytes stay unchanged",
+    "replace_ast structurally matches syntax despite formatting trivia and remains bounded by Scout evidence",
+    "partial/blocked or stale Scout handoffs never create write authority",
+    "files outside the Scout handoff cannot enter the mutation",
+    "a touched file whose detached HEAD baseline differs from the Scout fingerprint is rejected",
+    "syntax failure after worktree mutation exports no patch and the worktree is removed",
+    "failed deterministic postconditions export no patch and the worktree is removed",
+    "patches above 120 changed lines are rejected",
+    "every success/failure path leaves no additional Git worktree behind"
+  ]
+}

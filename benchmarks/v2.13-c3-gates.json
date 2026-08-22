@@ -1,0 +1,16 @@
+{
+  "version": "v2.13-C3",
+  "protocol": "search-v2.13.6-scout-handoff",
+  "handoff_protocol": "scout-handoff-v1",
+  "goal": "freeze Scout discovery and create a deterministic trust boundary for v2.14 Patch Executor",
+  "gates": [
+    "search probe/emit budgets remain lexical 8 / graph 2 / total 10 / emit 4 / graph emit 1",
+    "every successful Scout search atomically updates one per-session handoff snapshot",
+    "handoff contains only repository-relative localized file paths",
+    "ordinary selected source files carry strong SHA-256 fingerprints and carried witness lines are rechecked against the hashed bytes",
+    "lexical evidence line hints and validated impact provenance survive the handoff",
+    "ready/partial/blocked status never hides refinement, retained unread files, partial evidence, stale files or weak fingerprints",
+    "handoff write failure is fail-open for read-only search and visible as a null handoff path",
+    "after this gate, new discovery heuristics require a reproduced post-freeze benchmark miss"
+  ]
+}

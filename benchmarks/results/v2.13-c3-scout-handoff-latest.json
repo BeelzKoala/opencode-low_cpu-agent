@@ -1,0 +1,20 @@
+{
+  "version": "v2.13-C3",
+  "protocol": "search-v2.13.6-scout-handoff",
+  "handoff_protocol": "scout-handoff-v1",
+  "verdict": "PASS",
+  "pass": 4,
+  "fail": 0,
+  "total_wall_s": 119,
+  "source_sha256": "e71a7b7f44b26a6a597590eb594fdc15cdf322282117509e3b0069e2aae0cb63",
+  "wins": {
+    "narrow_ready": true,
+    "broad_partial_explicit": true,
+    "impact_provenance_preserved": true,
+    "empty_localization_blocked": true,
+    "max_handoff_elapsed_ms": 1.19,
+    "lexical_probe_cap_preserved": true,
+    "graph_probe_cap_preserved": true,
+    "emit_cap_preserved": true
+  }
+}

@@ -21,3 +21,7 @@ strip = true
 [[bin]]
 name = "opencode-impact-index"
 path = "src/impact_index.rs"
+
+[[bin]]
+name = "opencode-patch-executor"
+path = "src/patch_executor.rs"
