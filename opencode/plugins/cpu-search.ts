@@ -6230,23 +6230,31 @@ export default {
           let noProgress = false
           let noProgressBlocked = false
 
-          if (state && novelty.novel.size < 1) {
+          const priorEvidenceReused = novelty.prior > 0
+          const noMeaningfulProgress =
+            novelty.novel.size < 1 && !meaningfulRouteProgress
+
+          if (state && noMeaningfulProgress) {
             state.consecutiveNoProgress += 1
             noProgress = true
             noProgressBlocked =
               state.consecutiveNoProgress >= MAX_CONSECUTIVE_NO_PROGRESS
 
+            const noProgressReason = priorEvidenceReused
+              ? "evidence_already_seen"
+              : "evidence_unavailable"
+
             if (noProgressBlocked) {
               content =
                 `SEARCH_BLOCKED reason=no_progress_loop ` +
                 `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=true no_progress_streak=${state.consecutiveNoProgress} ` +
+                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
                 `action=use_prior_or_change_search_dimension`
             } else {
               content =
-                `SEARCH_NO_PROGRESS reason=evidence_already_seen ` +
+                `SEARCH_NO_PROGRESS reason=${noProgressReason} ` +
                 `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=true no_progress_streak=${state.consecutiveNoProgress} ` +
+                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
                 `action=use_prior_or_change_search_dimension`
             }
 
