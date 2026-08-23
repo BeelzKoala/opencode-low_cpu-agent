@@ -425,13 +425,209 @@ fn git_apply_check(root: &Path, patch: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-fn git_diff_check(root: &Path, files: &[String]) -> Result<bool> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(root).args(["diff", "--check", "--"]);
-    for file in files {
-        cmd.arg(file);
+const MAX_GIT_DIAGNOSTIC_CHARS: usize = 2048;
+
+fn bounded_git_diagnostic(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (false, false) => format!(
+            "stdout={} stderr={}",
+            stdout.trim(),
+            stderr.trim()
+        ),
+        (false, true) => format!("stdout={}", stdout.trim()),
+        (true, false) => format!("stderr={}", stderr.trim()),
+        (true, true) => "no_output".to_string(),
+    };
+
+    let flattened = combined
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\0', "\\0");
+
+    flattened
+        .chars()
+        .take(MAX_GIT_DIAGNOSTIC_CHARS)
+        .collect()
+}
+
+fn git_index_blob(root: &Path, file: &str) -> Result<Vec<u8>> {
+    /*
+     * Read the stage-0 blob from the index rather than the mutated worktree.
+     * This gives us the immutable baseline bytes without depending on the
+     * main checkout contents.
+     */
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "-s", "-z", "--", file])
+        .output()
+        .context("cannot inspect git index")?;
+
+    anyhow::ensure!(output.status.success(), "git ls-files failed");
+
+    let mut stage0 = Vec::<String>::new();
+
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("malformed git index record")?;
+
+        let meta = std::str::from_utf8(&record[..tab])
+            .context("git index metadata is not UTF-8")?;
+
+        let mut fields = meta.split_whitespace();
+        let _mode = fields.next().context("git index mode missing")?;
+        let oid = fields.next().context("git index oid missing")?;
+        let stage = fields.next().context("git index stage missing")?;
+
+        if stage == "0" {
+            stage0.push(oid.to_string());
+        }
     }
-    Ok(cmd.output().context("cannot run git diff --check")?.status.success())
+
+    anyhow::ensure!(
+        stage0.len() == 1,
+        "expected exactly one stage-0 index entry"
+    );
+
+    let blob = Command::new("git")
+        .current_dir(root)
+        .args(["cat-file", "blob", &stage0[0]])
+        .output()
+        .context("cannot read baseline git blob")?;
+
+    anyhow::ensure!(blob.status.success(), "git cat-file failed");
+
+    Ok(blob.stdout)
+}
+
+fn baseline_is_consistent_crlf(root: &Path, file: &str) -> Result<bool> {
+    let bytes = git_index_blob(root, file)?;
+
+    let mut saw_crlf = false;
+    let mut saw_bare_lf = false;
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+
+        if idx > 0 && bytes[idx - 1] == b'\r' {
+            saw_crlf = true;
+        } else {
+            saw_bare_lf = true;
+        }
+    }
+
+    /*
+     * Mixed-EOL files deliberately remain on strict git diff --check.
+     * We only relax CR handling when the baseline establishes a consistent
+     * CRLF convention.
+     */
+    Ok(saw_crlf && !saw_bare_lf)
+}
+
+fn whitespace_policy_with_cr_at_eol(root: &Path) -> Result<String> {
+    /*
+     * Preserve repository-specific core.whitespace policy. Only replace the
+     * CR-at-EOL decision for a baseline-proven CRLF file.
+     */
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["config", "--get", "core.whitespace"])
+        .output()
+        .context("cannot read core.whitespace")?;
+
+    let raw = if output.status.success() {
+        std::str::from_utf8(&output.stdout)
+            .context("core.whitespace is not UTF-8")?
+            .trim()
+            .to_string()
+    } else if output.status.code() == Some(1) {
+        String::new()
+    } else {
+        anyhow::bail!("git config core.whitespace failed");
+    };
+
+    let mut parts = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            *part != "cr-at-eol" && *part != "-cr-at-eol"
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    parts.push("cr-at-eol".to_string());
+
+    Ok(parts.join(","))
+}
+
+fn git_diff_check_one(
+    root: &Path,
+    file: &str,
+    allow_cr_at_eol: bool,
+) -> Result<(bool, String)> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(root);
+
+    if allow_cr_at_eol {
+        let policy = whitespace_policy_with_cr_at_eol(root)?;
+        cmd.arg("-c")
+            .arg(format!("core.whitespace={policy}"));
+    }
+
+    let output = cmd
+        .args(["diff", "--check", "--"])
+        .arg(file)
+        .output()
+        .context("cannot run git diff --check")?;
+
+    if output.status.success() {
+        return Ok((true, String::new()));
+    }
+
+    Ok((
+        false,
+        format!(
+            "file={} cr_at_eol={} exit_code={} {}",
+            file,
+            allow_cr_at_eol,
+            output.status.code().unwrap_or(-1),
+            bounded_git_diagnostic(&output),
+        ),
+    ))
+}
+
+fn git_diff_check(
+    root: &Path,
+    files: &[String],
+) -> Result<(bool, String)> {
+    /*
+     * Check files independently because their baseline EOL policies may
+     * differ. MAX_CHANGED_FILES keeps the process cost bounded.
+     */
+    for file in files {
+        let allow_cr_at_eol =
+            baseline_is_consistent_crlf(root, file)?;
+
+        let (ok, diagnostic) =
+            git_diff_check_one(root, file, allow_cr_at_eol)?;
+
+        if !ok {
+            return Ok((false, diagnostic));
+        }
+    }
+
+    Ok((true, String::new()))
 }
 
 fn git_patch(root: &Path, files: &[String]) -> Result<String> {
@@ -586,7 +782,23 @@ fn mutate_in_worktree(
     }
 
     let changed_vec: Vec<String> = changed.iter().cloned().collect();
-    if !git_diff_check(worktree, &changed_vec).map_err(|_| "git_diff_check_failed".to_string())? {
+
+    let (diff_check_ok, diff_check_diagnostic) =
+        git_diff_check(worktree, &changed_vec)
+            .map_err(|err| {
+                eprintln!(
+                    "PATCH_EXECUTOR_DIAGNOSTIC kind=git_diff_check_error error={}",
+                    err
+                );
+                "git_diff_check_failed".to_string()
+            })?;
+
+    if !diff_check_ok {
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=git_diff_check_failed {}",
+            diff_check_diagnostic
+        );
+
         return Err("git_diff_check_failed".to_string());
     }
     let patch = git_patch(worktree, &changed_vec).map_err(|_| "git_diff_failed".to_string())?;
@@ -1003,4 +1215,124 @@ mod tests {
         assert_eq!(postcondition_holds("not_contains_exact", "abc", "z"), Some(true));
         assert_eq!(postcondition_holds("shell", "abc", "b"), None);
     }
+
+    fn diff_check_repo(name: &str, baseline: &[u8]) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "opencode-diff-check-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args(["config", "core.autocrlf", "false"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        std::fs::write(root.join("sample.ts"), baseline).unwrap();
+
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args(["add", "--", "sample.ts"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        root
+    }
+
+    #[test]
+    fn diff_check_accepts_preserved_crlf_baseline() {
+        let root = diff_check_repo(
+            "crlf-ok",
+            b"const value = oldName();\r\n",
+        );
+
+        std::fs::write(
+            root.join("sample.ts"),
+            b"const value = newName();\r\n",
+        )
+        .unwrap();
+
+        let (ok, diagnostic) =
+            git_diff_check(&root, &["sample.ts".to_string()])
+                .unwrap();
+
+        assert!(ok, "{diagnostic}");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_check_rejects_spaces_before_crlf() {
+        let root = diff_check_repo(
+            "crlf-space",
+            b"const value = oldName();\r\n",
+        );
+
+        std::fs::write(
+            root.join("sample.ts"),
+            b"const value = newName(); \r\n",
+        )
+        .unwrap();
+
+        let (ok, diagnostic) =
+            git_diff_check(&root, &["sample.ts".to_string()])
+                .unwrap();
+
+        assert!(!ok);
+        assert!(
+            diagnostic.contains("trailing whitespace"),
+            "{diagnostic}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_check_does_not_enable_crlf_for_lf_baseline() {
+        let root = diff_check_repo(
+            "lf-strict",
+            b"const value = oldName();\n",
+        );
+
+        std::fs::write(
+            root.join("sample.ts"),
+            b"const value = newName();\r\n",
+        )
+        .unwrap();
+
+        let (ok, diagnostic) =
+            git_diff_check(&root, &["sample.ts".to_string()])
+                .unwrap();
+
+        assert!(!ok);
+        assert!(
+            diagnostic.contains("trailing whitespace"),
+            "{diagnostic}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

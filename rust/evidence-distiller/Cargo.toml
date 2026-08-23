@@ -25,3 +25,11 @@ path = "src/impact_index.rs"
 [[bin]]
 name = "opencode-patch-executor"
 path = "src/patch_executor.rs"
+
+[[bin]]
+name = "opencode-patch-compiler"
+path = "src/patch_compiler.rs"
+
+[[bin]]
+name = "opencode-invariant-verifier"
+path = "src/invariant_verifier.rs"
