@@ -25,6 +25,22 @@ const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
 const QUERY_TIMEOUT_MS = 1500
 
+const QUERY_COMPILER_MIN_TOKENS = 3
+const QUERY_COMPILER_MAX_TOKENS = 6
+
+const QUERY_COMPILER_STOPWORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "into",
+  "when",
+  "then",
+  "this",
+  "that",
+])
+
 const DISTILLER_TIMEOUT_MS = 500
 const DISTILLER_MAX_STDOUT_BYTES = 512 * 1024
 const DISTILLER_RAW_BODY_PRESSURE_BYTES = 2500
@@ -132,7 +148,7 @@ const EDIT_CAPSULE_MAX_SCOPES = 4
 const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
 const EDIT_CAPSULE_WINDOW_RADIUS = 6
 
-const SEARCH_PROTOCOL = "search-v2.13.6-scout-handoff"
+const SEARCH_PROTOCOL = "search-v2.17.0-query-compiler"
 const AGENT_PROTOCOL = "cpu-agent-v2.6.4-permission-scoped-frontier"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -1279,6 +1295,263 @@ function queryPathTokens(query) {
   return [...tokens].slice(0, 8)
 }
 
+
+function escapeRegexLiteral(text) {
+  return String(text ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function queryCompilerTokens(query) {
+  const chunks = String(query ?? "").match(
+    /[A-Za-z][A-Za-z0-9_-]{2,}/g,
+  )
+
+  if (!chunks) return []
+
+  const tokens = []
+  const seen = new Set()
+
+  const add = (raw) => {
+    const token = String(raw ?? "").toLowerCase()
+
+    if (
+      token.length < 3 ||
+      token.length > 32 ||
+      QUERY_COMPILER_STOPWORDS.has(token) ||
+      seen.has(token)
+    ) {
+      return
+    }
+
+    seen.add(token)
+    tokens.push(token)
+  }
+
+  for (const chunk of chunks) {
+    const split = chunk
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[_\-\s]+/)
+
+    for (const part of split) add(part)
+  }
+
+  return tokens.slice(0, QUERY_COMPILER_MAX_TOKENS)
+}
+
+function queryCompilerEligible(query) {
+  const text = String(query ?? "")
+  const tokens = queryCompilerTokens(text)
+
+  return (
+    text.includes(".*") &&
+    tokens.length >= QUERY_COMPILER_MIN_TOKENS
+  )
+}
+
+function queryCompilerCasefoldRegex(query) {
+  return `(?i:${String(query ?? "")})`
+}
+
+function queryCompilerAnchorToken(tokens) {
+  return [...tokens].sort(
+    (a, b) => b.length - a.length || a.localeCompare(b),
+  )[0] ?? null
+}
+
+function queryCompilerProbeResult(
+  result,
+  requestedQuery,
+  matchMode,
+) {
+  const fallback = matchMode !== "exact"
+
+  return {
+    ...result,
+    query: requestedQuery,
+    matchMode,
+    matches: (result?.matches ?? []).map((match) => ({
+      ...match,
+
+      // A fallback hit is real source evidence, but it is NOT an exact
+      // match for the model-supplied regex. Never allow it to masquerade
+      // as exact structural replacement evidence.
+      exactSpans: fallback ? [] : (match.exactSpans ?? []),
+      matchTexts: fallback ? [] : (match.matchTexts ?? []),
+    })),
+  }
+}
+
+function restrictProbeResultToTargets(result, targets) {
+  const allowed = new Set(
+    (targets ?? []).map((file) => evidenceFileKey(file)),
+  )
+
+  return {
+    ...result,
+    matches: (result?.matches ?? []).filter((match) =>
+      allowed.has(evidenceFileKey(match.file)),
+    ),
+  }
+}
+
+async function runCompiledDiscovery(
+  root,
+  query,
+  queryIndex,
+  target,
+  glob,
+) {
+  const exact = await runFileDiscovery(
+    root,
+    query,
+    queryIndex,
+    target,
+    glob,
+  )
+
+  const exactResult = {
+    ...exact,
+    query,
+    requestedQuery: query,
+    effectiveQuery: query,
+    cacheQuery: `exact:${query}`,
+    matchMode: "exact",
+    compilerTokens: [],
+    compiledProbe: null,
+  }
+
+  const exactCompleteZero =
+    exact.scanComplete === true &&
+    exact.timedOut !== true &&
+    exact.scanCapped !== true &&
+    !exact.error &&
+    (exact.files?.length ?? 0) === 0
+
+  if (
+    !exactCompleteZero ||
+    !queryCompilerEligible(query)
+  ) {
+    return exactResult
+  }
+
+  // Stage 1: preserve regex semantics and only relax case.
+  const foldedQuery = queryCompilerCasefoldRegex(query)
+
+  const folded = await runFileDiscovery(
+    root,
+    foldedQuery,
+    queryIndex,
+    target,
+    glob,
+  )
+
+  if ((folded.files?.length ?? 0) > 0) {
+    return {
+      ...folded,
+      query,
+      requestedQuery: query,
+      effectiveQuery: foldedQuery,
+      cacheQuery: `casefold:${foldedQuery}`,
+      matchMode: "casefold",
+      compilerTokens: queryCompilerTokens(query),
+      compiledProbe: null,
+    }
+  }
+
+  // Do not build stronger routing claims on top of an incomplete fallback.
+  const foldedCompleteZero =
+    folded.scanComplete === true &&
+    folded.timedOut !== true &&
+    folded.scanCapped !== true &&
+    !folded.error &&
+    (folded.files?.length ?? 0) === 0
+
+  if (!foldedCompleteZero) {
+    return exactResult
+  }
+
+  // Stage 2: order-independent recovery, but only when ALL significant
+  // query tokens occur on the SAME physical source line.
+  //
+  // One longest token is used as a cheap rg anchor; JS then validates
+  // complete co-occurrence. This avoids permutations/lookaheads and keeps
+  // the operation bounded to one additional rg scan.
+  const tokens = queryCompilerTokens(query)
+
+  if (tokens.length < QUERY_COMPILER_MIN_TOKENS) {
+    return exactResult
+  }
+
+  const anchorToken = queryCompilerAnchorToken(tokens)
+  if (!anchorToken) return exactResult
+
+  const anchorQuery =
+    `(?i:${escapeRegexLiteral(anchorToken)})`
+
+  const anchorProbe = await runQuery(
+    root,
+    anchorQuery,
+    queryIndex,
+    [target],
+    glob,
+  )
+
+  if (
+    anchorProbe.scanComplete !== true ||
+    anchorProbe.timedOut === true ||
+    anchorProbe.scanCapped === true ||
+    anchorProbe.error
+  ) {
+    return exactResult
+  }
+
+  const matches = (anchorProbe.matches ?? [])
+    .filter((match) => {
+      const line = String(match?.text ?? "").toLowerCase()
+      return tokens.every((token) => line.includes(token))
+    })
+    .map((match) => ({
+      ...match,
+      exactSpans: [],
+      matchTexts: [],
+    }))
+
+  if (matches.length < 1) {
+    return exactResult
+  }
+
+  const files = [
+    ...new Set(
+      matches
+        .map((match) => match.file)
+        .filter((file) => typeof file === "string" && file.length > 0),
+    ),
+  ]
+
+  const compiledProbe = {
+    ...anchorProbe,
+    query,
+    requestedQuery: query,
+    matchMode: "token_line_cooccurrence",
+    matches,
+  }
+
+  return {
+    query,
+    requestedQuery: query,
+    effectiveQuery: anchorQuery,
+    cacheQuery: `token-line:${tokens.join("|")}`,
+    queryIndex,
+    files,
+    timedOut: false,
+    scanCapped: false,
+    error: null,
+    scanComplete: true,
+    matchMode: "token_line_cooccurrence",
+    compilerTokens: tokens,
+    compiledProbe,
+  }
+}
+
 function pathAffinity(file, queryIndices, queryTokensByIndex) {
   const normalized = evidenceFileKey(file).toLowerCase()
   const base = path.posix.basename(normalized)
@@ -1489,8 +1762,12 @@ function discoverySummaryFor(results) {
     const errorDetail = result.error
       ? ` error=${JSON.stringify(clipLine(result.error, 240))}`
       : ""
+    const matchDetail =
+      result.matchMode && result.matchMode !== "exact"
+        ? ` match=${result.matchMode}`
+        : ""
 
-    return `Q${result.queryIndex + 1} files=${count} discovery=${state}${errorDetail}`
+    return `Q${result.queryIndex + 1} files=${count} discovery=${state}${matchDetail}${errorDetail}`
   })
 }
 
@@ -4734,8 +5011,12 @@ function querySummaryFor(results) {
     const errorDetail = result.error
       ? ` error=${JSON.stringify(clipLine(result.error, 240))}`
       : ""
+    const matchDetail =
+      result.matchMode && result.matchMode !== "exact"
+        ? ` match=${result.matchMode}`
+        : ""
 
-    return `Q${result.queryIndex + 1} probed_line_hits=${count} probe_scan=${state}${errorDetail}`
+    return `Q${result.queryIndex + 1} probed_line_hits=${count} probe_scan=${state}${matchDetail}${errorDetail}`
   })
 }
 
@@ -5442,7 +5723,13 @@ export default {
           const discoveryStarted = performance.now()
           const discoveryResults = await Promise.all(
             queries.map((query, index) =>
-              runFileDiscovery(root, query, index, target, glob),
+              runCompiledDiscovery(
+                root,
+                query,
+                index,
+                target,
+                glob,
+              ),
             ),
           )
           const discoveryElapsedMs =
@@ -5458,40 +5745,91 @@ export default {
             rankedFiles.length === probeFileSet.size
 
           const queryPlan = queries.map((query, index) => {
+            const discoveryResult = discoveryResults.find(
+              (result) => result.queryIndex === index,
+            )
+
+            const effectiveQuery =
+              discoveryResult?.effectiveQuery ?? query
+            const matchMode =
+              discoveryResult?.matchMode ?? "exact"
+            const cacheQuery =
+              discoveryResult?.cacheQuery ?? effectiveQuery
+
             const targets = probeFiles
               .filter((entry) => entry.queries.has(index))
               .map((entry) => entry.file)
               .sort()
+
             const cacheKey = queryCacheKey(
               root,
-              query,
+              cacheQuery,
               target,
               glob,
               targets,
             )
-            const cached = state?.queryCache?.get(cacheKey) ?? null
+
+            const cached =
+              state?.queryCache?.get(cacheKey) ?? null
+
+            const compiledProbe =
+              discoveryResult?.compiledProbe
+                ? restrictProbeResultToTargets(
+                    discoveryResult.compiledProbe,
+                    targets,
+                  )
+                : null
 
             return {
               query,
+              effectiveQuery,
+              matchMode,
               index,
               targets,
               cacheKey,
               cached,
+              compiledProbe,
             }
           })
 
-          const freshPlan = queryPlan.filter((item) => !item.cached)
-          const reusedQueryCount = queryPlan.length - freshPlan.length
-          const executedQueryCount = freshPlan.filter(
-            (item) => item.targets.length > 0,
+          const freshPlan = queryPlan.filter(
+            (item) => !item.cached && !item.compiledProbe,
+          )
+
+          const reusedQueryCount = queryPlan.filter(
+            (item) => Boolean(item.cached),
           ).length
 
+          const compiledQueryCount = queryPlan.filter(
+            (item) => Boolean(item.compiledProbe),
+          ).length
+
+          const executedQueryCount =
+            freshPlan.filter(
+              (item) => item.targets.length > 0,
+            ).length +
+            compiledQueryCount
+
           const refineStarted = performance.now()
+
           const freshResults = await Promise.all(
-            freshPlan.map((item) =>
-              runQuery(root, item.query, item.index, item.targets, glob),
-            ),
+            freshPlan.map(async (item) => {
+              const raw = await runQuery(
+                root,
+                item.effectiveQuery,
+                item.index,
+                item.targets,
+                glob,
+              )
+
+              return queryCompilerProbeResult(
+                raw,
+                item.query,
+                item.matchMode,
+              )
+            }),
           )
+
           const refineElapsedMs =
             Math.round((performance.now() - refineStarted) * 100) / 100
 
@@ -5500,20 +5838,50 @@ export default {
           )
 
           if (state) {
-            for (const item of freshPlan) {
-              const result = freshByIndex.get(item.index)
-              if (result) rememberQueryResult(state, item.cacheKey, result)
+            for (const item of queryPlan) {
+              if (item.cached) continue
+
+              const result =
+                item.compiledProbe ??
+                freshByIndex.get(item.index)
+
+              if (result) {
+                rememberQueryResult(
+                  state,
+                  item.cacheKey,
+                  result,
+                )
+              }
             }
           }
 
           const probeResults = queryPlan
             .map((item) => {
               if (item.cached) {
-                return reindexQueryResult(item.cached, item.index, true)
+                return reindexQueryResult(
+                  item.cached,
+                  item.index,
+                  true,
+                )
+              }
+
+              if (item.compiledProbe) {
+                return reindexQueryResult(
+                  item.compiledProbe,
+                  item.index,
+                  false,
+                )
               }
 
               const result = freshByIndex.get(item.index)
-              return result ? reindexQueryResult(result, item.index, false) : null
+
+              return result
+                ? reindexQueryResult(
+                    result,
+                    item.index,
+                    false,
+                  )
+                : null
             })
             .filter(Boolean)
             .sort((a, b) => a.queryIndex - b.queryIndex)
@@ -6486,7 +6854,16 @@ export default {
               capped: result.scanCapped,
               timed_out: result.timedOut,
               error: result.error ?? null,
+              match_mode: result.matchMode ?? "exact",
+              effective_query: result.effectiveQuery ?? result.query,
+              compiler_tokens: result.compilerTokens ?? [],
             })),
+            query_compiler_fallbacks: discoveryResults
+              .filter((result) => result.matchMode && result.matchMode !== "exact")
+              .map((result) => ({
+                query_index: result.queryIndex,
+                match_mode: result.matchMode,
+              })),
             reused_query_count: reusedQueryCount,
             executed_query_count: executedQueryCount,
             reused_queries: queryPlan
