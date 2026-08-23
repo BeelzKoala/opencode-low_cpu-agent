@@ -101,6 +101,21 @@ const INVARIANT_VERIFIER_TIMEOUT_MS = 5000
 const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
 const MAX_PATCH_ATTEMPTS_PER_TURN = 2
 
+// v2.16-B: deterministic runtime identity.
+// The installer is authoritative for cryptographic hashes. The plugin reads
+// the small manifest and performs cheap path/size checks; it never hashes
+// ~40 MB binaries on the patch hot path.
+const RUNTIME_STACK_PROTOCOL = "runtime-stack-v1"
+const RUNTIME_STACK_MANIFEST = ".runtime-stack-v1.json"
+const RUNTIME_STACK_COMPONENTS = {
+  compiler: "opencode-patch-compiler",
+  executor: "opencode-patch-executor",
+  verifier: "opencode-invariant-verifier",
+  impact_index: "opencode-impact-index",
+}
+
+let runtimeStackManifestCache = null
+
 // v2.15-B: explicit causal controller. The model never chooses between tools
 // when deterministic preconditions already identify the only valid next action.
 const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
@@ -2012,6 +2027,169 @@ function runDistiller(root, hits) {
       })
     }
   })
+}
+
+
+function runtimeStackDirectory() {
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(home, ".local", "libexec", "opencode-cpu-agent")
+}
+
+function emptyRuntimeStackIdentity(status) {
+  return {
+    runtime_stack_protocol: RUNTIME_STACK_PROTOCOL,
+    runtime_stack_status: status,
+    runtime_git_head: null,
+    runtime_manifest_sha256: null,
+    runtime_manifest_compiler_sha256: null,
+    runtime_manifest_executor_sha256: null,
+    runtime_manifest_verifier_sha256: null,
+    runtime_manifest_impact_index_sha256: null,
+  }
+}
+
+function runtimeStackOverridesActive() {
+  return [
+    "OPENCODE_PATCH_COMPILER",
+    "OPENCODE_PATCH_EXECUTOR",
+    "OPENCODE_INVARIANT_VERIFIER",
+    "OPENCODE_IMPACT_INDEX",
+  ].some((name) => {
+    const value = process.env[name]
+    return typeof value === "string" && value.length > 0
+  })
+}
+
+function parseRuntimeStackManifest(raw) {
+  let manifest
+  try {
+    manifest = JSON.parse(raw)
+  } catch {
+    return null
+  }
+
+  if (
+    manifest?.protocol !== RUNTIME_STACK_PROTOCOL ||
+    typeof manifest?.git_head !== "string" ||
+    !manifest.git_head.length ||
+    typeof manifest?.components !== "object" ||
+    manifest.components === null
+  ) {
+    return null
+  }
+
+  const records = {}
+  for (const [key, binary] of Object.entries(RUNTIME_STACK_COMPONENTS)) {
+    const record = manifest.components[binary]
+    if (
+      typeof record !== "object" ||
+      record === null ||
+      typeof record.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(record.sha256) ||
+      !Number.isSafeInteger(record.bytes) ||
+      record.bytes < 0
+    ) {
+      return null
+    }
+    records[key] = {
+      binary,
+      sha256: record.sha256,
+      bytes: record.bytes,
+    }
+  }
+
+  return {
+    git_head: manifest.git_head,
+    records,
+  }
+}
+
+async function runtimeStackIdentity() {
+  const dir = runtimeStackDirectory()
+  if (!dir) return emptyRuntimeStackIdentity("home_unavailable")
+
+  const manifestPath = path.join(dir, RUNTIME_STACK_MANIFEST)
+
+  try {
+    const manifestStat = await stat(manifestPath)
+    if (!manifestStat.isFile()) {
+      return emptyRuntimeStackIdentity("manifest_missing")
+    }
+
+    const cacheKey = `${manifestStat.size}:${manifestStat.mtimeMs}`
+    let cached = runtimeStackManifestCache
+
+    if (!cached || cached.path !== manifestPath || cached.key !== cacheKey) {
+      const raw = await readFile(manifestPath, "utf8")
+      const parsed = parseRuntimeStackManifest(raw)
+
+      cached = {
+        path: manifestPath,
+        key: cacheKey,
+        parsed,
+        manifestSha256: createHash("sha256").update(raw).digest("hex"),
+      }
+      runtimeStackManifestCache = cached
+    }
+
+    if (!cached.parsed) {
+      return emptyRuntimeStackIdentity("manifest_invalid")
+    }
+
+    const identity = {
+      runtime_stack_protocol: RUNTIME_STACK_PROTOCOL,
+      runtime_stack_status: "manifest_loaded",
+      runtime_git_head: cached.parsed.git_head,
+      runtime_manifest_sha256: cached.manifestSha256,
+      runtime_manifest_compiler_sha256: cached.parsed.records.compiler.sha256,
+      runtime_manifest_executor_sha256: cached.parsed.records.executor.sha256,
+      runtime_manifest_verifier_sha256: cached.parsed.records.verifier.sha256,
+      runtime_manifest_impact_index_sha256: cached.parsed.records.impact_index.sha256,
+    }
+
+    // An override can point at binaries unrelated to the installed manifest.
+    // Never present manifest hashes as actual runtime identity in that case.
+    if (runtimeStackOverridesActive()) {
+      return {
+        ...identity,
+        runtime_stack_status: "override_unverified",
+      }
+    }
+
+    for (const record of Object.values(cached.parsed.records)) {
+      let binaryStat
+      try {
+        binaryStat = await stat(path.join(dir, record.binary))
+      } catch {
+        return {
+          ...identity,
+          runtime_stack_status: "binary_missing",
+        }
+      }
+
+      if (!binaryStat.isFile()) {
+        return {
+          ...identity,
+          runtime_stack_status: "binary_missing",
+        }
+      }
+
+      if (binaryStat.size !== record.bytes) {
+        return {
+          ...identity,
+          runtime_stack_status: "binary_size_mismatch",
+        }
+      }
+    }
+
+    return {
+      ...identity,
+      runtime_stack_status: "manifest_size_checked",
+    }
+  } catch {
+    return emptyRuntimeStackIdentity("manifest_missing")
+  }
 }
 
 
@@ -6536,6 +6714,7 @@ export default {
               : null
           const state = getSessionState(sessionID)
           const root = await rootForTool(ctx, toolContext, sessionID, state)
+          const runtimeIdentity = await runtimeStackIdentity()
 
           const trace = async (record) => {
             await writeProjectTrace(root, "executor-trace.jsonl", {
@@ -6552,6 +6731,7 @@ export default {
               execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
               execution_state: state?.executionState ?? null,
               execution_reason: state?.executionReason ?? null,
+              ...runtimeIdentity,
               ...record,
               tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
             })
