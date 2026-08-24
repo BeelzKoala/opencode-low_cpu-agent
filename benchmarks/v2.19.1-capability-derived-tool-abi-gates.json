@@ -1,0 +1,18 @@
+{
+  "version": "v2.19.1-r3",
+  "protocol": "capability-derived-tool-abi-v1",
+  "goal": "remove zero-information authority fields from model intent so invalid mutation shapes are not representable",
+  "invariants": {
+    "model_supplies_file": false,
+    "model_supplies_symbol": false,
+    "model_supplies_scope": false,
+    "rename_scope": "deterministically_handoff",
+    "replace_node_scope_field": "impossible",
+    "runtime_shape_validator_remains_authoritative": true,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false,
+    "scout_changed": false,
+    "model_calls_added": 0
+  }
+}

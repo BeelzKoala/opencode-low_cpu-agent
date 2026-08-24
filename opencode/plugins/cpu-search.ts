@@ -3419,6 +3419,7 @@ function validateMutationShape(input) {
       "before",
       "replacement",
       "after",
+      "scope",
     ].filter(has)
 
     if (forbidden.length > 0) {
@@ -3741,7 +3742,7 @@ async function materializeCapabilityBoundMutation(
       ? { replacement: input.replacement }
       : {}),
     ...(typeof input.new_name === "string" ? { new_name: input.new_name } : {}),
-    ...(typeof input.scope === "string" ? { scope: input.scope } : {}),
+    ...(input.kind === "rename_symbol" ? { scope: "handoff" } : {}),
   }
 
   return {
@@ -9500,6 +9501,7 @@ export default {
         description:
           "Submit exactly ONE semantic mutation inside the single mutation-authorized CAPSULE_SCOPE. " +
           "The target file and symbol are implicit capabilities and MUST NOT be supplied. " +
+          "Mutation scope is also capability-derived and MUST NOT be supplied; rename_symbol is deterministically bound to handoff scope. " +
           "Prefer replace_node: before is a canonical exact source slice, never a pattern; only outer whitespace and line endings are normalized deterministically. Copy the smallest complete structural slice from the authorized scope and provide only its replacement. " +
           "A slice may be one named AST node, a bounded contiguous sibling sequence, or the full authorized owner when copied exactly. " +
           "The deterministic compiler NEVER expands the physical edit beyond before; it certifies exact byte offsets and the verifier re-derives them independently. " +
@@ -9531,10 +9533,6 @@ export default {
               type: "string",
               minLength: 1,
               maxLength: 256,
-            },
-            scope: {
-              type: "string",
-              enum: ["handoff"],
             },
           },
           required: ["kind"],
