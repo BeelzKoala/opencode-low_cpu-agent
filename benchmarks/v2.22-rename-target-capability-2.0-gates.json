@@ -1,0 +1,22 @@
+{
+  "protocol": "v2.22-rename-target-capability-2.0",
+  "goal": "bind global rename to a separately sealed exact symbol identity instead of inheriting the replace-node owner",
+  "invariants": {
+    "replace_target_is_rename_target": false,
+    "rename_target_source": "complete_exact_identifier_structural_definition",
+    "heuristic_query_formulation_can_authorize_rename": false,
+    "multiple_exact_definition_targets": "safe_fail",
+    "partial_handoff_can_authorize_rename": false,
+    "target_requires_strong_current_sha256": true,
+    "target_revalidated_before_compiler": true,
+    "model_supplies_old_symbol": false,
+    "model_supplies_file": false,
+    "model_supplies_scope": false,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false,
+    "model_call_budget_changed": false,
+    "search_budget_changed": false,
+    "semantic_repair_budget_changed": false
+  }
+}
