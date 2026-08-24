@@ -25,7 +25,7 @@ const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
 const QUERY_TIMEOUT_MS = 1500
 
-const QUERY_COMPILER_MIN_TOKENS = 3
+const QUERY_COMPILER_MIN_TOKENS = 2
 const QUERY_COMPILER_MAX_TOKENS = 6
 
 const QUERY_COMPILER_STOPWORDS = new Set([
@@ -137,6 +137,7 @@ let runtimeStackManifestCache = null
 const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
 const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.4-permission-scoped"
 const EDIT_CAPSULE_PROTOCOL = "edit-capsule-v1"
+const EDIT_CAPSULE_RENDER_CONTRACT = "transactional-scope-v1"
 const PROOF_OBLIGATION_PROTOCOL = "proof-obligation-v1"
 const EXEC_STATE_LOCATE = "locate"
 const EXEC_STATE_MUTATE = "mutate"
@@ -148,7 +149,7 @@ const EDIT_CAPSULE_MAX_SCOPES = 4
 const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
 const EDIT_CAPSULE_WINDOW_RADIUS = 6
 
-const SEARCH_PROTOCOL = "search-v2.17.0-query-compiler"
+const SEARCH_PROTOCOL = "search-v2.17.1-evidence-boundary"
 const AGENT_PROTOCOL = "cpu-agent-v2.6.4-permission-scoped-frontier"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -172,6 +173,28 @@ const EXCLUDES = [
   "!dist/**",
   "!build/**",
 ]
+
+function appendSearchGlobs(args, glob) {
+  // ripgrep glob precedence is order-sensitive.
+  // User glob constrains search first; reserved exclusions are applied last
+  // and are therefore authoritative.
+  if (glob) args.push("-g", glob)
+
+  for (const pattern of EXCLUDES) {
+    args.push("-g", pattern)
+  }
+}
+
+function isReservedAgentEvidencePath(raw) {
+  const normalized = String(raw ?? "")
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+
+  return (
+    normalized === ".opencode" ||
+    normalized.startsWith(".opencode/")
+  )
+}
 
 function bytes(text) {
   return Buffer.byteLength(String(text ?? ""), "utf8")
@@ -457,6 +480,85 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
   }
 }
 
+function scoutMutationLocalizationEligibility(state, scoutHandoff) {
+  const latest =
+    state?.scoutSearches?.[state.scoutSearches.length - 1] ?? null
+
+  if (!scoutHandoff?.path) {
+    return {
+      eligible: false,
+      reason: "handoff_unavailable",
+    }
+  }
+
+  if (scoutHandoff.status === "blocked") {
+    return {
+      eligible: false,
+      reason: "handoff_blocked",
+    }
+  }
+
+  if (
+    Array.isArray(scoutHandoff.blockingReasons) &&
+    scoutHandoff.blockingReasons.length > 0
+  ) {
+    return {
+      eligible: false,
+      reason: "handoff_has_blockers",
+    }
+  }
+
+  if ((scoutHandoff.files ?? 0) < 1) {
+    return {
+      eligible: false,
+      reason: "no_localized_files",
+    }
+  }
+
+  if (!latest) {
+    return {
+      eligible: false,
+      reason: "search_snapshot_unavailable",
+    }
+  }
+
+  if (latest.lexical_discovery_complete !== true) {
+    return {
+      eligible: false,
+      reason: "lexical_discovery_incomplete",
+    }
+  }
+
+  if (latest.scan_complete !== true) {
+    return {
+      eligible: false,
+      reason: "source_scan_incomplete",
+    }
+  }
+
+  if (latest.selected_scan_complete !== true) {
+    return {
+      eligible: false,
+      reason: "selected_scan_incomplete",
+    }
+  }
+
+  if (latest.refinement_required === true) {
+    return {
+      eligible: false,
+      reason: "refinement_required",
+    }
+  }
+
+  return {
+    eligible: true,
+    reason:
+      scoutHandoff.status === "ready"
+        ? "ready_handoff_complete_source_scan"
+        : "partial_handoff_complete_source_scan",
+  }
+}
+
 const sessionStates = new Map()
 
 function dropSessionState(sessionID) {
@@ -514,9 +616,14 @@ function getSessionState(sessionID) {
       scoutSearches: [],
       scoutFiles: new Map(),
       scoutHandoffPath: null,
+      mutationAttempts: 0,
+      repairAttempts: 0,
+      compilerRuns: 0,
       patchAttempts: 0,
+      executorRuns: 0,
       executedPatches: 0,
       patchSignatures: new Set(),
+      contractFailureSignatures: new Set(),
       patchAccepted: false,
       patchReceiptPath: null,
       executionState: EXEC_STATE_LOCATE,
@@ -555,9 +662,14 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.scoutSearches = []
   state.scoutFiles = new Map()
   state.scoutHandoffPath = null
+  state.mutationAttempts = 0
+  state.repairAttempts = 0
+  state.compilerRuns = 0
   state.patchAttempts = 0
+  state.executorRuns = 0
   state.executedPatches = 0
   state.patchSignatures.clear()
+  state.contractFailureSignatures.clear()
   state.patchAccepted = false
   state.patchReceiptPath = null
   state.executionState = EXEC_STATE_LOCATE
@@ -1098,7 +1210,15 @@ async function safeTarget(root, raw = ".") {
     throw new Error("path must be a non-empty relative path")
   }
 
-  if (path.isAbsolute(raw)) throw new Error("absolute paths are disabled")
+  if (path.isAbsolute(raw)) {
+    const resolvedAbsolute = await realpath(raw)
+
+    if (resolvedAbsolute === root) {
+      return "."
+    }
+
+    throw new Error("absolute paths are disabled")
+  }
 
   const candidate = path.resolve(root, raw)
   const resolved = await realpath(candidate)
@@ -1183,8 +1303,7 @@ function runFileDiscovery(root, query, queryIndex, target, glob) {
       "never",
     ]
 
-    for (const pattern of EXCLUDES) args.push("-g", pattern)
-    if (glob) args.push("-g", glob)
+    appendSearchGlobs(args, glob)
     args.push("--", query, target)
 
     const child = spawn("rg", args, {
@@ -1206,6 +1325,7 @@ function runFileDiscovery(root, query, queryIndex, target, glob) {
 
     function consume(file) {
       if (!file || scanCapped) return
+      if (isReservedAgentEvidencePath(file)) return
 
       // Exactly FILE_DISCOVERY_CAP_PER_QUERY files are complete; observing
       // one more file proves that lexical file discovery is truncated.
@@ -1338,13 +1458,12 @@ function queryCompilerTokens(query) {
 }
 
 function queryCompilerEligible(query) {
-  const text = String(query ?? "")
-  const tokens = queryCompilerTokens(text)
+  const tokens = queryCompilerTokens(query)
 
-  return (
-    text.includes(".*") &&
-    tokens.length >= QUERY_COMPILER_MIN_TOKENS
-  )
+  // This fallback only runs after authoritative exact-zero discovery.
+  // Requiring model-generated `.*` made ordinary natural-language
+  // compound queries unnecessarily expensive.
+  return tokens.length >= QUERY_COMPILER_MIN_TOKENS
 }
 
 function queryCompilerCasefoldRegex(query) {
@@ -1839,8 +1958,7 @@ function runQuery(root, query, queryIndex, targets, glob) {
       "--max-columns-preview",
     ]
 
-    for (const pattern of EXCLUDES) args.push("-g", pattern)
-    if (glob) args.push("-g", glob)
+    appendSearchGlobs(args, glob)
     args.push("--", query, ...searchTargets)
 
     const child = spawn("rg", args, {
@@ -1875,6 +1993,7 @@ function runQuery(root, query, queryIndex, targets, glob) {
       const file = event.data?.path?.text
       const lineNo = event.data?.line_number
       if (typeof file !== "string" || !Number.isInteger(lineNo)) return
+      if (isReservedAgentEvidencePath(file)) return
 
       // Exactly LINE_HIT_CAP_PER_QUERY hits are complete; the next hit proves truncation.
       if (matches.length >= LINE_HIT_CAP_PER_QUERY) {
@@ -2072,6 +2191,44 @@ function distillerHitsFromMerged(hits) {
       a.file.localeCompare(b.file) ||
       a.start_byte - b.start_byte ||
       a.end_byte - b.end_byte ||
+      a.query - b.query,
+  )
+}
+
+function ownerRecoveryHitsFromMerged(hits) {
+  const unique = new Map()
+
+  for (const hit of hits.values()) {
+    if (
+      typeof hit?.file !== "string" ||
+      hit.file.length < 1 ||
+      !Number.isInteger(hit?.line) ||
+      hit.line < 1
+    ) {
+      continue
+    }
+
+    const queryIndex = [...(hit.queries ?? [])]
+      .filter((value) => Number.isInteger(value) && value >= 0)
+      .sort((a, b) => a - b)[0]
+
+    if (!Number.isInteger(queryIndex)) continue
+
+    const key = `${hit.file}\0${hit.line}`
+
+    if (!unique.has(key)) {
+      unique.set(key, {
+        file: hit.file,
+        line: hit.line,
+        query: queryIndex + 1,
+      })
+    }
+  }
+
+  return [...unique.values()].sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.line - b.line ||
       a.query - b.query,
   )
 }
@@ -2501,6 +2658,399 @@ function patchPlanSignature(compiled) {
     .slice(0, 24)
 }
 
+
+function mutationFieldPresent(input, key) {
+  return Object.prototype.hasOwnProperty.call(input ?? {}, key)
+}
+
+function mutationShapeFailure(kind, detail) {
+  const normalizedKind =
+    typeof kind === "string" && kind.length > 0
+      ? kind
+      : "unknown"
+
+  return {
+    ok: false,
+    reason: "mutation_shape_invalid",
+    detail,
+    signature: `${normalizedKind}:${detail}`,
+  }
+}
+
+function validateMutationShape(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return mutationShapeFailure(
+      "unknown",
+      "input_not_object",
+    )
+  }
+
+  const has = (key) =>
+    mutationFieldPresent(input, key)
+
+  // Mutation target is capability-bound in 2.0.
+  // A model must never choose or repeat file/symbol identity.
+  if (has("file") || has("symbol")) {
+    return mutationShapeFailure(
+      input.kind,
+      "target_fields_forbidden_capability_bound",
+    )
+  }
+
+  if (input.kind === "replace_node") {
+    const missing = []
+
+    if (
+      typeof input.before !== "string" ||
+      input.before.length < 1
+    ) {
+      missing.push("before")
+    }
+
+    if (typeof input.replacement !== "string") {
+      missing.push("replacement")
+    }
+
+    if (missing.length > 0) {
+      return mutationShapeFailure(
+        input.kind,
+        `replace_node_requires_${missing.join("_")}`,
+      )
+    }
+
+    const forbidden = [
+      "body",
+      "after",
+      "new_name",
+      "scope",
+    ].filter(has)
+
+    if (forbidden.length > 0) {
+      return mutationShapeFailure(
+        input.kind,
+        `replace_node_forbids_${forbidden.sort().join("_")}`,
+      )
+    }
+
+    return { ok: true }
+  }
+
+  if (input.kind === "rename_symbol") {
+    if (
+      typeof input.new_name !== "string" ||
+      input.new_name.length < 1
+    ) {
+      return mutationShapeFailure(
+        input.kind,
+        "rename_symbol_requires_new_name",
+      )
+    }
+
+    const forbidden = [
+      "body",
+      "before",
+      "replacement",
+      "after",
+    ].filter(has)
+
+    if (forbidden.length > 0) {
+      return mutationShapeFailure(
+        input.kind,
+        `rename_symbol_forbids_${forbidden.sort().join("_")}`,
+      )
+    }
+
+    return { ok: true }
+  }
+
+  return mutationShapeFailure(
+    input.kind,
+    "mutation_kind_unknown",
+  )
+}
+
+function normalizeMutationFile(value) {
+  return String(value ?? "")
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+}
+
+function canonicalMutationFile(root, value) {
+  if (
+    typeof root !== "string" ||
+    root.length < 1 ||
+    typeof value !== "string" ||
+    value.length < 1
+  ) {
+    return null
+  }
+
+  const normalizedInput = value.replaceAll("\\", "/")
+  const rootAbs = path.resolve(root)
+
+  const candidateAbs = path.isAbsolute(normalizedInput)
+    ? path.resolve(normalizedInput)
+    : path.resolve(rootAbs, normalizedInput)
+
+  const rel = path.relative(rootAbs, candidateAbs)
+
+  if (
+    !rel ||
+    rel === ".." ||
+    rel.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(rel)
+  ) {
+    return null
+  }
+
+  return normalizeMutationFile(rel)
+}
+
+async function readAuthorizedEditCapsule(root, state) {
+  const rel = state?.editCapsulePath
+
+  if (
+    typeof root !== "string" ||
+    typeof rel !== "string" ||
+    rel.length < 1 ||
+    path.isAbsolute(rel)
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_unavailable",
+    }
+  }
+
+  const normalized = normalizeMutationFile(rel)
+
+  if (!normalized.startsWith(".opencode/edit-capsules/")) {
+    return {
+      ok: false,
+      reason: "edit_capsule_path_invalid",
+    }
+  }
+
+  const capsuleRoot = path.resolve(
+    root,
+    ".opencode",
+    "edit-capsules",
+  )
+
+  const absolute = path.resolve(root, normalized)
+
+  if (
+    absolute !== capsuleRoot &&
+    !absolute.startsWith(capsuleRoot + path.sep)
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_path_escape",
+    }
+  }
+
+  let raw
+
+  try {
+    raw = await readFile(absolute, "utf8")
+  } catch {
+    return {
+      ok: false,
+      reason: "edit_capsule_read_failed",
+    }
+  }
+
+  if (
+    typeof state?.editCapsuleHash === "string" &&
+    state.editCapsuleHash.length > 0
+  ) {
+    const actual = createHash("sha256")
+      .update(raw)
+      .digest("hex")
+
+    if (actual !== state.editCapsuleHash) {
+      return {
+        ok: false,
+        reason: "edit_capsule_hash_mismatch",
+      }
+    }
+  }
+
+  let capsule
+
+  try {
+    capsule = JSON.parse(raw)
+  } catch {
+    return {
+      ok: false,
+      reason: "edit_capsule_json_invalid",
+    }
+  }
+
+  if (
+    capsule?.protocol !== EDIT_CAPSULE_PROTOCOL ||
+    capsule?.render_contract !== EDIT_CAPSULE_RENDER_CONTRACT ||
+    capsule?.mutation_ready !== true ||
+    capsule?.mutation_scope_complete !== true ||
+    capsule?.mutation_capable_scopes !== 1 ||
+    !Array.isArray(capsule?.scopes)
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_contract_invalid",
+    }
+  }
+
+  const authorizedScopes =
+    capsule.scopes.filter(
+      (scope) =>
+        scope?.mutation_authorized === true &&
+        scope?.context === "full",
+    )
+
+  if (authorizedScopes.length !== 1) {
+    return {
+      ok: false,
+      reason: "edit_capsule_authority_invalid",
+    }
+  }
+
+  const authorized = authorizedScopes[0]
+  const attested = capsule?.authorized_mutation_scope
+
+  const authorizedFile =
+    canonicalMutationFile(root, authorized?.file)
+
+  const attestedFile =
+    canonicalMutationFile(root, attested?.file)
+
+  if (
+    !authorizedFile ||
+    !attestedFile ||
+    authorizedFile !== attestedFile ||
+    authorized?.symbol_name !== attested?.symbol_name ||
+    authorized?.symbol_kind !== attested?.symbol_kind ||
+    authorized?.start_line !== attested?.start_line ||
+    authorized?.end_line !== attested?.end_line
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_authority_attestation_mismatch",
+    }
+  }
+
+  const expectedSourceLines =
+    authorized.end_line - authorized.start_line + 1
+
+  const actualSourceLines =
+    typeof authorized?.source === "string" &&
+    authorized.source.length > 0
+      ? authorized.source.split("\n").length
+      : 0
+
+  if (
+    !Number.isInteger(expectedSourceLines) ||
+    expectedSourceLines < 1 ||
+    actualSourceLines !== expectedSourceLines
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_full_scope_incomplete",
+    }
+  }
+
+  return {
+    ok: true,
+    capsule,
+  }
+}
+
+async function materializeCapabilityBoundMutation(
+  root,
+  state,
+  input,
+) {
+  const loaded =
+    await readAuthorizedEditCapsule(root, state)
+
+  if (!loaded.ok) {
+    return {
+      ...loaded,
+      rescout: false,
+    }
+  }
+
+  const authorizedScopes =
+    loaded.capsule.scopes.filter(
+      (scope) =>
+        scope?.context === "full" &&
+        scope?.mutation_authorized === true,
+    )
+
+  if (authorizedScopes.length !== 1) {
+    return {
+      ok: false,
+      reason: "mutation_capability_invalid",
+      detail:
+        `authorized_scope_count_${authorizedScopes.length}`,
+      rescout: false,
+    }
+  }
+
+  const target = authorizedScopes[0]
+
+  const file =
+    canonicalMutationFile(root, target?.file)
+
+  const symbol =
+    typeof target?.symbol_name === "string"
+      ? target.symbol_name
+      : ""
+
+  if (!file || !symbol) {
+    return {
+      ok: false,
+      reason: "mutation_capability_invalid",
+      detail: "authorized_target_identity_invalid",
+      rescout: false,
+    }
+  }
+
+  const mutation = {
+    file,
+    kind: input.kind,
+    symbol,
+
+    ...(typeof input.before === "string"
+      ? { before: input.before }
+      : {}),
+
+    ...(typeof input.replacement === "string"
+      ? { replacement: input.replacement }
+      : {}),
+
+    ...(typeof input.new_name === "string"
+      ? { new_name: input.new_name }
+      : {}),
+
+    ...(typeof input.scope === "string"
+      ? { scope: input.scope }
+      : {}),
+  }
+
+  return {
+    ok: true,
+    mutation,
+    scope_context: target.context,
+    target: {
+      file,
+      symbol,
+      symbol_kind: target.symbol_kind ?? null,
+      start_line: target.start_line ?? null,
+      end_line: target.end_line ?? null,
+    },
+  }
+}
+
 const PATCH_COMPILER_RETRY_REASONS = new Set([
   "mutation_contract_invalid",
   "mutation_kind_invalid",
@@ -2514,6 +3064,9 @@ const PATCH_COMPILER_RETRY_REASONS = new Set([
   "rename_scope_too_large",
   "lowered_edit_budget_exceeded",
   "no_effect_plan",
+  "node_pattern_invalid",
+  "node_not_found",
+  "node_ambiguous",
 ])
 
 const PATCH_COMPILER_RESCOUT_REASONS = new Set([
@@ -2674,7 +3227,12 @@ function runJsonBinary(binary, root, request, protocol, timeoutMs, stdoutLimit) 
       if (response?.protocol !== protocol) {
         return finish({ ok: false, reason: "protocol_mismatch", response })
       }
-      finish({ ok: true, reason: "ok", response })
+      finish({
+        ok: true,
+        reason: "ok",
+        response,
+        diagnostic: stderrText || null,
+      })
     })
     try {
       child.stdin.end(JSON.stringify(request))
@@ -2753,7 +3311,12 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
     proof_disposition: proofAssessment?.disposition ?? null,
     patch_path: path.relative(root, patchPath),
     patch_sha256: createHash("sha256").update(patch).digest("hex"),
-    attempts_used: state.patchAttempts,
+    attempts_used: state.mutationAttempts,
+    mutation_attempts_used: state.mutationAttempts,
+    repair_attempts_used: state.repairAttempts,
+    compiler_runs: state.compilerRuns,
+    patch_attempts_used: state.patchAttempts,
+    executor_runs: state.executorRuns,
     mutations_requested: compilerResponse?.mutations_requested ?? null,
     mutations_effective: compilerResponse?.mutations_effective ?? null,
     compiler_dropped_noops: compilerResponse?.dropped_noops ?? null,
@@ -3498,8 +4061,7 @@ function runImpactValidationQuery(root, file, bindings, glob) {
     }
     const pattern = escaped.length === 1 ? escaped[0] : `(?:${escaped.join("|")})`
     const args = ["--json", "--color", "never", "--max-columns", "500", "--max-columns-preview"]
-    for (const exclude of EXCLUDES) args.push("-g", exclude)
-    if (glob) args.push("-g", glob)
+    appendSearchGlobs(args, glob)
     args.push("--", pattern, file)
 
     const started = performance.now()
@@ -3527,6 +4089,7 @@ function runImpactValidationQuery(root, file, bindings, glob) {
       const matchFile = event.data?.path?.text
       const lineNo = event.data?.line_number
       if (typeof matchFile !== "string" || !Number.isInteger(lineNo)) return
+      if (isReservedAgentEvidencePath(matchFile)) return
       if (matches.length >= IMPACT_VALIDATION_HIT_CAP) { capped = true; child.kill("SIGTERM"); return }
       matches.push({ file: matchFile, line: lineNo, text: event.data?.lines?.text ?? "", exactMatches: Array.isArray(event.data?.submatches) ? event.data.submatches.length : 0 })
     }
@@ -3729,6 +4292,14 @@ function selectFairReservedFiles(rankedFiles, queryResults, limit) {
   return rankedFiles.filter((entry) => selected.has(entry.file))
 }
 
+function bestStructuralProbeCandidate(probedFiles) {
+  return (probedFiles ?? []).find(
+    (entry) =>
+      Number.isInteger(entry?.probeDefinitionHints) &&
+      entry.probeDefinitionHints > 0,
+  ) ?? null
+}
+
 function impactEmitEntry(entry) {
   const primary = entry.relations?.[0] ?? {}
   const sample = entry.validationKind === "forward_scope_definition"
@@ -3756,11 +4327,42 @@ function selectEmitFilesWithImpact(probedFiles, discoveryResults, validatedImpac
   const selected = []
   const selectedKeys = new Set()
 
-  const reserve = selectFairReservedFiles(probedFiles, discoveryResults, EMIT_MAX_FILES)
+  const reserve = selectFairReservedFiles(
+    probedFiles,
+    discoveryResults,
+    EMIT_MAX_FILES,
+  )
+
   for (const entry of reserve) {
     if (selected.length >= EMIT_MAX_FILES) break
     selected.push({ ...entry, origin: "lexical" })
     selectedKeys.add(evidenceFileKey(entry.file))
+  }
+
+  // Direct lexical structural evidence has precedence over graph-derived
+  // auxiliary context. The candidate is chosen from the existing post-probe
+  // relevance order; this adds no new relevance score.
+  //
+  // This is only a routing reservation. probeDefinitionHints is never treated
+  // as proof of ownership; downstream distiller/source validation must still
+  // establish the actual structural owner before mutation authority exists.
+  const structuralCandidate =
+    bestStructuralProbeCandidate(probedFiles)
+
+  if (
+    structuralCandidate &&
+    selected.length < EMIT_MAX_FILES
+  ) {
+    const key =
+      evidenceFileKey(structuralCandidate.file)
+
+    if (!selectedKeys.has(key)) {
+      selected.push({
+        ...structuralCandidate,
+        origin: "lexical",
+      })
+      selectedKeys.add(key)
+    }
   }
 
   let impactEmitted = 0
@@ -4416,13 +5018,118 @@ function focusedScopesFromGroups(groups) {
     )
 }
 
-async function buildEditCapsule(root, sessionID, state, groups, scoutHandoff) {
-  if (!state || !sessionID || scoutHandoff?.status !== "ready") return null
+function likelyTestFile(file) {
+  const normalized =
+    String(evidenceFileKey(file) ?? "")
+      .replaceAll("\\", "/")
+      .replace(/^\.\/+/, "")
+      .toLowerCase()
+
+  const parts =
+    normalized.split("/").filter(Boolean)
+
+  const base =
+    parts.length > 0
+      ? parts[parts.length - 1]
+      : ""
+
+  if (
+    parts.some(
+      (part) =>
+        part === "test" ||
+        part === "tests" ||
+        part === "__tests__" ||
+        part === "spec" ||
+        part === "specs",
+    )
+  ) {
+    return true
+  }
+
+  if (
+    /^test_.+\.py$/.test(base) ||
+    /.+_test\.py$/.test(base)
+  ) {
+    return true
+  }
+
+  if (
+    /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(base)
+  ) {
+    return true
+  }
+
+  return false
+}
+
+function scopesShareQueryEvidence(a, b) {
+  const left =
+    a?.queries instanceof Set
+      ? a.queries
+      : new Set(a?.queries ?? [])
+
+  const right =
+    b?.queries instanceof Set
+      ? b.queries
+      : new Set(b?.queries ?? [])
+
+  for (const query of left) {
+    if (right.has(query)) return true
+  }
+
+  return false
+}
+
+function resolvePrimaryMutationScope(primaryStructuralScopes) {
+  const top =
+    primaryStructuralScopes?.[0] ?? null
+
+  if (!top) return null
+
+  if (!likelyTestFile(top.file)) {
+    return top
+  }
+
+  // Keep the existing deterministic structural order.
+  // A test witness is displaced only by a non-test structural scope
+  // carrying overlapping query provenance.
+  const sourceAlternative =
+    primaryStructuralScopes.find(
+      (scope) =>
+        scope !== top &&
+        !likelyTestFile(scope.file) &&
+        scopesShareQueryEvidence(top, scope),
+    ) ?? null
+
+  return sourceAlternative ?? top
+}
+
+async function buildEditCapsule(
+  root,
+  sessionID,
+  state,
+  groups,
+  scoutHandoff,
+  structuralSource = "none",
+  mutationLocalization = null,
+) {
+  if (
+    !state ||
+    !sessionID ||
+    mutationLocalization?.eligible !== true
+  ) {
+    return null
+  }
 
   const files = [...state.scoutFiles.values()]
     .map(serializeScoutFile)
     .sort((a, b) => a.file.localeCompare(b.file))
   const rankedStructuralScopes = focusedScopesFromGroups(groups)
+    .map((scope) => {
+      const file = canonicalMutationFile(root, scope?.file)
+      return file ? { ...scope, file } : null
+    })
+    .filter(Boolean)
   const scopes = []
   const chosenScopeKeys = new Set()
 
@@ -4444,84 +5151,278 @@ async function buildEditCapsule(root, sessionID, state, groups, scoutHandoff) {
     }
   }
 
-  // Fairness is semantic here: every handoff file gets at least one capsule
-  // scope before a second scope from any file can consume the bounded budget.
-  for (const file of files.slice(0, EDIT_CAPSULE_MAX_SCOPES)) {
-    const structural = rankedStructuralScopes.find((scope) => scope.file === file.file)
-    const scope = structural ?? fallbackScope(file)
-    scopes.push(scope)
-    chosenScopeKeys.add(`${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`)
+  // Mutation authority has priority over auxiliary context.
+  //
+  // Phase 1: reserve the best available structural owner for each handoff
+  // file. This avoids filename-order allocation and prevents secondary
+  // scopes from starving a mutation-capable owner.
+  //
+  // Phase 2: spend remaining scope slots on additional structural owners.
+  //
+  // Phase 3: spend any remaining slots on fallback evidence windows.
+  //
+  // The byte budget itself is enforced transactionally during rendering.
+  const structuralRank = new Map(
+    rankedStructuralScopes.map((scope, index) => [
+      `${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`,
+      index,
+    ]),
+  )
+
+  const handoffFilesByCanonical = new Map()
+
+  for (const file of files) {
+    const canonical = canonicalMutationFile(root, file.file)
+    if (canonical) {
+      handoffFilesByCanonical.set(canonical, file)
+    }
   }
-  for (const scope of rankedStructuralScopes) {
-    if (scopes.length >= EDIT_CAPSULE_MAX_SCOPES) break
-    const key = `${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`
-    if (chosenScopeKeys.has(key)) continue
+
+  const primaryStructuralScopes = []
+
+  for (const [canonicalFile] of handoffFilesByCanonical) {
+    const structural = rankedStructuralScopes.find(
+      (scope) => scope.file === canonicalFile,
+    )
+
+    if (structural) {
+      primaryStructuralScopes.push(structural)
+    }
+  }
+
+  primaryStructuralScopes.sort((a, b) => {
+    const aKey =
+      `${a.file}\0${a.start}\0${a.end}\0${a.symbolName}`
+    const bKey =
+      `${b.file}\0${b.start}\0${b.end}\0${b.symbolName}`
+
+    return (
+      (structuralRank.get(aKey) ?? Number.MAX_SAFE_INTEGER) -
+      (structuralRank.get(bKey) ?? Number.MAX_SAFE_INTEGER)
+    )
+  })
+
+  // Exactly one structural owner is allowed to carry mutation authority.
+  // Its identity comes from the existing deterministic structural ranking;
+  // auxiliary structural scopes remain context-only.
+  const primaryMutationScope =
+    resolvePrimaryMutationScope(
+      primaryStructuralScopes,
+    )
+
+  const primaryMutationScopeKey =
+    primaryMutationScope
+      ? `${primaryMutationScope.file}\0${primaryMutationScope.start}\0${primaryMutationScope.end}\0${primaryMutationScope.symbolName}`
+      : null
+
+  function addScope(scope) {
+    if (!scope || scopes.length >= EDIT_CAPSULE_MAX_SCOPES) {
+      return false
+    }
+
+    const key =
+      `${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`
+
+    if (chosenScopeKeys.has(key)) return false
+
     scopes.push(scope)
     chosenScopeKeys.add(key)
+    return true
+  }
+
+  // One best structural owner per handoff file first.
+  // The designated mutation owner gets first claim on the
+  // unchanged transactional byte budget. addScope() deduplicates it
+  // when the auxiliary structural pass reaches the same scope.
+  addScope(primaryMutationScope)
+
+  for (const scope of primaryStructuralScopes) {
+    if (scopes.length >= EDIT_CAPSULE_MAX_SCOPES) break
+    addScope(scope)
+  }
+
+  // Then additional validated structural scopes.
+  for (const scope of rankedStructuralScopes) {
+    if (scopes.length >= EDIT_CAPSULE_MAX_SCOPES) break
+
+    // Structural metadata outside the handoff is not mutation authority.
+    if (!handoffFilesByCanonical.has(scope.file)) continue
+
+    addScope(scope)
+  }
+
+  // Only after structural allocation do fallback evidence windows consume
+  // the remaining scope slots.
+  const representedFiles = new Set(scopes.map((scope) => scope.file))
+
+  for (const file of files) {
+    if (scopes.length >= EDIT_CAPSULE_MAX_SCOPES) break
+
+    const canonical = canonicalMutationFile(root, file.file)
+    if (!canonical || representedFiles.has(canonical)) continue
+
+    const fallback = fallbackScope({
+      ...file,
+      file: canonical,
+    })
+
+    if (addScope(fallback)) {
+      representedFiles.add(canonical)
+    }
   }
 
   const cache = new Map()
   const rendered = []
   const capsuleScopes = []
+
   let usedBytes = 0
   let fullScopes = 0
   let windowScopes = 0
-  let truncated = false
 
-  function push(line) {
-    const cost = bytes(line + "\n")
-    if (usedBytes + cost > EDIT_CAPSULE_MAX_BYTES) {
-      truncated = true
-      return false
+  // Compatibility meaning:
+  // `truncated` below becomes an alias for auxiliary context loss.
+  // It no longer means that an already committed scope is partial.
+  let auxiliaryTruncated = false
+  let omittedScopesByBudget = 0
+  let downgradedStructuralScopes = 0
+
+  function blockBytes(lines) {
+    let total = 0
+    for (const line of lines) {
+      total += bytes(line + "\n")
     }
-    rendered.push(line)
-    usedBytes += cost
-    return true
+    return total
   }
 
   for (const scope of scopes) {
     const lines = await loadLines(root, scope.file, cache)
     if (!lines || lines.length < 1) continue
-    const start = Math.max(1, Math.min(scope.start, lines.length))
-    const end = Math.max(start, Math.min(scope.end, lines.length))
-    const full = files.length === 1 && end - start + 1 <= EDIT_CAPSULE_FULL_SCOPE_MAX_LINES
+
+    const start =
+      Math.max(1, Math.min(scope.start, lines.length))
+    const end =
+      Math.max(start, Math.min(scope.end, lines.length))
+
+    const scopeKey =
+      `${scope.file}\0${scope.start}\0${scope.end}\0${scope.symbolName}`
+
+    const primaryMutationCandidate =
+      primaryMutationScopeKey !== null &&
+      scopeKey === primaryMutationScopeKey
+
+    const namedStructuralScope =
+      scope.symbolKind !== "evidence_window" &&
+      scope.symbolKind !== "module" &&
+      scope.symbolName !== "<evidence>" &&
+      scope.symbolName !== "<module>"
+
+    const fullCandidate =
+      namedStructuralScope &&
+      end - start + 1 <= EDIT_CAPSULE_FULL_SCOPE_MAX_LINES
+
+    // Test the COMPLETE full scope against the remaining byte budget before
+    // granting context=full. No partial source can become mutation authority.
+    let full = false
+
+    if (fullCandidate) {
+      const fullBlock = [
+        `CAPSULE_SCOPE ${scope.file}:${start}-${end} symbol=${JSON.stringify(scope.symbolName)} ` +
+          `kind=${scope.symbolKind} context=full authority=${primaryMutationCandidate ? "mutation" : "context"}`,
+      ]
+
+      for (let line = start; line <= end; line++) {
+        fullBlock.push(
+          `  ${String(line).padStart(5)} | ${clipLine(lines[line - 1])}`,
+        )
+      }
+
+      const fullCost = blockBytes(fullBlock)
+
+      if (usedBytes + fullCost <= EDIT_CAPSULE_MAX_BYTES) {
+        full = true
+      } else {
+        // The structural owner remains useful as context, but is not allowed
+        // to masquerade as a complete mutation scope.
+        auxiliaryTruncated = true
+        downgradedStructuralScopes += 1
+      }
+    }
+
     const selected = []
 
     if (full) {
-      for (let line = start; line <= end; line++) selected.push(line)
-      fullScopes += 1
+      for (let line = start; line <= end; line++) {
+        selected.push(line)
+      }
     } else {
       const wanted = new Set()
-      for (let line = start; line <= Math.min(end, start + 2); line++) wanted.add(line)
+
+      for (
+        let line = start;
+        line <= Math.min(end, start + 2);
+        line++
+      ) {
+        wanted.add(line)
+      }
+
       for (const hitLine of scope.hitLines ?? []) {
         if (!Number.isInteger(hitLine)) continue
-        const lo = Math.max(start, hitLine - EDIT_CAPSULE_WINDOW_RADIUS)
-        const hi = Math.min(end, hitLine + EDIT_CAPSULE_WINDOW_RADIUS)
-        for (let line = lo; line <= hi; line++) wanted.add(line)
+
+        const lo =
+          Math.max(start, hitLine - EDIT_CAPSULE_WINDOW_RADIUS)
+        const hi =
+          Math.min(end, hitLine + EDIT_CAPSULE_WINDOW_RADIUS)
+
+        for (let line = lo; line <= hi; line++) {
+          wanted.add(line)
+        }
       }
+
       selected.push(...[...wanted].sort((a, b) => a - b))
-      windowScopes += 1
     }
 
     if (selected.length < 1) continue
-    const scopeHeader =
+
+    // Build this scope transactionally.
+    const mutationAuthorized =
+      full && primaryMutationCandidate
+
+    const block = [
       `CAPSULE_SCOPE ${scope.file}:${start}-${end} symbol=${JSON.stringify(scope.symbolName)} ` +
-      `kind=${scope.symbolKind} context=${full ? "full" : "evidence_window"}`
-    if (!push(scopeHeader)) break
+        `kind=${scope.symbolKind} context=${full ? "full" : "evidence_window"} ` +
+        `authority=${mutationAuthorized ? "mutation" : "context"}`,
+    ]
 
     const source = []
     let previous = null
+
     for (const lineNo of selected) {
       if (previous !== null && lineNo > previous + 1) {
-        if (!push("  … omitted …")) break
+        block.push("  … omitted …")
         source.push("… omitted …")
       }
+
       const text = clipLine(lines[lineNo - 1])
-      const row = `  ${String(lineNo).padStart(5)} | ${text}`
-      if (!push(row)) break
+      const row =
+        `  ${String(lineNo).padStart(5)} | ${text}`
+
+      block.push(row)
       source.push(`${lineNo} | ${text}`)
       previous = lineNo
     }
+
+    const blockCost = blockBytes(block)
+
+    // Atomic scope commit: if the complete block does not fit, NONE of this
+    // scope enters rendered[] or capsuleScopes[].
+    if (usedBytes + blockCost > EDIT_CAPSULE_MAX_BYTES) {
+      auxiliaryTruncated = true
+      omittedScopesByBudget += 1
+      continue
+    }
+
+    rendered.push(...block)
+    usedBytes += blockCost
 
     capsuleScopes.push({
       file: scope.file,
@@ -4529,31 +5430,175 @@ async function buildEditCapsule(root, sessionID, state, groups, scoutHandoff) {
       symbol_name: scope.symbolName,
       start_line: start,
       end_line: end,
-      evidence_lines: [...(scope.hitLines ?? [])].filter(Number.isInteger).sort((a, b) => a - b),
+      evidence_lines: [...(scope.hitLines ?? [])]
+        .filter(Number.isInteger)
+        .sort((a, b) => a - b),
       context: full ? "full" : "evidence_window",
+      mutation_authorized: mutationAuthorized,
       source: source.join("\n"),
     })
-    if (truncated) break
+
+    if (full) {
+      fullScopes += 1
+    } else {
+      windowScopes += 1
+    }
   }
 
-  const strongFingerprints = files.length > 0 && files.every((file) => file.fingerprint?.strong === true)
-  const contextFiles = new Set(capsuleScopes.map((scope) => scope.file))
-  const allHandoffFilesContextualized = files.length > 0 && files.every((file) => contextFiles.has(file.file))
-  const mutationReady = strongFingerprints && allHandoffFilesContextualized
+  const strongFingerprints =
+    files.length > 0 &&
+    files.every(
+      (file) => file.fingerprint?.strong === true,
+    )
+
+  const contextFiles = new Set(
+    capsuleScopes
+      .map((scope) =>
+        canonicalMutationFile(root, scope.file),
+      )
+      .filter(Boolean),
+  )
+
+  let handoffFilesContextualized = 0
+
+  for (const file of files) {
+    const normalized =
+      canonicalMutationFile(root, file.file)
+
+    if (
+      normalized !== null &&
+      contextFiles.has(normalized)
+    ) {
+      handoffFilesContextualized += 1
+    }
+  }
+
+  const allHandoffFilesContextualized =
+    files.length > 0 &&
+    handoffFilesContextualized === files.length
+
+  const mutationCapableScopes =
+    capsuleScopes.filter(
+      (scope) =>
+        scope.mutation_authorized === true &&
+        scope.context === "full" &&
+        scope.symbol_kind !== "evidence_window" &&
+        scope.symbol_kind !== "module" &&
+        scope.symbol_name !== "<evidence>" &&
+        scope.symbol_name !== "<module>",
+    )
+
+  // Rendering and authorization are both single-scope contracts:
+  // exactly one complete designated structural owner must survive.
+  const mutationScopeComplete =
+    mutationCapableScopes.length === 1
+
+  const readinessBlockers = []
+
+  if (!strongFingerprints) {
+    readinessBlockers.push("weak_file_fingerprint")
+  }
+
+  if (!mutationScopeComplete) {
+    readinessBlockers.push("mutation_scope_unavailable")
+  }
+
+  const readinessWarnings = []
+
+  if (!allHandoffFilesContextualized) {
+    readinessWarnings.push("handoff_context_incomplete")
+  }
+
+  if (auxiliaryTruncated) {
+    readinessWarnings.push("capsule_budget_exhausted")
+  }
+
+  const contextComplete =
+    allHandoffFilesContextualized &&
+    !auxiliaryTruncated
+
+  // Mutation authority and auxiliary model context are separate contracts.
+  //
+  // A complete, source-validated full structural scope may authorize the
+  // bounded mutation even when some unrelated auxiliary context did not fit.
+  const mutationReady =
+    readinessBlockers.length === 0
+
+  const readinessReason =
+    mutationReady
+      ? "scout_ready_with_mutation_scope"
+      : readinessBlockers[0]
+
   const capsule = {
     protocol: EDIT_CAPSULE_PROTOCOL,
+    render_contract: EDIT_CAPSULE_RENDER_CONTRACT,
     search_protocol: SEARCH_PROTOCOL,
     scout_handoff_protocol: SCOUT_HANDOFF_PROTOCOL,
     scout_handoff: scoutHandoff.path,
+    scout_handoff_status: scoutHandoff.status,
+    scout_handoff_partial_reasons:
+      scoutHandoff.partialReasons ?? [],
+    mutation_localization_eligibility:
+      mutationLocalization.reason,
     generated_at_ms: nowMs(),
     mutation_ready: mutationReady,
-    readiness_reason: mutationReady ? "scout_ready_with_structural_context" : "handoff_context_incomplete",
-    all_handoff_files_contextualized: allHandoffFilesContextualized,
-    coverage: fullScopes === capsuleScopes.length ? "full_scope" : fullScopes > 0 ? "mixed" : "evidence_window",
+    readiness_reason: readinessReason,
+    readiness_blockers: readinessBlockers,
+    readiness_warnings: readinessWarnings,
+    structural_source: structuralSource,
+
+    // Deterministic candidate selected before byte-budget rendering.
+    // This is NOT mutation authority by itself.
+    primary_mutation_candidate:
+      primaryMutationScope
+        ? {
+            file: primaryMutationScope.file,
+            symbol_kind: primaryMutationScope.symbolKind,
+            symbol_name: primaryMutationScope.symbolName,
+            start_line: primaryMutationScope.start,
+            end_line: primaryMutationScope.end,
+          }
+        : null,
+
+    // Actual post-render mutation authority.
+    // Transactional rendering guarantees this scope is complete.
+    authorized_mutation_scope:
+      mutationCapableScopes.length === 1
+        ? {
+            file: mutationCapableScopes[0].file,
+            symbol_kind: mutationCapableScopes[0].symbol_kind,
+            symbol_name: mutationCapableScopes[0].symbol_name,
+            start_line: mutationCapableScopes[0].start_line,
+            end_line: mutationCapableScopes[0].end_line,
+          }
+        : null,
+
+    mutation_capable_scopes: mutationCapableScopes.length,
+    mutation_scope_complete: mutationScopeComplete,
+    context_complete: contextComplete,
+    all_handoff_files_contextualized:
+      allHandoffFilesContextualized,
+    handoff_files_contextualized:
+      handoffFilesContextualized,
+    handoff_files_total: files.length,
+    auxiliary_truncated: auxiliaryTruncated,
+    omitted_scopes_by_budget: omittedScopesByBudget,
+    downgraded_structural_scopes:
+      downgradedStructuralScopes,
+    coverage:
+      capsuleScopes.length > 0 &&
+      fullScopes === capsuleScopes.length
+        ? "full_scope"
+        : fullScopes > 0
+          ? "mixed"
+          : "evidence_window",
     files,
     scopes: capsuleScopes,
     bytes: usedBytes,
-    truncated,
+
+    // Compatibility alias. This no longer means a committed scope is partial;
+    // transactional rendering guarantees committed scopes are complete.
+    truncated: auxiliaryTruncated,
   }
   const json = JSON.stringify(capsule, null, 2) + "\n"
   const hash = createHash("sha256").update(json).digest("hex")
@@ -4575,16 +5620,35 @@ async function buildEditCapsule(root, sessionID, state, groups, scoutHandoff) {
   state.editCapsuleHash = hash
   const header =
     `EDIT_CAPSULE protocol=${EDIT_CAPSULE_PROTOCOL} mutation_ready=${mutationReady} ` +
-    `coverage=${capsule.coverage} scopes=${capsuleScopes.length} path=${rel} sha256=${hash}`
+    `context_complete=${contextComplete} coverage=${capsule.coverage} ` +
+    `mutation_scopes=${mutationCapableScopes.length} scopes=${capsuleScopes.length} ` +
+    `path=${rel} sha256=${hash}`
   return {
     protocol: EDIT_CAPSULE_PROTOCOL,
     path: rel,
     sha256: hash,
     mutationReady,
+    readinessReason,
+    readinessBlockers,
+    readinessWarnings,
+    structuralSource,
+    primaryMutationCandidate:
+      capsule.primary_mutation_candidate,
+    authorizedMutationScope:
+      capsule.authorized_mutation_scope,
+    mutationCapableScopes: mutationCapableScopes.length,
+    mutationScopeComplete,
+    contextComplete,
+    allHandoffFilesContextualized,
+    handoffFilesContextualized,
+    handoffFilesTotal: files.length,
+    auxiliaryTruncated,
+    omittedScopesByBudget,
+    downgradedStructuralScopes,
     coverage: capsule.coverage,
     scopes: capsuleScopes.length,
     bytes: usedBytes,
-    truncated,
+    truncated: auxiliaryTruncated,
     text: [header, ...rendered].join("\n"),
   }
 }
@@ -5311,13 +6375,33 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
   }
 }
 
-function worstCaseHeaderBytes(scanComplete, querySummary, uniqueHits) {
-  return bytes([
-    `SEARCH complete=false scan_complete=${scanComplete} evidence_complete=false unique_hits=${uniqueHits} shown_hits=${uniqueHits}`,
+function rawHeaderReserveLines({
+  scanComplete,
+  discoveryComplete,
+  selectedScanComplete,
+  candidateFiles,
+  selectedFiles,
+  uniqueHits,
+  querySummary,
+}) {
+  // This is deliberately conservative.
+  //
+  // The reserve must contain every field that the real RAW header may emit.
+  // "false" is at least as long as "true", shown_hits cannot require more
+  // digits than unique_hits, and the reasons line contains the union of all
+  // RAW incomplete reasons.
+  return [
+    `SEARCH complete=false scan_complete=${scanComplete} ` +
+      `lexical_discovery_complete=${discoveryComplete} ` +
+      `selected_scan_complete=${selectedScanComplete} ` +
+      `evidence_complete=false selected_evidence_complete=false ` +
+      `candidate_files=${candidateFiles} selected_files=${selectedFiles} ` +
+      `unique_hits=${uniqueHits} shown_hits=${uniqueHits}`,
     ...querySummary,
-    "INCOMPLETE reasons=scan_incomplete,output_budget",
-    "",
-  ].join("\n"))
+    "INCOMPLETE reasons=" +
+      "lexical_discovery_incomplete,probe_subset,scan_incomplete," +
+      "budgeted_emit_subset,output_budget",
+  ]
 }
 
 function normalizePublicEvent(raw) {
@@ -5886,7 +6970,13 @@ export default {
             .filter(Boolean)
             .sort((a, b) => a.queryIndex - b.queryIndex)
 
-          const probeRankedFiles = rankProbedFiles(rankedFiles, probeResults)
+          const probeRankedFiles = rankProbedFiles(
+            rankedFiles,
+            probeResults,
+          )
+          const structuralReservationCandidate =
+            bestStructuralProbeCandidate(probeRankedFiles)
+
           const impactValidation = await validateImpactHypotheses(
             root,
             target,
@@ -5942,11 +7032,30 @@ export default {
           ]
           const callBudgetBytes = Math.min(MAX_OUTPUT_BYTES, remainingEvidenceBytes)
           const provisionalRoute = routingActive
-            ? renderRouteMap(rankedFiles, selectedFiles, ROUTE_BODY_BUDGET_BYTES)
+            ? renderRouteMap(
+                rankedFiles,
+                selectedFiles,
+                ROUTE_BODY_BUDGET_BYTES,
+              )
             : { body: [], bodyBytes: 0, retained: 0 }
-          const headerReserve =
-            worstCaseHeaderBytes(scanComplete, querySummary, hits.size) +
-            provisionalRoute.bodyBytes
+
+          const reserveHeader = rawHeaderReserveLines({
+            scanComplete,
+            discoveryComplete,
+            selectedScanComplete,
+            candidateFiles: rankedFiles.length,
+            selectedFiles: selectedFileSet.size,
+            uniqueHits: hits.size,
+            querySummary,
+          })
+
+          const headerReserve = bytes([
+            ...reserveHeader,
+            ...(provisionalRoute.body.length > 0
+              ? ["", ...provisionalRoute.body]
+              : []),
+            "",
+          ].join("\n"))
 
           if (callBudgetBytes <= headerReserve) {
             return await blockSearch("evidence_budget", {
@@ -5997,8 +7106,13 @@ export default {
 
           if (rawResultBytes > callBudgetBytes) {
             return await blockSearch("internal_budget_guard", {
+              stage: "raw_pack",
               result_bytes: rawResultBytes,
               call_budget_bytes: callBudgetBytes,
+              reserved_header_bytes: headerReserve,
+              rendered_body_bytes: rawRendered.bodyBytes,
+              route_body_bytes: routeRendered.bodyBytes,
+              overflow_bytes: rawResultBytes - callBudgetBytes,
             })
           }
 
@@ -6008,6 +7122,7 @@ export default {
             selectedEvidenceComplete,
           )
           const distillInput = distillerHitsFromMerged(hits)
+          const ownerRecoveryInput = ownerRecoveryHitsFromMerged(hits)
           const spansComplete = spanCaptureComplete(results)
 
           let representation = "raw"
@@ -6034,6 +7149,38 @@ export default {
           let hybridFacts = new Set()
           let variantDiversity = null
           let distillGroupsForIndex = null
+
+          // Diagnostic-only line-owner recovery.
+          //
+          // This data MUST NOT feed Evidence IR rendering, index routing,
+          // Edit Capsule construction, mutation readiness or authorization.
+          let ownerRecoveryAttempted = false
+          let ownerRecoveryReason = "not_needed"
+          let ownerRecoveryElapsedMs = null
+          let ownerRecoveryObserved = false
+          let ownerRecoveryDistillComplete = null
+          let ownerRecoveryLocationComplete = null
+          let ownerRecoveryAnchorComplete = null
+          let ownerRecoveryWitnessComplete = null
+          let ownerRecoveryIrComplete = null
+          let ownerRecoveryExactSpanHits = null
+          let ownerRecoveryMappedHits = null
+          let ownerRecoveryGroupCount = null
+          let ownerRecoveryOwners = []
+          let ownerRecoveryGroups = null
+          let ownerRecoveryFilesAttempted = 0
+          let ownerRecoveryFilesAccepted = 0
+          let ownerRecoveryFilesRejected = 0
+          let ownerRecoveryRejectedFiles = []
+
+          // Structural localization for mutation authorization is independent
+          // from model-facing evidence representation. The normal distiller
+          // may be skipped when compression/focused rendering is unnecessary;
+          // the capsule still needs a validated structural owner.
+          let capsuleExactProbeAttempted = false
+          let capsuleExactProbeReason = "not_needed"
+          let capsuleExactProbeElapsedMs = null
+          let capsuleExactProbeGroups = null
 
           let indexReason = null
           let indexRenderComplete = null
@@ -6683,16 +7830,354 @@ export default {
             noProgressBlocked,
           })
 
+          const mutationLocalization =
+            scoutMutationLocalizationEligibility(
+              state,
+              scoutHandoff,
+            )
+
+          // First reuse structural groups produced by the normal exact-span
+          // Evidence IR path, if available.
+          const existingExactStructuralGroups =
+            Array.isArray(distillGroupsForIndex) &&
+            distillGroupsForIndex.length > 0
+              ? distillGroupsForIndex
+              : null
+
+          // If model-facing evidence did not need distillation, perform a
+          // separate strict exact-span probe solely for EditCapsule structural
+          // ownership. This closes the spansComplete=true / shouldDistill=false
+          // dead zone without changing search representation.
+          if (
+            mutationLocalization.eligible &&
+            !existingExactStructuralGroups &&
+            spansComplete &&
+            distillInput.length > 0 &&
+            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
+          ) {
+            capsuleExactProbeAttempted = true
+
+            const exactProbe =
+              await runDistiller(root, distillInput)
+
+            capsuleExactProbeElapsedMs =
+              exactProbe.elapsedMs
+
+            if (
+              exactProbe.ok === true &&
+              exactProbe.response?.ir_complete === true &&
+              exactProbe.response?.location_complete === true &&
+              exactProbe.response?.anchor_complete === true &&
+              exactProbe.response?.witness_complete === true &&
+              exactProbe.response?.distill_complete === true &&
+              exactProbe.response?.truncated === false &&
+              Array.isArray(exactProbe.response?.groups) &&
+              exactProbe.response.groups.length > 0
+            ) {
+              capsuleExactProbeGroups =
+                exactProbe.response.groups
+              capsuleExactProbeReason =
+                "exact_structural_groups_observed"
+            } else {
+              capsuleExactProbeReason =
+                exactProbe.reason ??
+                "exact_structural_probe_rejected"
+            }
+          } else if (
+            !mutationLocalization.eligible
+          ) {
+            capsuleExactProbeReason =
+              mutationLocalization.reason
+          } else if (existingExactStructuralGroups) {
+            capsuleExactProbeReason =
+              "reused_existing_evidence_ir"
+          } else if (!spansComplete) {
+            capsuleExactProbeReason =
+              "exact_spans_incomplete"
+          } else if (distillInput.length < 1) {
+            capsuleExactProbeReason =
+              "no_exact_spans"
+          } else if (
+            distillInput.length >
+            FOCUSED_PROBE_MAX_EXACT_MATCHES
+          ) {
+            capsuleExactProbeReason =
+              "exact_input_cap"
+          }
+
+          const exactGroupsForCapsule =
+            existingExactStructuralGroups ??
+            capsuleExactProbeGroups
+
+          // Line-only recovery is the fallback when no exact structural
+          // ownership is available. It no longer depends directly on
+          // spansComplete: exact spans may exist yet fail structural parsing.
+          if (
+            mutationLocalization.eligible &&
+            !exactGroupsForCapsule
+          ) {
+            if (ownerRecoveryInput.length < 1) {
+              ownerRecoveryReason = "no_line_hits"
+            } else if (
+              ownerRecoveryInput.length > FOCUSED_PROBE_MAX_LINE_HITS
+            ) {
+              ownerRecoveryReason = "input_cap"
+            } else {
+              ownerRecoveryAttempted = true
+
+              const ownerRecoveryByFile = new Map()
+
+              for (const hit of ownerRecoveryInput) {
+                const batch =
+                  ownerRecoveryByFile.get(hit.file) ?? []
+                batch.push(hit)
+                ownerRecoveryByFile.set(hit.file, batch)
+              }
+
+              const ownerRecoveryBatches =
+                [...ownerRecoveryByFile.entries()]
+                  .sort(([a], [b]) => a.localeCompare(b))
+
+              ownerRecoveryFilesAttempted =
+                ownerRecoveryBatches.length
+
+              let elapsedTotal = 0
+              let mappedTotal = 0
+              let exactSpanTotal = 0
+              let groupTotal = 0
+              let allLocationIncomplete = true
+              let allIrIncomplete = true
+
+              const acceptedGroups = []
+              const rejectedFiles = []
+
+              for (const [file, fileHits] of ownerRecoveryBatches) {
+                const ownerProbe = await runDistiller(
+                  root,
+                  fileHits,
+                )
+
+                elapsedTotal +=
+                  Number.isFinite(ownerProbe.elapsedMs)
+                    ? ownerProbe.elapsedMs
+                    : 0
+
+                const response = ownerProbe.response
+
+                if (Number.isInteger(response?.mapped_hits)) {
+                  mappedTotal += response.mapped_hits
+                }
+
+                if (Number.isInteger(response?.exact_span_hits)) {
+                  exactSpanTotal += response.exact_span_hits
+                }
+
+                if (Array.isArray(response?.groups)) {
+                  groupTotal += response.groups.length
+                }
+
+                if (response?.location_complete !== false) {
+                  allLocationIncomplete = false
+                }
+
+                if (response?.ir_complete !== false) {
+                  allIrIncomplete = false
+                }
+
+                const fileOwnerSafe =
+                  ownerProbe.ok === false &&
+                  ownerProbe.reason === "unsafe_ir" &&
+                  response?.protocol === "evidence-distiller-v3" &&
+                  response?.representation === "evidence_ir" &&
+                  response?.raw_hits === fileHits.length &&
+                  response?.mapped_hits === fileHits.length &&
+                  response?.exact_span_hits === 0 &&
+                  response?.location_complete === false &&
+                  response?.anchor_complete === true &&
+                  response?.witness_complete === true &&
+                  response?.distill_complete === true &&
+                  response?.ir_complete === false &&
+                  response?.v2_grouping_preserved === true &&
+                  response?.truncated === false &&
+                  Array.isArray(response?.groups) &&
+                  response.groups.length > 0 &&
+                  response?.groups_shown ===
+                    response.groups.length &&
+                  response?.variants_shown ===
+                    response?.variants_total
+
+                if (fileOwnerSafe) {
+                  ownerRecoveryFilesAccepted += 1
+                  acceptedGroups.push(...response.groups)
+                } else {
+                  ownerRecoveryFilesRejected += 1
+
+                  rejectedFiles.push({
+                    file,
+                    input_hits: fileHits.length,
+                    reason:
+                      ownerProbe.reason ??
+                      "owner_contract_rejected",
+                    mapped_hits:
+                      Number.isInteger(response?.mapped_hits)
+                        ? response.mapped_hits
+                        : null,
+                    unsupported:
+                      Array.isArray(response?.unsupported_files)
+                        ? response.unsupported_files.length
+                        : null,
+                    errors:
+                      Array.isArray(response?.errors)
+                        ? response.errors.length
+                        : null,
+                  })
+                }
+              }
+
+              ownerRecoveryElapsedMs =
+                Math.round(elapsedTotal * 100) / 100
+              ownerRecoveryMappedHits = mappedTotal
+              ownerRecoveryExactSpanHits = exactSpanTotal
+              ownerRecoveryGroupCount = groupTotal
+
+              ownerRecoveryLocationComplete =
+                ownerRecoveryFilesAttempted > 0
+                  ? !allLocationIncomplete
+                  : null
+
+              ownerRecoveryIrComplete =
+                ownerRecoveryFilesAttempted > 0
+                  ? !allIrIncomplete
+                  : null
+
+              ownerRecoveryDistillComplete =
+                ownerRecoveryFilesAccepted > 0 &&
+                ownerRecoveryFilesRejected === 0
+
+              ownerRecoveryAnchorComplete =
+                ownerRecoveryFilesAccepted > 0 &&
+                ownerRecoveryFilesRejected === 0
+
+              ownerRecoveryWitnessComplete =
+                ownerRecoveryFilesAccepted > 0 &&
+                ownerRecoveryFilesRejected === 0
+
+              ownerRecoveryRejectedFiles =
+                rejectedFiles.slice(0, 16)
+
+              if (acceptedGroups.length > 0) {
+                ownerRecoveryObserved = true
+                ownerRecoveryGroups = acceptedGroups
+
+                ownerRecoveryReason =
+                  ownerRecoveryFilesRejected > 0
+                    ? "partial_diagnostic_groups_observed"
+                    : "diagnostic_groups_observed"
+
+                const owners = new Map()
+
+                for (const group of acceptedGroups) {
+                  const file =
+                    typeof group?.file === "string"
+                      ? group.file
+                      : null
+                  const symbolKind =
+                    typeof group?.symbol_kind === "string"
+                      ? group.symbol_kind
+                      : null
+                  const symbolName =
+                    typeof group?.symbol_name === "string"
+                      ? group.symbol_name
+                      : null
+                  const startLine =
+                    Number.isInteger(group?.start_line)
+                      ? group.start_line
+                      : null
+                  const endLine =
+                    Number.isInteger(group?.end_line)
+                      ? group.end_line
+                      : null
+
+                  if (
+                    !file ||
+                    !symbolKind ||
+                    !symbolName ||
+                    !startLine ||
+                    !endLine
+                  ) {
+                    continue
+                  }
+
+                  const key =
+                    `${file}\0${symbolKind}\0${symbolName}` +
+                    `\0${startLine}\0${endLine}`
+
+                  if (!owners.has(key)) {
+                    owners.set(key, {
+                      file,
+                      symbol_kind: symbolKind,
+                      symbol_name: symbolName,
+                      start_line: startLine,
+                      end_line: endLine,
+                    })
+                  }
+                }
+
+                ownerRecoveryOwners =
+                  [...owners.values()].slice(0, 16)
+              } else {
+                ownerRecoveryReason =
+                  "no_valid_owner_batches"
+              }
+            }
+          }
+
+          const exactStructuralGroups =
+            Array.isArray(exactGroupsForCapsule) &&
+            exactGroupsForCapsule.length > 0
+              ? exactGroupsForCapsule
+              : null
+
+          const recoveredStructuralGroups =
+            Array.isArray(ownerRecoveryGroups) &&
+            ownerRecoveryGroups.length > 0
+              ? ownerRecoveryGroups
+              : null
+
+          const capsuleGroups =
+            exactStructuralGroups ?? recoveredStructuralGroups
+
+          const capsuleStructuralSource =
+            existingExactStructuralGroups
+              ? "evidence_ir"
+              : capsuleExactProbeGroups
+                ? "exact_structural_probe"
+                : recoveredStructuralGroups
+                  ? "line_owner_recovery"
+                  : "none"
+
           let editCapsule = null
-          if (scoutHandoff?.status === "ready") {
-            editCapsule = await buildEditCapsule(root, sessionID, state, distillGroupsForIndex, scoutHandoff)
+          if (mutationLocalization.eligible) {
+            editCapsule = await buildEditCapsule(
+              root,
+              sessionID,
+              state,
+              capsuleGroups,
+              scoutHandoff,
+              capsuleStructuralSource,
+              mutationLocalization,
+            )
             if (editCapsule?.mutationReady === true) {
               applyExecutionEvent(state, "scout_ready", "edit_capsule_ready")
             } else {
               applyExecutionEvent(state, "scout_needs_evidence", "edit_capsule_unavailable")
             }
           } else {
-            applyExecutionEvent(state, "scout_needs_evidence", `scout_handoff_${scoutHandoff?.status ?? "missing"}`)
+            applyExecutionEvent(
+              state,
+              "scout_needs_evidence",
+              `mutation_localization_${mutationLocalization.reason}`,
+            )
           }
 
           const elapsedMs = Math.round((performance.now() - started) * 100) / 100
@@ -6724,10 +8209,44 @@ export default {
             scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
             scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
             scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
+            mutation_localization_eligible:
+              mutationLocalization.eligible,
+            mutation_localization_reason:
+              mutationLocalization.reason,
             edit_capsule_protocol: editCapsule?.protocol ?? null,
             edit_capsule_path: editCapsule?.path ?? null,
             edit_capsule_sha256: editCapsule?.sha256 ?? null,
             edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
+            edit_capsule_readiness_reason:
+              editCapsule?.readinessReason ?? null,
+            edit_capsule_structural_source:
+              editCapsule?.structuralSource ?? null,
+            edit_capsule_primary_mutation_candidate:
+              editCapsule?.primaryMutationCandidate ?? null,
+            edit_capsule_authorized_mutation_scope:
+              editCapsule?.authorizedMutationScope ?? null,
+            edit_capsule_mutation_capable_scopes:
+              editCapsule?.mutationCapableScopes ?? 0,
+            edit_capsule_mutation_scope_complete:
+              editCapsule?.mutationScopeComplete ?? false,
+            edit_capsule_context_complete:
+              editCapsule?.contextComplete ?? null,
+            edit_capsule_all_handoff_files_contextualized:
+              editCapsule?.allHandoffFilesContextualized ?? null,
+            edit_capsule_handoff_files_contextualized:
+              editCapsule?.handoffFilesContextualized ?? null,
+            edit_capsule_handoff_files_total:
+              editCapsule?.handoffFilesTotal ?? null,
+            edit_capsule_auxiliary_truncated:
+              editCapsule?.auxiliaryTruncated ?? null,
+            edit_capsule_omitted_scopes_by_budget:
+              editCapsule?.omittedScopesByBudget ?? null,
+            edit_capsule_downgraded_structural_scopes:
+              editCapsule?.downgradedStructuralScopes ?? null,
+            edit_capsule_readiness_blockers:
+              editCapsule?.readinessBlockers ?? [],
+            edit_capsule_readiness_warnings:
+              editCapsule?.readinessWarnings ?? [],
             edit_capsule_coverage: editCapsule?.coverage ?? null,
             execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
             execution_state: state?.executionState ?? null,
@@ -6811,7 +8330,38 @@ export default {
             impact_index_forward_neighbors: impactIndexShadow.forwardNeighbors,
             impact_index_reverse_neighbors: impactIndexShadow.reverseNeighbors,
             impact_index_candidates: impactIndexShadow.candidates,
-            impact_index_routing_active: selectedImpactFiles.length > 0,
+            impact_index_routing_active:
+              selectedImpactFiles.length > 0,
+
+            structural_emit_reservation_candidate:
+              structuralReservationCandidate
+                ? {
+                    file:
+                      structuralReservationCandidate.file,
+                    probe_definition_hints:
+                      structuralReservationCandidate
+                        .probeDefinitionHints ?? 0,
+                    probe_exact_matches:
+                      structuralReservationCandidate
+                        .probeExactMatches ?? 0,
+                    probe_rank:
+                      probeRankedFiles.findIndex(
+                        (candidate) =>
+                          candidate.file ===
+                          structuralReservationCandidate.file,
+                      ) + 1,
+                  }
+                : null,
+
+            structural_emit_reservation_selected:
+              structuralReservationCandidate
+                ? selectedLexicalFileSet.has(
+                    evidenceFileKey(
+                      structuralReservationCandidate.file,
+                    ),
+                  )
+                : false,
+
             probe_files: probeFiles.map((entry) => ({
               file: entry.file,
               queries: [...entry.queries].sort((a, b) => a - b),
@@ -6878,6 +8428,48 @@ export default {
             exact_span_hits: exactSpanHits,
             probed_exact_span_hits: probedExactSpanHits,
             distill_input_hits: distillInput.length,
+            capsule_exact_probe_attempted:
+              capsuleExactProbeAttempted,
+            capsule_exact_probe_reason:
+              capsuleExactProbeReason,
+            capsule_exact_probe_elapsed_ms:
+              capsuleExactProbeElapsedMs,
+            capsule_exact_probe_groups:
+              Array.isArray(capsuleExactProbeGroups)
+                ? capsuleExactProbeGroups.length
+                : null,
+
+            owner_recovery_input_hits: ownerRecoveryInput.length,
+            owner_recovery_attempted: ownerRecoveryAttempted,
+            owner_recovery_reason: ownerRecoveryReason,
+            owner_recovery_elapsed_ms: ownerRecoveryElapsedMs,
+            owner_recovery_observed: ownerRecoveryObserved,
+            owner_recovery_distill_complete:
+              ownerRecoveryDistillComplete,
+            owner_recovery_location_complete:
+              ownerRecoveryLocationComplete,
+            owner_recovery_anchor_complete:
+              ownerRecoveryAnchorComplete,
+            owner_recovery_witness_complete:
+              ownerRecoveryWitnessComplete,
+            owner_recovery_ir_complete:
+              ownerRecoveryIrComplete,
+            owner_recovery_exact_span_hits:
+              ownerRecoveryExactSpanHits,
+            owner_recovery_mapped_hits:
+              ownerRecoveryMappedHits,
+            owner_recovery_group_count:
+              ownerRecoveryGroupCount,
+            owner_recovery_files_attempted:
+              ownerRecoveryFilesAttempted,
+            owner_recovery_files_accepted:
+              ownerRecoveryFilesAccepted,
+            owner_recovery_files_rejected:
+              ownerRecoveryFilesRejected,
+            owner_recovery_rejected_files:
+              ownerRecoveryRejectedFiles,
+            owner_recovery_owners:
+              ownerRecoveryOwners,
             shown_hits: shownHits,
             scan_complete: scanComplete,
             evidence_complete: evidenceComplete,
@@ -6969,8 +8561,17 @@ export default {
             turn_evidence_bytes: state?.evidenceBytes ?? null,
           })
 
+          // Context Boundary:
+          // once deterministic Scout + structural validation has produced
+          // an authorized mutation capsule, raw discovery evidence is no
+          // longer model-facing. The user task remains in conversation and
+          // the capsule contains the bounded source context required for the
+          // only exposed next action: execute_patch.
+          //
+          // Full Scout evidence remains persisted in search trace / handoff
+          // artifacts; this changes only the next model-facing projection.
           const actionableContent = editCapsule?.mutationReady === true
-            ? `${content}\n\n${editCapsule.text}\nNEXT_ACTION=execute_patch reason=edit_capsule_ready search_locked=true`
+            ? `${editCapsule.text}\nNEXT_ACTION=execute_patch reason=edit_capsule_ready search_locked=true`
             : content
 
           return {
@@ -7066,24 +8667,46 @@ export default {
       tools.add({
         name: "execute_patch",
         description:
-          "Submit exactly ONE semantic mutation against the latest Scout edit-capsule. Arguments are FLAT: file, kind, symbol and the kind-specific fields; do not wrap them in a mutations array. " +
-          "replace_body supplies body; replace_expr supplies before+after; rename_symbol supplies new_name and optional scope=handoff. " +
-          "The deterministic compiler expands the semantic mutation into guarded physical edits, removes mechanical ambiguity and generates checks. " +
-          "Use the edit-capsule-v1 emitted by search; do not search again while mutation is enabled. " +
-          "PATCH_READY persists a verified receipt; PATCH_RETRY means revise semantic intent once; PATCH_RESCOUT reopens search through the causal controller.",
+          "Submit exactly ONE semantic mutation inside the single mutation-authorized CAPSULE_SCOPE. " +
+          "The target file and symbol are implicit capabilities and MUST NOT be supplied. " +
+          "Prefer replace_node: copy the smallest exact AST fragment from the authorized scope into before, and provide only its replacement. " +
+          "Do not reproduce the enclosing function. rename_symbol is reserved for a semantic rename. " +
+          "The deterministic compiler resolves the target, requires a unique AST node, expands the physical edit, and runs guarded checks. " +
+          "PATCH_RETRY means revise semantic intent once; PATCH_RESCOUT means new evidence is required.",
         input: {
           type: "object",
           properties: {
-            file: { type: "string", minLength: 1, maxLength: 4096 },
-            kind: { type: "string", enum: ["replace_body", "replace_expr", "rename_symbol"] },
-            symbol: { type: "string", minLength: 1, maxLength: 256 },
-            body: { type: "string", maxLength: 16384 },
-            before: { type: "string", maxLength: 16384 },
-            after: { type: "string", maxLength: 16384 },
-            new_name: { type: "string", maxLength: 256 },
-            scope: { type: "string", enum: ["handoff"] },
+            kind: {
+              type: "string",
+              enum: [
+                "replace_node",
+                "rename_symbol",
+              ],
+            },
+            before: {
+              type: "string",
+              minLength: 1,
+              maxLength: 4096,
+              description:
+                "Smallest exact source fragment identifying one named AST node inside the mutation-authorized scope.",
+            },
+            replacement: {
+              type: "string",
+              maxLength: 4096,
+              description:
+                "Replacement fragment only. Use indentation relative to the selected node; never reproduce the enclosing function.",
+            },
+            new_name: {
+              type: "string",
+              minLength: 1,
+              maxLength: 256,
+            },
+            scope: {
+              type: "string",
+              enum: ["handoff"],
+            },
           },
-          required: ["file", "kind", "symbol"],
+          required: ["kind"],
           additionalProperties: false,
         },
         options: {
@@ -7108,7 +8731,11 @@ export default {
               sessionID,
               turnID: state?.turnID ?? null,
               project_root: root,
+              mutation_attempt: state?.mutationAttempts ?? null,
+              repair_attempts: state?.repairAttempts ?? null,
+              compiler_runs: state?.compilerRuns ?? null,
               patch_attempt: state?.patchAttempts ?? null,
+              executor_runs: state?.executorRuns ?? null,
               executed_patches: state?.executedPatches ?? null,
               turn_model_calls: state?.modelCalls ?? null,
               scout_handoff_path: state?.scoutHandoffPath ?? null,
@@ -7158,29 +8785,209 @@ export default {
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
             }
           }
-          if (state.patchAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
-            applyExecutionEvent(state, "fatal", "patch_attempt_budget")
-            await trace({ admitted: false, reason: "patch_attempt_budget", action: "stop" })
+          if (state.mutationAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
+            applyExecutionEvent(state, "fatal", "mutation_attempt_budget")
+            await trace({
+              admitted: false,
+              reason: "mutation_attempt_budget",
+              action: "stop",
+            })
             return {
-              content: `PATCH_STOP reason=patch_attempt_budget attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_attempt_budget" },
+              content:
+                `PATCH_STOP reason=mutation_attempt_budget ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=report_blocked`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason: "mutation_attempt_budget",
+              },
             }
           }
 
-          state.patchAttempts += 1
+          if (state.executionState === EXEC_STATE_REPAIR) {
+            state.repairAttempts += 1
+          }
+
+          state.mutationAttempts += 1
           state.lastSeen = nowMs()
 
-          const mutation = {
-            file: input?.file,
-            kind: input?.kind,
-            symbol: input?.symbol,
-            ...(typeof input?.body === "string" ? { body: input.body } : {}),
-            ...(typeof input?.before === "string" ? { before: input.before } : {}),
-            ...(typeof input?.after === "string" ? { after: input.after } : {}),
-            ...(typeof input?.new_name === "string" ? { new_name: input.new_name } : {}),
-            ...(typeof input?.scope === "string" ? { scope: input.scope } : {}),
+          const shape = validateMutationShape(input)
+
+          if (shape.ok !== true) {
+            const repeated =
+              state.contractFailureSignatures.has(shape.signature)
+
+            state.contractFailureSignatures.add(shape.signature)
+
+            const canRetry =
+              !repeated &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+
+            const reason = repeated
+              ? "duplicate_mutation_shape"
+              : shape.reason
+
+            const action = canRetry ? "retry" : "stop"
+
+            if (canRetry) {
+              applyExecutionEvent(
+                state,
+                "patch_retry",
+                reason,
+              )
+            } else {
+              applyExecutionEvent(
+                state,
+                "fatal",
+                reason,
+              )
+            }
+
+            await trace({
+              admitted: false,
+              failure_layer: "tool_contract",
+              reason,
+              contract_detail: shape.detail,
+              contract_signature: shape.signature,
+              action,
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            if (canRetry) {
+              return {
+                content:
+                  `PATCH_RETRY reason=${reason} ` +
+                  `detail=${shape.detail} ` +
+                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                  `action=revise_mutation_shape`,
+                metadata: {
+                  protocol: EXECUTION_LOOP_PROTOCOL,
+                  action,
+                  reason,
+                  detail: shape.detail,
+                  failure_layer: "tool_contract",
+                  compiler_run: false,
+                  executor_run: false,
+                },
+              }
+            }
+
+            return {
+              content:
+                `PATCH_STOP reason=${reason} ` +
+                `detail=${shape.detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=report_blocked`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action,
+                reason,
+                detail: shape.detail,
+                failure_layer: "tool_contract",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
           }
+
+          const authorization =
+            await materializeCapabilityBoundMutation(
+              root,
+              state,
+              input,
+            )
+
+          if (authorization.ok !== true) {
+            const reason =
+              typeof authorization.reason === "string"
+                ? authorization.reason
+                : "mutation_scope_unavailable"
+
+            const detail =
+              typeof authorization.detail === "string"
+                ? authorization.detail
+                : reason
+
+            if (authorization.rescout === true) {
+              applyExecutionEvent(
+                state,
+                "patch_rescout",
+                reason,
+                {
+                  reason,
+                  detail,
+                },
+              )
+
+              await trace({
+                admitted: false,
+                failure_layer: "scope_authorization",
+                reason,
+                scope_detail: detail,
+                action: "rescout",
+                compiler_run: false,
+                executor_run: false,
+              })
+
+              return {
+                content:
+                  `PATCH_RESCOUT reason=${reason} ` +
+                  `detail=${detail} ` +
+                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                  `action=refine_search`,
+                metadata: {
+                  protocol: EXECUTION_LOOP_PROTOCOL,
+                  action: "rescout",
+                  reason,
+                  detail,
+                  failure_layer: "scope_authorization",
+                  compiler_run: false,
+                  executor_run: false,
+                },
+              }
+            }
+
+            applyExecutionEvent(
+              state,
+              "fatal",
+              reason,
+            )
+
+            await trace({
+              admitted: false,
+              failure_layer: "internal_contract",
+              reason,
+              scope_detail: detail,
+              action: "stop",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_STOP reason=${reason} ` +
+                `detail=${detail} action=report_blocked`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason,
+                detail,
+                failure_layer: "internal_contract",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          const mutation =
+            authorization.mutation
+
           const mutations = [mutation]
+
+          state.compilerRuns += 1
+
           const compiled = await runPatchCompiler(root, {
             root,
             handoff: state.scoutHandoffPath,
@@ -7200,7 +9007,9 @@ export default {
           if (compilerResponse?.ok !== true) {
             const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
             const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
-            const canRetry = PATCH_COMPILER_RETRY_REASONS.has(reason) && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+            const canRetry =
+              PATCH_COMPILER_RETRY_REASONS.has(reason) &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
             const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
             if (needsRescout) {
               applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
@@ -7221,32 +9030,35 @@ export default {
             })
             if (needsRescout) {
               return {
-                content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+                content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
                 metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
               }
             }
             if (canRetry) {
               return {
-                content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
                 metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
               }
             }
             return {
-              content: `PATCH_STOP reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+              content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
             }
           }
+
+          state.patchAttempts += 1
 
           const signature = patchPlanSignature(compilerResponse)
           if (state.patchSignatures.has(signature)) {
             applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
             await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
             return {
-              content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
+              content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
             }
           }
           state.patchSignatures.add(signature)
+          state.executorRuns += 1
           state.executedPatches += 1
 
           const result = await runPatchExecutor(root, {
@@ -7295,7 +9107,9 @@ export default {
             const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
             if (!proofAssessment.ok) {
               const failedProofs = compactProofFailure(proofAssessment)
-              const canRepair = proofAssessment.disposition === "repair" && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+              const canRepair =
+                proofAssessment.disposition === "repair" &&
+                state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
               if (proofAssessment.disposition === "rescout") {
                 applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
                   reason: "proof_obligation_failed",
@@ -7311,7 +9125,7 @@ export default {
                 applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
                 await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
                 return {
-                  content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                  content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
                   metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
                 }
               }
@@ -7370,7 +9184,7 @@ export default {
                 `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
                 `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
                 `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
-                `capsule=${state.editCapsulePath ?? "none"} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
+                `capsule=${state.editCapsulePath ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
               metadata: {
                 protocol: EXECUTION_LOOP_PROTOCOL,
                 action: "ready",
@@ -7402,7 +9216,9 @@ export default {
           }
 
           const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
-          const canRetry = PATCH_RETRY_REASONS.has(reason) && state.patchAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+          const canRetry =
+            PATCH_RETRY_REASONS.has(reason) &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
           const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
           const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
           if (needsRescout) {
@@ -7420,24 +9236,26 @@ export default {
             compiler_elapsed_ms: compiled.elapsedMs,
             compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
             executor_elapsed_ms: result.elapsedMs,
+            executor_diagnostic:
+              result.diagnostic ?? null,
             allowed_files: response?.allowed_files ?? [],
             changed_files: response?.changed_files ?? [],
           })
 
           if (needsRescout) {
             return {
-              content: `PATCH_RESCOUT reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+              content: `PATCH_RESCOUT reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
             }
           }
           if (canRetry) {
             return {
-              content: `PATCH_RETRY reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+              content: `PATCH_RETRY reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
             }
           }
           return {
-            content: `PATCH_STOP reason=${reason} attempts=${state.patchAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+            content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
             metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
           }
         },
@@ -7557,12 +9375,36 @@ export default {
       state.lastSeen = nowMs()
 
       let contextBytes = null
+      let systemBytes = null
+      let messagesBytes = null
+      let toolsBytes = null
+      let messageBreakdown = []
+
       try {
         contextBytes = bytes(JSON.stringify({
           system: event.system,
           messages: event.messages,
           tools: event.tools,
         }))
+
+        systemBytes = bytes(JSON.stringify(event.system))
+        messagesBytes = bytes(JSON.stringify(event.messages))
+        toolsBytes = bytes(JSON.stringify(event.tools))
+
+        messageBreakdown = Array.isArray(event.messages)
+          ? event.messages.map((message, index) => ({
+              index,
+              role:
+                typeof message?.role === "string"
+                  ? message.role
+                  : null,
+              bytes: bytes(JSON.stringify(message)),
+              part_count:
+                Array.isArray(message?.parts)
+                  ? message.parts.length
+                  : null,
+            }))
+          : []
       } catch {
         // Best-effort telemetry.
       }
@@ -7580,6 +9422,10 @@ export default {
         model_call: state.modelCalls,
         turn_elapsed_ms: elapsed,
         context_bytes: contextBytes,
+        context_system_bytes: systemBytes,
+        context_messages_bytes: messagesBytes,
+        context_tools_bytes: toolsBytes,
+        context_message_breakdown: messageBreakdown,
         message_count: Array.isArray(event.messages) ? event.messages.length : null,
         tool_count:
           event.tools && typeof event.tools === "object"
@@ -7602,7 +9448,11 @@ export default {
         pending_rescout: state.pendingRescout,
         turn_search_attempts: state.searchAttempts,
         turn_executed_searches: state.executedSearches,
+        turn_mutation_attempts: state.mutationAttempts,
+        turn_repair_attempts: state.repairAttempts,
+        turn_compiler_runs: state.compilerRuns,
         turn_patch_attempts: state.patchAttempts,
+        turn_executor_runs: state.executorRuns,
         turn_executed_patches: state.executedPatches,
         turn_patch_accepted: state.patchAccepted,
         turn_evidence_bytes: state.evidenceBytes,

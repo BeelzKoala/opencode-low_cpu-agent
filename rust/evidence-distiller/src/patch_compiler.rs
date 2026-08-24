@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use opencode_evidence_distiller::impact_index_core::{
-    resolve_symbol_closure, SymbolClosureBinding,
-};
-use ast_grep_core::{matcher::MatcherExt, Pattern};
+use ast_grep_core::{Pattern, matcher::MatcherExt};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
+use opencode_evidence_distiller::impact_index_core::{
+    SymbolClosureBinding, resolve_symbol_closure,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,13 +17,13 @@ const PROTOCOL: &str = "patch-compiler-v1";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
 const EDIT_PROTOCOL: &str = "edit-script-v2";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
-const SEARCH_PROTOCOL: &str = "search-v2.13.6-scout-handoff";
 const MAX_MUTATIONS: usize = 4;
 const MAX_LOWERED_EDITS: usize = 4;
 const MAX_CHANGED_FILES: usize = 2;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
+const MAX_NODE_REPLACEMENT_BYTES: usize = 4 * 1024;
 const MAX_CHECK_BYTES: usize = 4 * 1024;
 const MAX_EVIDENCE_DISTANCE_LINES: usize = 96;
 const MAX_RENAME_OCCURRENCES: usize = 16;
@@ -48,6 +48,8 @@ struct Mutation {
     #[serde(default)]
     after: Option<String>,
     #[serde(default)]
+    replacement: Option<String>,
+    #[serde(default)]
     new_name: Option<String>,
     #[serde(default)]
     scope: Option<String>,
@@ -56,7 +58,8 @@ struct Mutation {
 #[derive(Debug, Deserialize)]
 struct ScoutHandoff {
     protocol: String,
-    search_protocol: String,
+    #[serde(rename = "search_protocol")]
+    _search_protocol: String,
     status: String,
     #[serde(default)]
     blocking_reasons: Vec<String>,
@@ -108,7 +111,11 @@ struct Response {
 }
 
 impl Response {
-    fn rejected(request: &Request, reason: impl Into<String>, mutation_index: Option<usize>) -> Self {
+    fn rejected(
+        request: &Request,
+        reason: impl Into<String>,
+        mutation_index: Option<usize>,
+    ) -> Self {
         Self {
             protocol: PROTOCOL,
             mutation_protocol: request.mutation_protocol.clone(),
@@ -149,15 +156,27 @@ fn normalize_rel(path: &Path) -> Option<String> {
             _ => return None,
         }
     }
-    if parts.is_empty() { None } else { Some(parts.join("/")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 fn safe_rel(raw: &str) -> Option<String> {
-    if raw.is_empty() || raw.len() > 4096 || raw.chars().any(char::is_control) || Path::new(raw).is_absolute() {
+    if raw.is_empty()
+        || raw.len() > 4096
+        || raw.chars().any(char::is_control)
+        || Path::new(raw).is_absolute()
+    {
         return None;
     }
     let rel = normalize_rel(Path::new(raw.trim_start_matches("./")))?;
-    if rel == ".git" || rel.starts_with(".git/") || rel == ".opencode" || rel.starts_with(".opencode/") {
+    if rel == ".git"
+        || rel.starts_with(".git/")
+        || rel == ".opencode"
+        || rel.starts_with(".opencode/")
+    {
         return None;
     }
     Some(rel)
@@ -177,25 +196,45 @@ fn safe_existing_file(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
-    anyhow::ensure!(!raw.is_empty() && !Path::new(raw).is_absolute(), "handoff_path_invalid");
-    let rel = normalize_rel(Path::new(raw.trim_start_matches("./"))).context("handoff_path_invalid")?;
-    anyhow::ensure!(rel.starts_with(".opencode/scout-handoffs/"), "handoff_path_invalid");
+    anyhow::ensure!(
+        !raw.is_empty() && !Path::new(raw).is_absolute(),
+        "handoff_path_invalid"
+    );
+    let rel =
+        normalize_rel(Path::new(raw.trim_start_matches("./"))).context("handoff_path_invalid")?;
+    anyhow::ensure!(
+        rel.starts_with(".opencode/scout-handoffs/"),
+        "handoff_path_invalid"
+    );
     let candidate = fs::canonicalize(root.join(&rel)).context("handoff_unavailable")?;
-    let handoff_root = fs::canonicalize(root.join(".opencode/scout-handoffs")).context("handoff_root_unavailable")?;
+    let handoff_root = fs::canonicalize(root.join(".opencode/scout-handoffs"))
+        .context("handoff_root_unavailable")?;
     anyhow::ensure!(candidate.starts_with(&handoff_root), "handoff_path_escape");
-    serde_json::from_slice(&fs::read(candidate).context("handoff_read_failed")?).context("handoff_json_invalid")
+    serde_json::from_slice(&fs::read(candidate).context("handoff_read_failed")?)
+        .context("handoff_json_invalid")
 }
 
 fn nearest_evidence_distance(line: usize, evidence: &[usize]) -> Option<usize> {
-    evidence.iter().copied().filter(|value| *value > 0).map(|value| value.abs_diff(line)).min()
+    evidence
+        .iter()
+        .copied()
+        .filter(|value| *value > 0)
+        .map(|value| value.abs_diff(line))
+        .min()
 }
 
 fn line_for_byte(text: &str, byte: usize) -> usize {
-    text.as_bytes()[..byte.min(text.len())].iter().filter(|value| **value == b'\n').count() + 1
+    text.as_bytes()[..byte.min(text.len())]
+        .iter()
+        .filter(|value| **value == b'\n')
+        .count()
+        + 1
 }
 
 fn count_exact(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() { return 0; }
+    if needle.is_empty() {
+        return 0;
+    }
     haystack.match_indices(needle).take(2).count()
 }
 
@@ -218,7 +257,11 @@ fn symbol_target_ranges(
     let lang = SupportLang::from_path(&file.path).ok_or("language_unsupported")?;
     let ast = lang.ast_grep(&file.source);
     let root = ast.root();
-    if root.clone().dfs().any(|node| node.is_error() || node.is_missing()) {
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
         return Err("source_syntax_invalid");
     }
 
@@ -227,11 +270,15 @@ fn symbol_target_ranges(
         if !is_definition_kind(node.kind().as_ref()) {
             continue;
         }
-        let Some(name) = node.field("name") else { continue; };
+        let Some(name) = node.field("name") else {
+            continue;
+        };
         if name.text().as_ref() != symbol {
             continue;
         }
-        let Some(body) = node.field("body") else { continue; };
+        let Some(body) = node.field("body") else {
+            continue;
+        };
         let line = node.start_pos().line() + 1;
         let Some(distance) = nearest_evidence_distance(line, &file.evidence_lines) else {
             return Err("evidence_anchor_missing");
@@ -258,7 +305,10 @@ fn apply_range(text: &str, outer: Range<usize>, inner: Range<usize>, replacement
 }
 
 fn line_indent(source: &str, byte: usize) -> String {
-    let line_start = source[..byte.min(source.len())].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_start = source[..byte.min(source.len())]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
     source[line_start..byte.min(source.len())]
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
@@ -274,15 +324,29 @@ fn format_body(source: &str, body_range: &Range<usize>, body: &str) -> String {
         if trimmed.is_empty() {
             return "{}".to_string();
         }
-        let joined = trimmed.lines().map(str::trim_end).collect::<Vec<_>>().join(&format!("\n{inner_indent}"));
+        let joined = trimmed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join(&format!("\n{inner_indent}"));
         format!("{{\n{inner_indent}{joined}\n{base_indent}}}")
     } else {
-        trimmed.lines().map(str::trim_end).collect::<Vec<_>>().join(&format!("\n{base_indent}"))
+        trimmed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join(&format!("\n{base_indent}"))
     }
 }
 
-fn compile_replace_body(file: &AllowedFile, mutation: &Mutation) -> std::result::Result<Option<Edit>, &'static str> {
-    let body = mutation.body.as_deref().ok_or("mutation_contract_invalid")?;
+fn compile_replace_body(
+    file: &AllowedFile,
+    mutation: &Mutation,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let body = mutation
+        .body
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
     if body.len() > MAX_BODY_BYTES || body.contains('\0') {
         return Err("mutation_contract_invalid");
     }
@@ -293,12 +357,26 @@ fn compile_replace_body(file: &AllowedFile, mutation: &Mutation) -> std::result:
     if before == after {
         return Ok(None);
     }
-    Ok(Some(Edit { file: file.rel.clone(), kind: "replace_exact".to_string(), before, after }))
+    Ok(Some(Edit {
+        file: file.rel.clone(),
+        kind: "replace_exact".to_string(),
+        before,
+        after,
+    }))
 }
 
-fn compile_replace_expr(file: &AllowedFile, mutation: &Mutation) -> std::result::Result<Option<Edit>, &'static str> {
-    let before_pattern = mutation.before.as_deref().ok_or("mutation_contract_invalid")?;
-    let after_fragment = mutation.after.as_deref().ok_or("mutation_contract_invalid")?;
+fn compile_replace_expr(
+    file: &AllowedFile,
+    mutation: &Mutation,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let before_pattern = mutation
+        .before
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+    let after_fragment = mutation
+        .after
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
     if before_pattern.is_empty()
         || before_pattern.len() > MAX_FRAGMENT_BYTES
         || after_fragment.len() > MAX_FRAGMENT_BYTES
@@ -312,7 +390,8 @@ fn compile_replace_expr(file: &AllowedFile, mutation: &Mutation) -> std::result:
     }
     let (def_range, _) = symbol_target_ranges(file, &mutation.symbol)?;
     let lang = SupportLang::from_path(&file.path).ok_or("language_unsupported")?;
-    let pattern = Pattern::try_new(before_pattern, lang).map_err(|_| "expression_pattern_invalid")?;
+    let pattern =
+        Pattern::try_new(before_pattern, lang).map_err(|_| "expression_pattern_invalid")?;
     let ast = lang.ast_grep(&file.source);
     let root = ast.root();
     let mut matched = Vec::new();
@@ -328,13 +407,125 @@ fn compile_replace_expr(file: &AllowedFile, mutation: &Mutation) -> std::result:
             }
         }
     }
-    let Some(expr_range) = matched.into_iter().next() else { return Err("expression_not_found"); };
+    let Some(expr_range) = matched.into_iter().next() else {
+        return Err("expression_not_found");
+    };
     let before = file.source[def_range.clone()].to_string();
     let after = apply_range(&file.source, def_range, expr_range, after_fragment);
     if before == after {
         return Ok(None);
     }
-    Ok(Some(Edit { file: file.rel.clone(), kind: "replace_exact".to_string(), before, after }))
+    Ok(Some(Edit {
+        file: file.rel.clone(),
+        kind: "replace_exact".to_string(),
+        before,
+        after,
+    }))
+}
+
+fn format_node_replacement(source: &str, node_range: &Range<usize>, replacement: &str) -> String {
+    let trimmed = replacement.trim();
+
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if !trimmed.contains('\n') {
+        return trimmed.to_string();
+    }
+
+    let base_indent = line_indent(source, node_range.start);
+
+    let mut lines = trimmed.lines();
+    let mut out = String::new();
+
+    if let Some(first) = lines.next() {
+        out.push_str(first.trim_end());
+    }
+
+    for line in lines {
+        out.push('\n');
+        out.push_str(&base_indent);
+        out.push_str(line.trim_end());
+    }
+
+    out
+}
+
+fn compile_replace_node(
+    file: &AllowedFile,
+    mutation: &Mutation,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let before_pattern = mutation
+        .before
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+
+    let replacement = mutation
+        .replacement
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+
+    if before_pattern.is_empty()
+        || before_pattern.len() > MAX_FRAGMENT_BYTES
+        || replacement.len() > MAX_NODE_REPLACEMENT_BYTES
+        || before_pattern.contains('\0')
+        || replacement.contains('\0')
+    {
+        return Err("mutation_contract_invalid");
+    }
+
+    if before_pattern == replacement {
+        return Ok(None);
+    }
+
+    let (def_range, _) = symbol_target_ranges(file, &mutation.symbol)?;
+
+    let lang = SupportLang::from_path(&file.path).ok_or("language_unsupported")?;
+
+    let pattern = Pattern::try_new(before_pattern, lang).map_err(|_| "node_pattern_invalid")?;
+
+    let ast = lang.ast_grep(&file.source);
+    let root = ast.root();
+
+    let mut matched = Vec::new();
+
+    for node in root.dfs().filter(|node| node.is_named()) {
+        let range = node.range();
+
+        if (range.start < def_range.start || range.end > def_range.end) {
+            continue;
+        }
+
+        if pattern.match_node(node.clone()).is_some() {
+            matched.push(range);
+
+            if matched.len() > 1 {
+                return Err("node_ambiguous");
+            }
+        }
+    }
+
+    let Some(node_range) = matched.into_iter().next() else {
+        return Err("node_not_found");
+    };
+
+    let formatted = format_node_replacement(&file.source, &node_range, replacement);
+
+    let before = file.source[def_range.clone()].to_string();
+
+    let after = apply_range(&file.source, def_range, node_range, &formatted);
+
+    if before == after {
+        return Ok(None);
+    }
+
+    Ok(Some(Edit {
+        file: file.rel.clone(),
+        kind: "replace_exact".to_string(),
+        before,
+        after,
+    }))
 }
 
 fn valid_ascii_identifier(value: &str) -> bool {
@@ -347,7 +538,10 @@ fn valid_ascii_identifier(value: &str) -> bool {
 }
 
 fn line_bounds(source: &str, byte: usize) -> (usize, usize) {
-    let start = source[..byte.min(source.len())].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let start = source[..byte.min(source.len())]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
     let end = source[byte.min(source.len())..]
         .find('\n')
         .map(|idx| byte.min(source.len()) + idx)
@@ -387,9 +581,7 @@ fn same_range(a: &Range<usize>, b: &Range<usize>) -> bool {
 fn is_class_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "class_definition"
-            | "class_declaration"
-            | "abstract_class_declaration"
+        "class_definition" | "class_declaration" | "abstract_class_declaration"
     )
 }
 
@@ -427,10 +619,7 @@ fn owner_def_index(defs: &[RenameDef], range: &Range<usize>) -> Option<usize> {
         .map(|(idx, _)| idx)
 }
 
-fn enclosing_class(
-    classes: &[Range<usize>],
-    range: &Range<usize>,
-) -> Option<Range<usize>> {
+fn enclosing_class(classes: &[Range<usize>], range: &Range<usize>) -> Option<Range<usize>> {
     classes
         .iter()
         .filter(|body| range_contains(body, range))
@@ -536,16 +725,13 @@ fn scan_rename_facts(
         }
 
         let binding_fields: &[&str] = match kind.as_str() {
-            "assignment"
-            | "augmented_assignment"
-            | "assignment_expression" => &["left"],
+            "assignment" | "augmented_assignment" | "assignment_expression" => &["left"],
 
             "variable_declarator" => &["name"],
 
             "named_expression" => &["name"],
 
-            "for_statement"
-            | "for_in_statement" => &["left"],
+            "for_statement" | "for_in_statement" => &["left"],
 
             "catch_clause" => &["parameter"],
 
@@ -614,7 +800,6 @@ fn scan_rename_facts(
     })
 }
 
-
 fn unique_exact_pos(source: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -682,8 +867,7 @@ fn rewrite_python_from_import(
         return Err("rename_import_validation_failed");
     }
 
-    let clause_offset_in_trimmed =
-        "from ".len() + import_at + " import ".len();
+    let clause_offset_in_trimmed = "from ".len() + import_at + " import ".len();
 
     let leading = witness.len() - trimmed.len();
     let clause_start = leading + clause_offset_in_trimmed;
@@ -736,18 +920,12 @@ fn rewrite_python_from_import(
     let (start, end) = candidates[0];
 
     let mut out = witness.to_string();
-    out.replace_range(
-        clause_start + start..clause_start + end,
-        new_name,
-    );
+    out.replace_range(clause_start + start..clause_start + end, new_name);
 
     Ok(out)
 }
 
-fn range_inside_any_def(
-    defs: &[RenameDef],
-    range: &Range<usize>,
-) -> bool {
+fn range_inside_any_def(defs: &[RenameDef], range: &Range<usize>) -> bool {
     defs.iter().any(|def| range_contains(&def.body, range))
 }
 
@@ -774,10 +952,11 @@ fn python_scope_shadows_import(
             return Ok(true);
         }
 
-        if facts.declarations.iter().any(|decl| {
-            !range_contains(import_range, decl)
-                && range_contains(&def.body, decl)
-        }) {
+        if facts
+            .declarations
+            .iter()
+            .any(|decl| !range_contains(import_range, decl) && range_contains(&def.body, decl))
+        {
             return Ok(true);
         }
     }
@@ -788,8 +967,7 @@ fn python_scope_shadows_import(
      * rebinding analysis here.
      */
     let module_competitor = facts.declarations.iter().any(|decl| {
-        !range_contains(import_range, decl)
-            && !range_inside_any_def(&facts.defs, decl)
+        !range_contains(import_range, decl) && !range_inside_any_def(&facts.defs, decl)
     });
 
     if module_competitor {
@@ -808,14 +986,11 @@ fn compile_python_import_binding(
         return Err("rename_binding_unsupported");
     }
 
-    let Some(import_start) =
-        unique_exact_pos(&file.source, &binding.witness)
-    else {
+    let Some(import_start) = unique_exact_pos(&file.source, &binding.witness) else {
         return Err("rename_import_precondition_not_unique");
     };
 
-    let import_range =
-        import_start..import_start + binding.witness.len();
+    let import_range = import_start..import_start + binding.witness.len();
 
     let import_after = rewrite_python_from_import(
         &binding.witness,
@@ -849,8 +1024,7 @@ fn compile_python_import_binding(
 
     let facts = scan_rename_facts(file, &binding.local_symbol)?;
 
-    let mut by_owner =
-        BTreeMap::<(usize, usize), Vec<Range<usize>>>::new();
+    let mut by_owner = BTreeMap::<(usize, usize), Vec<Range<usize>>>::new();
 
     for (range, _) in &facts.candidates {
         if range_contains(&import_range, range) {
@@ -888,11 +1062,7 @@ fn compile_python_import_binding(
             continue;
         }
 
-        if python_scope_shadows_import(
-            &facts,
-            range,
-            &import_range,
-        )? {
+        if python_scope_shadows_import(&facts, range, &import_range)? {
             continue;
         }
 
@@ -914,18 +1084,13 @@ fn compile_python_import_binding(
     }
 
     for ((start, end), mut ranges) in by_owner {
-        if end <= start
-            || end > file.source.len()
-            || end - start > MAX_FRAGMENT_BYTES
-        {
+        if end <= start || end > file.source.len() || end - start > MAX_FRAGMENT_BYTES {
             return Err("rename_context_too_large");
         }
 
         let before = file.source[start..end].to_string();
 
-        if before.is_empty()
-            || count_exact(&file.source, &before) != 1
-        {
+        if before.is_empty() || count_exact(&file.source, &before) != 1 {
             return Err("rename_context_ambiguous");
         }
 
@@ -937,16 +1102,11 @@ fn compile_python_import_binding(
             let local_start = range.start - start;
             let local_end = range.end - start;
 
-            if &after[local_start..local_end]
-                != binding.local_symbol.as_str()
-            {
+            if &after[local_start..local_end] != binding.local_symbol.as_str() {
                 return Err("rename_binding_ambiguous");
             }
 
-            after.replace_range(
-                local_start..local_end,
-                new_name,
-            );
+            after.replace_range(local_start..local_end, new_name);
         }
 
         if after != before {
@@ -969,15 +1129,11 @@ fn closure_failure_reason(reason: Option<&str>) -> &'static str {
         Some("closure_index_refresh_incomplete")
         | Some("closure_index_unavailable")
         | Some("closure_index_incomplete")
-        | Some("closure_source_validation_failed") => {
-            "rename_dependency_evidence_invalid"
-        }
-        Some("closure_binding_budget_exceeded")
-        | Some("closure_state_budget_exceeded") => {
+        | Some("closure_source_validation_failed") => "rename_dependency_evidence_invalid",
+        Some("closure_binding_budget_exceeded") | Some("closure_state_budget_exceeded") => {
             "rename_scope_too_large"
         }
-        Some("closure_member_binding_unsupported")
-        | Some("closure_unsupported_import_syntax") => {
+        Some("closure_member_binding_unsupported") | Some("closure_unsupported_import_syntax") => {
             "rename_binding_unsupported"
         }
         _ => "rename_binding_unsupported",
@@ -1108,18 +1264,12 @@ fn compile_rename(
      * resolver. The compiler must not infer identity from spelling or handoff
      * membership.
      */
-    let closure = resolve_symbol_closure(
-        root,
-        &target.rel,
-        &mutation.symbol,
-        MAX_RENAME_OCCURRENCES,
-    )
-    .map_err(|_| "rename_dependency_evidence_invalid")?;
+    let closure =
+        resolve_symbol_closure(root, &target.rel, &mutation.symbol, MAX_RENAME_OCCURRENCES)
+            .map_err(|_| "rename_dependency_evidence_invalid")?;
 
     if !closure.ready || !closure.complete {
-        return Err(closure_failure_reason(
-            closure.reason.as_deref(),
-        ));
+        return Err(closure_failure_reason(closure.reason.as_deref()));
     }
 
     /*
@@ -1174,11 +1324,7 @@ fn compile_rename(
              * x.foo, super().foo and other receivers remain unknown.
              */
             match member_receiver {
-                Some("self" | "cls" | "this")
-                    if range_contains(class_body, range) =>
-                {
-                    true
-                }
+                Some("self" | "cls" | "this") if range_contains(class_body, range) => true,
 
                 Some(_) if range_contains(class_body, range) => {
                     return Err("rename_binding_ambiguous");
@@ -1202,9 +1348,7 @@ fn compile_rename(
             continue;
         }
 
-        let Some(distance) =
-            nearest_evidence_distance(*line, &target.evidence_lines)
-        else {
+        let Some(distance) = nearest_evidence_distance(*line, &target.evidence_lines) else {
             return Err("evidence_anchor_missing");
         };
 
@@ -1228,8 +1372,7 @@ fn compile_rename(
      *
      * We deliberately do NOT widen to arbitrary neighbouring lines.
      */
-    let mut groups =
-        BTreeMap::<(usize, usize), Vec<Range<usize>>>::new();
+    let mut groups = BTreeMap::<(usize, usize), Vec<Range<usize>>>::new();
 
     for range in proven_ranges {
         let envelope = if same_range(&range, &target_def.name) {
@@ -1260,10 +1403,7 @@ fn compile_rename(
     let mut edits = Vec::new();
 
     for ((start, end), mut ranges) in groups {
-        if end <= start
-            || end > target.source.len()
-            || end - start > MAX_FRAGMENT_BYTES
-        {
+        if end <= start || end > target.source.len() || end - start > MAX_FRAGMENT_BYTES {
             return Err("rename_context_too_large");
         }
 
@@ -1318,18 +1458,11 @@ fn compile_rename(
             return Err("rename_scope_incomplete");
         };
 
-        let lang = SupportLang::from_path(&importer.path)
-            .ok_or("language_unsupported")?;
+        let lang = SupportLang::from_path(&importer.path).ok_or("language_unsupported")?;
 
         match lang {
             SupportLang::Python => {
-                edits.extend(
-                    compile_python_import_binding(
-                        importer,
-                        binding,
-                        new_name,
-                    )?
-                );
+                edits.extend(compile_python_import_binding(importer, binding, new_name)?);
             }
 
             /*
@@ -1337,9 +1470,7 @@ fn compile_rename(
              * compiler does not yet have a block/function lexical-shadow
              * validator strong enough to mutate them safely.
              */
-            SupportLang::JavaScript
-            | SupportLang::TypeScript
-            | SupportLang::Tsx => {
+            SupportLang::JavaScript | SupportLang::TypeScript | SupportLang::Tsx => {
                 return Err("rename_binding_unsupported");
             }
 
@@ -1361,7 +1492,11 @@ fn compile_rename(
 
 fn compile(request: &Request) -> Result<Response> {
     if request.mutation_protocol != MUTATION_PROTOCOL {
-        return Ok(Response::rejected(request, "mutation_protocol_mismatch", None));
+        return Ok(Response::rejected(
+            request,
+            "mutation_protocol_mismatch",
+            None,
+        ));
     }
     if request.mutations.is_empty() || request.mutations.len() > MAX_MUTATIONS {
         return Ok(Response::rejected(request, "mutation_count_invalid", None));
@@ -1372,10 +1507,19 @@ fn compile(request: &Request) -> Result<Response> {
         Ok(value) => value,
         Err(error) => return Ok(Response::rejected(request, error.to_string(), None)),
     };
-    if handoff.protocol != HANDOFF_PROTOCOL || handoff.search_protocol != SEARCH_PROTOCOL {
-        return Ok(Response::rejected(request, "handoff_protocol_mismatch", None));
+    // Compatibility is defined by the stable handoff schema.
+    // search_protocol is provenance only and may evolve independently.
+    if handoff.protocol != HANDOFF_PROTOCOL {
+        return Ok(Response::rejected(
+            request,
+            "handoff_protocol_mismatch",
+            None,
+        ));
     }
-    if handoff.status != "ready" || !handoff.blocking_reasons.is_empty() || !handoff.partial_reasons.is_empty() {
+    if handoff.status != "ready"
+        || !handoff.blocking_reasons.is_empty()
+        || !handoff.partial_reasons.is_empty()
+    {
         return Ok(Response::rejected(request, "handoff_not_ready", None));
     }
 
@@ -1385,13 +1529,25 @@ fn compile(request: &Request) -> Result<Response> {
             return Ok(Response::rejected(request, "handoff_file_invalid", None));
         };
         let Some(path) = safe_existing_file(&root, &rel) else {
-            return Ok(Response::rejected(request, "handoff_file_unavailable", None));
+            return Ok(Response::rejected(
+                request,
+                "handoff_file_unavailable",
+                None,
+            ));
         };
         let source = match fs::read_to_string(&path) {
             Ok(value) => value,
             Err(_) => return Ok(Response::rejected(request, "handoff_file_not_utf8", None)),
         };
-        allowed.insert(rel.clone(), AllowedFile { rel, path, source, evidence_lines: handoff_file.evidence_lines });
+        allowed.insert(
+            rel.clone(),
+            AllowedFile {
+                rel,
+                path,
+                source,
+                evidence_lines: handoff_file.evidence_lines,
+            },
+        );
     }
     if allowed.is_empty() {
         return Ok(Response::rejected(request, "handoff_scope_empty", None));
@@ -1404,14 +1560,29 @@ fn compile(request: &Request) -> Result<Response> {
     let mut effective = 0usize;
 
     for (idx, mutation) in request.mutations.iter().enumerate() {
-        if mutation.symbol.is_empty() || mutation.symbol.len() > 256 || mutation.symbol.contains('\0') {
-            return Ok(Response::rejected(request, "mutation_contract_invalid", Some(idx)));
+        if mutation.symbol.is_empty()
+            || mutation.symbol.len() > 256
+            || mutation.symbol.contains('\0')
+        {
+            return Ok(Response::rejected(
+                request,
+                "mutation_contract_invalid",
+                Some(idx),
+            ));
         }
         let Some(rel) = safe_rel(&mutation.file) else {
-            return Ok(Response::rejected(request, "mutation_file_invalid", Some(idx)));
+            return Ok(Response::rejected(
+                request,
+                "mutation_file_invalid",
+                Some(idx),
+            ));
         };
         let Some(file) = allowed.get(&rel) else {
-            return Ok(Response::rejected(request, "file_outside_handoff", Some(idx)));
+            return Ok(Response::rejected(
+                request,
+                "file_outside_handoff",
+                Some(idx),
+            ));
         };
         let key = serde_json::to_string(mutation).context("cannot canonicalize mutation")?;
         if !seen_mutations.insert(key) {
@@ -1425,6 +1596,11 @@ fn compile(request: &Request) -> Result<Response> {
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
+            "replace_node" => match compile_replace_node(file, mutation) {
+                Ok(Some(edit)) => vec![edit],
+                Ok(None) => Vec::new(),
+                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+            },
             "replace_expr" => match compile_replace_expr(file, mutation) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
@@ -1434,7 +1610,13 @@ fn compile(request: &Request) -> Result<Response> {
                 Ok(values) => values,
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
-            _ => return Ok(Response::rejected(request, "mutation_kind_invalid", Some(idx))),
+            _ => {
+                return Ok(Response::rejected(
+                    request,
+                    "mutation_kind_invalid",
+                    Some(idx),
+                ));
+            }
         };
         if compiled.is_empty() {
             dropped_noops += 1;
@@ -1453,17 +1635,32 @@ fn compile(request: &Request) -> Result<Response> {
         return Ok(response);
     }
     if edits.len() > MAX_LOWERED_EDITS {
-        return Ok(Response::rejected(request, "lowered_edit_budget_exceeded", None));
+        return Ok(Response::rejected(
+            request,
+            "lowered_edit_budget_exceeded",
+            None,
+        ));
     }
-    let changed_files = edits.iter().map(|edit| edit.file.clone()).collect::<BTreeSet<_>>();
+    let changed_files = edits
+        .iter()
+        .map(|edit| edit.file.clone())
+        .collect::<BTreeSet<_>>();
     if changed_files.len() > MAX_CHANGED_FILES {
-        return Ok(Response::rejected(request, "changed_file_budget_exceeded", None));
+        return Ok(Response::rejected(
+            request,
+            "changed_file_budget_exceeded",
+            None,
+        ));
     }
 
     let mut checks = BTreeSet::<Postcondition>::new();
     for edit in &edits {
         if !edit.after.is_empty() && edit.after.len() <= MAX_CHECK_BYTES {
-            checks.insert(Postcondition { file: edit.file.clone(), kind: "contains_exact".to_string(), value: edit.after.clone() });
+            checks.insert(Postcondition {
+                file: edit.file.clone(),
+                kind: "contains_exact".to_string(),
+                value: edit.after.clone(),
+            });
         }
     }
     let checks = checks.into_iter().collect::<Vec<_>>();
@@ -1524,7 +1721,10 @@ mod tests {
         let text = "def f():\n    return 1\n";
         let def = 0..21;
         let body = 13..21;
-        assert_eq!(apply_range(text, def, body, "return 2"), "def f():\n    return 2");
+        assert_eq!(
+            apply_range(text, def, body, "return 2"),
+            "def f():\n    return 2"
+        );
     }
 
     #[test]
@@ -1532,7 +1732,6 @@ mod tests {
         assert_eq!(nearest_evidence_distance(10, &[1, 12, 30]), Some(2));
         assert_eq!(nearest_evidence_distance(10, &[]), None);
     }
-
 
     fn rename_file(source: &str, evidence_lines: Vec<usize>) -> AllowedFile {
         let nonce = std::time::SystemTime::now()
@@ -1566,6 +1765,7 @@ mod tests {
             body: None,
             before: None,
             after: None,
+            replacement: None,
             new_name: Some(new_name.to_string()),
             scope: Some("handoff".to_string()),
         }
@@ -1587,12 +1787,13 @@ def second():
         let mut allowed = BTreeMap::new();
         allowed.insert(file.rel.clone(), file.clone());
 
-        let edits =
-            compile_rename(
-                file.path.parent().expect("fixture root"),
-                &allowed,
-                &file, &rename_mutation("alpha", "beta"))
-                .expect("rename should compile");
+        let edits = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .expect("rename should compile");
 
         assert_eq!(edits.len(), 3);
         assert!(edits.iter().all(|edit| edit.kind == "replace_exact"));
@@ -1621,12 +1822,13 @@ def caller(alpha):
         let mut allowed = BTreeMap::new();
         allowed.insert(file.rel.clone(), file.clone());
 
-        let err =
-            compile_rename(
-                file.path.parent().expect("fixture root"),
-                &allowed,
-                &file, &rename_mutation("alpha", "beta"))
-                .unwrap_err();
+        let err = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .unwrap_err();
 
         assert_eq!(err, "rename_binding_ambiguous");
     }
@@ -1645,12 +1847,13 @@ def caller(alpha):
         let mut allowed = BTreeMap::new();
         allowed.insert(file.rel.clone(), file.clone());
 
-        let edits =
-            compile_rename(
-                file.path.parent().expect("fixture root"),
-                &allowed,
-                &file, &rename_mutation("alpha", "beta"))
-                .expect("method rename should compile");
+        let edits = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .expect("method rename should compile");
 
         assert_eq!(edits.len(), 2);
 
@@ -1678,12 +1881,13 @@ def caller(alpha):
         let mut allowed = BTreeMap::new();
         allowed.insert(file.rel.clone(), file.clone());
 
-        let err =
-            compile_rename(
-                file.path.parent().expect("fixture root"),
-                &allowed,
-                &file, &rename_mutation("alpha", "beta"))
-                .unwrap_err();
+        let err = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .unwrap_err();
 
         assert_eq!(err, "rename_binding_ambiguous");
     }
@@ -1759,12 +1963,7 @@ def shadow(price):
             propagates: true,
         };
 
-        let edits = compile_python_import_binding(
-            &file,
-            &binding,
-            "calculate_price",
-        )
-        .unwrap();
+        let edits = compile_python_import_binding(&file, &binding, "calculate_price").unwrap();
 
         let rendered = edits
             .iter()
@@ -1772,29 +1971,13 @@ def shadow(price):
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            rendered.contains(
-                "from service import calculate_price"
-            )
-        );
+        assert!(rendered.contains("from service import calculate_price"));
 
-        assert!(
-            rendered.contains(
-                "return calculate_price(value)"
-            )
-        );
+        assert!(rendered.contains("return calculate_price(value)"));
 
-        assert!(
-            !rendered.contains(
-                "def shadow(calculate_price)"
-            )
-        );
+        assert!(!rendered.contains("def shadow(calculate_price)"));
 
-        assert!(
-            !rendered.contains(
-                "return calculate_price(10)"
-            )
-        );
+        assert!(!rendered.contains("return calculate_price(10)"));
     }
 
     #[test]
@@ -1820,21 +2003,27 @@ def quote(value):
             propagates: false,
         };
 
-        let edits = compile_python_import_binding(
-            &file,
-            &binding,
-            "calculate_price",
-        )
-        .unwrap();
+        let edits = compile_python_import_binding(&file, &binding, "calculate_price").unwrap();
 
         assert_eq!(edits.len(), 1);
 
-        assert_eq!(
-            edits[0].after,
-            "from service import calculate_price as p"
-        );
+        assert_eq!(edits[0].after, "from service import calculate_price as p");
 
         assert!(!edits[0].after.contains("calculate_price("));
     }
+    #[test]
+    fn node_replacement_preserves_relative_indent() {
+        let source = "def f():\n    old_call()\n";
 
+        let start = source.find("old_call()").unwrap();
+
+        let end = start + "old_call()".len();
+
+        let replacement = "if ready:\n    return value";
+
+        assert_eq!(
+            format_node_replacement(source, &(start..end), replacement,),
+            "if ready:\n        return value",
+        );
+    }
 }

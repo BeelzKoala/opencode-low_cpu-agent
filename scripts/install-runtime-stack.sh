@@ -11,6 +11,7 @@ PARENT="$(dirname "$DEST")"
 RUNTIME_MANIFEST=".runtime-stack-v1.json"
 
 COMPONENTS=(
+  opencode-evidence-distiller
   opencode-patch-compiler
   opencode-patch-executor
   opencode-invariant-verifier
@@ -21,6 +22,7 @@ build_stack() {
   cargo build \
     --manifest-path "$CARGO" \
     --release \
+    --bin opencode-evidence-distiller \
     --bin opencode-patch-compiler \
     --bin opencode-patch-executor \
     --bin opencode-invariant-verifier \

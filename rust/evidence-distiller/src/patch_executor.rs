@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
-use ast_grep_core::{matcher::MatcherExt, Pattern};
+use ast_grep_core::{Pattern, matcher::MatcherExt};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    fs,
+    env, fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -14,7 +13,6 @@ use std::{
 
 const PROTOCOL: &str = "patch-executor-v2";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
-const HANDOFF_SEARCH_PROTOCOL: &str = "search-v2.13.6-scout-handoff";
 const EDIT_PROTOCOL: &str = "edit-script-v2";
 const MODE: &str = "guarded";
 const MAX_EDITS: usize = 4;
@@ -58,7 +56,8 @@ struct Postcondition {
 #[derive(Debug, Deserialize)]
 struct ScoutHandoff {
     protocol: String,
-    search_protocol: String,
+    #[serde(rename = "search_protocol")]
+    _search_protocol: String,
     status: String,
     #[serde(default)]
     blocking_reasons: Vec<String>,
@@ -176,7 +175,8 @@ impl Worktree {
             .context("cannot resolve git toplevel")?;
         anyhow::ensure!(top.status.success(), "project root is not a git worktree");
         let top_text = String::from_utf8(top.stdout).context("git toplevel is not UTF-8")?;
-        let top_path = fs::canonicalize(top_text.trim()).context("cannot canonicalize git toplevel")?;
+        let top_path =
+            fs::canonicalize(top_text.trim()).context("cannot canonicalize git toplevel")?;
         anyhow::ensure!(top_path == root, "project root must equal git toplevel");
 
         let nonce = SystemTime::now()
@@ -380,7 +380,11 @@ fn structural_match_range(
     }
     let ast = lang.ast_grep(source);
     let root = ast.root();
-    if root.clone().dfs().any(|node| node.is_error() || node.is_missing()) {
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
         return Err("source_syntax_invalid");
     }
 
@@ -432,11 +436,7 @@ fn bounded_git_diagnostic(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-        (false, false) => format!(
-            "stdout={} stderr={}",
-            stdout.trim(),
-            stderr.trim()
-        ),
+        (false, false) => format!("stdout={} stderr={}", stdout.trim(), stderr.trim()),
         (false, true) => format!("stdout={}", stdout.trim()),
         (true, false) => format!("stderr={}", stderr.trim()),
         (true, true) => "no_output".to_string(),
@@ -447,10 +447,7 @@ fn bounded_git_diagnostic(output: &std::process::Output) -> String {
         .replace('\n', "\\n")
         .replace('\0', "\\0");
 
-    flattened
-        .chars()
-        .take(MAX_GIT_DIAGNOSTIC_CHARS)
-        .collect()
+    flattened.chars().take(MAX_GIT_DIAGNOSTIC_CHARS).collect()
 }
 
 fn git_index_blob(root: &Path, file: &str) -> Result<Vec<u8>> {
@@ -479,8 +476,8 @@ fn git_index_blob(root: &Path, file: &str) -> Result<Vec<u8>> {
             .position(|byte| *byte == b'\t')
             .context("malformed git index record")?;
 
-        let meta = std::str::from_utf8(&record[..tab])
-            .context("git index metadata is not UTF-8")?;
+        let meta =
+            std::str::from_utf8(&record[..tab]).context("git index metadata is not UTF-8")?;
 
         let mut fields = meta.split_whitespace();
         let _mode = fields.next().context("git index mode missing")?;
@@ -560,9 +557,7 @@ fn whitespace_policy_with_cr_at_eol(root: &Path) -> Result<String> {
         .split(',')
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .filter(|part| {
-            *part != "cr-at-eol" && *part != "-cr-at-eol"
-        })
+        .filter(|part| *part != "cr-at-eol" && *part != "-cr-at-eol")
         .map(str::to_string)
         .collect::<Vec<_>>();
 
@@ -571,18 +566,13 @@ fn whitespace_policy_with_cr_at_eol(root: &Path) -> Result<String> {
     Ok(parts.join(","))
 }
 
-fn git_diff_check_one(
-    root: &Path,
-    file: &str,
-    allow_cr_at_eol: bool,
-) -> Result<(bool, String)> {
+fn git_diff_check_one(root: &Path, file: &str, allow_cr_at_eol: bool) -> Result<(bool, String)> {
     let mut cmd = Command::new("git");
     cmd.current_dir(root);
 
     if allow_cr_at_eol {
         let policy = whitespace_policy_with_cr_at_eol(root)?;
-        cmd.arg("-c")
-            .arg(format!("core.whitespace={policy}"));
+        cmd.arg("-c").arg(format!("core.whitespace={policy}"));
     }
 
     let output = cmd
@@ -607,20 +597,15 @@ fn git_diff_check_one(
     ))
 }
 
-fn git_diff_check(
-    root: &Path,
-    files: &[String],
-) -> Result<(bool, String)> {
+fn git_diff_check(root: &Path, files: &[String]) -> Result<(bool, String)> {
     /*
      * Check files independently because their baseline EOL policies may
      * differ. MAX_CHANGED_FILES keeps the process cost bounded.
      */
     for file in files {
-        let allow_cr_at_eol =
-            baseline_is_consistent_crlf(root, file)?;
+        let allow_cr_at_eol = baseline_is_consistent_crlf(root, file)?;
 
-        let (ok, diagnostic) =
-            git_diff_check_one(root, file, allow_cr_at_eol)?;
+        let (ok, diagnostic) = git_diff_check_one(root, file, allow_cr_at_eol)?;
 
         if !ok {
             return Ok((false, diagnostic));
@@ -672,8 +657,8 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
         !raw.is_empty() && !Path::new(raw).is_absolute(),
         "handoff_path_invalid"
     );
-    let rel = normalize_rel(Path::new(raw.trim_start_matches("./")))
-        .context("handoff_path_invalid")?;
+    let rel =
+        normalize_rel(Path::new(raw.trim_start_matches("./"))).context("handoff_path_invalid")?;
     anyhow::ensure!(
         rel.starts_with(".opencode/scout-handoffs/"),
         "handoff_path_invalid"
@@ -733,7 +718,9 @@ fn mutate_in_worktree(
     }
 
     for rel in &required {
-        let handoff_file = allowed.get(rel).ok_or_else(|| "file_outside_handoff".to_string())?;
+        let handoff_file = allowed
+            .get(rel)
+            .ok_or_else(|| "file_outside_handoff".to_string())?;
         let expected = handoff_file
             .fingerprint
             .sha256
@@ -784,14 +771,13 @@ fn mutate_in_worktree(
     let changed_vec: Vec<String> = changed.iter().cloned().collect();
 
     let (diff_check_ok, diff_check_diagnostic) =
-        git_diff_check(worktree, &changed_vec)
-            .map_err(|err| {
-                eprintln!(
-                    "PATCH_EXECUTOR_DIAGNOSTIC kind=git_diff_check_error error={}",
-                    err
-                );
-                "git_diff_check_failed".to_string()
-            })?;
+        git_diff_check(worktree, &changed_vec).map_err(|err| {
+            eprintln!(
+                "PATCH_EXECUTOR_DIAGNOSTIC kind=git_diff_check_error error={}",
+                err
+            );
+            "git_diff_check_failed".to_string()
+        })?;
 
     if !diff_check_ok {
         eprintln!(
@@ -829,7 +815,11 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
         return Ok(Response::rejected(started, request, "unsupported_mode"));
     }
     if request.edit_protocol != EDIT_PROTOCOL {
-        return Ok(Response::rejected(started, request, "edit_protocol_mismatch"));
+        return Ok(Response::rejected(
+            started,
+            request,
+            "edit_protocol_mismatch",
+        ));
     }
     if request.edits.is_empty() || request.edits.len() > MAX_EDITS {
         return Ok(Response::rejected(started, request, "edit_count_invalid"));
@@ -842,7 +832,11 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
                 || !matches!(check.kind.as_str(), "contains_exact" | "not_contains_exact")
         })
     {
-        return Ok(Response::rejected(started, request, "check_contract_invalid"));
+        return Ok(Response::rejected(
+            started,
+            request,
+            "check_contract_invalid",
+        ));
     }
     if request.edits.iter().any(|edit| {
         !matches!(edit.kind.as_str(), "replace_exact" | "replace_ast")
@@ -853,7 +847,11 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
             || edit.before.contains('\0')
             || edit.after.contains('\0')
     }) {
-        return Ok(Response::rejected(started, request, "edit_contract_invalid"));
+        return Ok(Response::rejected(
+            started,
+            request,
+            "edit_contract_invalid",
+        ));
     }
 
     let root = fs::canonicalize(&request.root).context("cannot resolve project root")?;
@@ -868,7 +866,9 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
     base.handoff_status = Some(handoff.status.clone());
     base.blocking_reasons = handoff.blocking_reasons.clone();
     base.partial_reasons = handoff.partial_reasons.clone();
-    if handoff.protocol != HANDOFF_PROTOCOL || handoff.search_protocol != HANDOFF_SEARCH_PROTOCOL {
+    // Compatibility is defined by the stable handoff schema.
+    // search_protocol is provenance only and may evolve independently.
+    if handoff.protocol != HANDOFF_PROTOCOL {
         base.reason = Some("handoff_protocol_mismatch".to_string());
         return Ok(base);
     }
@@ -969,7 +969,8 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
                 return Ok(base);
             }
             let line = line_for_byte(&current, byte.unwrap());
-            let Some(distance) = nearest_evidence_distance(line, &handoff_file.evidence_lines) else {
+            let Some(distance) = nearest_evidence_distance(line, &handoff_file.evidence_lines)
+            else {
                 base.reason = Some("evidence_anchor_missing".to_string());
                 return Ok(base);
             };
@@ -977,7 +978,11 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
                 base.reason = Some("edit_outside_evidence_radius".to_string());
                 return Ok(base);
             }
-            (current.replacen(&edit.before, &edit.after, 1), line, distance)
+            (
+                current.replacen(&edit.before, &edit.after, 1),
+                line,
+                distance,
+            )
         } else {
             let path = root.join(&rel);
             let (start, end, line, distance) = match structural_match_range(
@@ -1191,13 +1196,8 @@ mod tests {
     #[test]
     fn structural_match_ignores_trivia_but_stays_evidence_local() {
         let source = "def f():\n    return add(1,  2)\n";
-        let (start, end, line, distance) = structural_match_range(
-            Path::new("sample.py"),
-            source,
-            "add(1, 2)",
-            &[2],
-        )
-        .unwrap();
+        let (start, end, line, distance) =
+            structural_match_range(Path::new("sample.py"), source, "add(1, 2)", &[2]).unwrap();
         assert_eq!(&source[start..end], "add(1,  2)");
         assert_eq!(line, 2);
         assert_eq!(distance, 0);
@@ -1211,8 +1211,14 @@ mod tests {
 
     #[test]
     fn deterministic_postconditions_are_bounded_predicates() {
-        assert_eq!(postcondition_holds("contains_exact", "abc", "b"), Some(true));
-        assert_eq!(postcondition_holds("not_contains_exact", "abc", "z"), Some(true));
+        assert_eq!(
+            postcondition_holds("contains_exact", "abc", "b"),
+            Some(true)
+        );
+        assert_eq!(
+            postcondition_holds("not_contains_exact", "abc", "z"),
+            Some(true)
+        );
         assert_eq!(postcondition_holds("shell", "abc", "b"), None);
     }
 
@@ -1263,20 +1269,11 @@ mod tests {
 
     #[test]
     fn diff_check_accepts_preserved_crlf_baseline() {
-        let root = diff_check_repo(
-            "crlf-ok",
-            b"const value = oldName();\r\n",
-        );
+        let root = diff_check_repo("crlf-ok", b"const value = oldName();\r\n");
 
-        std::fs::write(
-            root.join("sample.ts"),
-            b"const value = newName();\r\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("sample.ts"), b"const value = newName();\r\n").unwrap();
 
-        let (ok, diagnostic) =
-            git_diff_check(&root, &["sample.ts".to_string()])
-                .unwrap();
+        let (ok, diagnostic) = git_diff_check(&root, &["sample.ts".to_string()]).unwrap();
 
         assert!(ok, "{diagnostic}");
 
@@ -1285,54 +1282,29 @@ mod tests {
 
     #[test]
     fn diff_check_rejects_spaces_before_crlf() {
-        let root = diff_check_repo(
-            "crlf-space",
-            b"const value = oldName();\r\n",
-        );
+        let root = diff_check_repo("crlf-space", b"const value = oldName();\r\n");
 
-        std::fs::write(
-            root.join("sample.ts"),
-            b"const value = newName(); \r\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("sample.ts"), b"const value = newName(); \r\n").unwrap();
 
-        let (ok, diagnostic) =
-            git_diff_check(&root, &["sample.ts".to_string()])
-                .unwrap();
+        let (ok, diagnostic) = git_diff_check(&root, &["sample.ts".to_string()]).unwrap();
 
         assert!(!ok);
-        assert!(
-            diagnostic.contains("trailing whitespace"),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.contains("trailing whitespace"), "{diagnostic}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn diff_check_does_not_enable_crlf_for_lf_baseline() {
-        let root = diff_check_repo(
-            "lf-strict",
-            b"const value = oldName();\n",
-        );
+        let root = diff_check_repo("lf-strict", b"const value = oldName();\n");
 
-        std::fs::write(
-            root.join("sample.ts"),
-            b"const value = newName();\r\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("sample.ts"), b"const value = newName();\r\n").unwrap();
 
-        let (ok, diagnostic) =
-            git_diff_check(&root, &["sample.ts".to_string()])
-                .unwrap();
+        let (ok, diagnostic) = git_diff_check(&root, &["sample.ts".to_string()]).unwrap();
 
         assert!(!ok);
-        assert!(
-            diagnostic.contains("trailing whitespace"),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.contains("trailing whitespace"), "{diagnostic}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
-
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ast_grep_core::{tree_sitter::StrDoc, Node};
+use ast_grep_core::{Node, tree_sitter::StrDoc};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -266,10 +266,7 @@ fn node_covers_line(node: &SgNode<'_>, line0: usize) -> bool {
     start <= line0 && line0 <= end
 }
 
-fn deepest_named_node_on_line<'a>(
-    root: &SgNode<'a>,
-    line0: usize,
-) -> Option<SgNode<'a>> {
+fn deepest_named_node_on_line<'a>(root: &SgNode<'a>, line0: usize) -> Option<SgNode<'a>> {
     root.dfs()
         .filter(|node| node.is_named())
         .filter(|node| node_covers_line(node, line0))
@@ -336,11 +333,7 @@ fn line_end_byte(source: &str, line_start: usize) -> usize {
     source.len()
 }
 
-fn resolve_hit<'a>(
-    source: &str,
-    root: &SgNode<'a>,
-    hit: &Hit,
-) -> Option<ResolvedHit> {
+fn resolve_hit<'a>(source: &str, root: &SgNode<'a>, hit: &Hit) -> Option<ResolvedHit> {
     if let (Some(start), Some(end)) = (hit.start_byte, hit.end_byte) {
         if start < end && end <= source.len() {
             let node = deepest_named_node_covering_span(root, start, end)?;
@@ -400,23 +393,33 @@ fn resolve_hit<'a>(
     })
 }
 
-fn find_node_by_exact_range<'a>(
-    root: &SgNode<'a>,
-    start: usize,
-    end: usize,
-) -> Option<SgNode<'a>> {
-    root.dfs()
-        .filter(|node| node.is_named())
-        .find(|node| {
-            let range = node.range();
-            range.start == start && range.end == end
-        })
+fn find_node_by_exact_range<'a>(root: &SgNode<'a>, start: usize, end: usize) -> Option<SgNode<'a>> {
+    root.dfs().filter(|node| node.is_named()).find(|node| {
+        let range = node.range();
+        range.start == start && range.end == end
+    })
 }
 
 fn enclosing_symbol<'a>(node: &SgNode<'a>) -> Option<SgNode<'a>> {
-    std::iter::once(node.clone())
-        .chain(node.ancestors())
-        .find(|candidate| is_symbol_kind(candidate.kind().as_ref()))
+    for candidate in std::iter::once(node.clone()).chain(node.ancestors()) {
+        if is_symbol_kind(candidate.kind().as_ref()) {
+            return Some(candidate);
+        }
+
+        // Python decorators are represented by a `decorated_definition`
+        // wrapper. A hit on the decorator line belongs structurally to the
+        // wrapped function/class, but the wrapper itself is not a mutation
+        // symbol and must never be exposed as one.
+        if candidate.kind().as_ref() == "decorated_definition" {
+            if let Some(definition) = candidate.field("definition") {
+                if is_symbol_kind(definition.kind().as_ref()) {
+                    return Some(definition);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn first_named_child_text(node: &SgNode<'_>, limit: usize) -> Option<TextValue> {
@@ -501,21 +504,12 @@ fn classification_from_owner(
     })
 }
 
-fn classify_with_witness(
-    node: &SgNode<'_>,
-    symbol: Option<&SgNode<'_>>,
-) -> Option<Classification> {
+fn classify_with_witness(node: &SgNode<'_>, symbol: Option<&SgNode<'_>>) -> Option<Classification> {
     if let Some(symbol) = symbol {
         if let Some(name) = symbol.field("name") {
             if range_contains(name.range(), node.range()) {
                 let anchor = node_text(&name, MAX_ANCHOR_CHARS)?;
-                return classification_from_owner(
-                    "definition",
-                    anchor,
-                    symbol,
-                    None,
-                    true,
-                );
+                return classification_from_owner("definition", anchor, symbol, None, true);
             }
         }
     }
@@ -539,30 +533,14 @@ fn classify_with_witness(
             )
             .or_else(|| node_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return classification_from_owner(
-                "import",
-                anchor,
-                &candidate,
-                symbol,
-                false,
-            );
+            return classification_from_owner("import", anchor, &candidate, symbol, false);
         }
 
         if k.contains("call") || k.contains("invocation") {
-            let anchor = field_text(
-                &candidate,
-                &["function", "callee"],
-                MAX_ANCHOR_CHARS,
-            )
-            .or_else(|| first_named_child_text(&candidate, MAX_ANCHOR_CHARS))?;
+            let anchor = field_text(&candidate, &["function", "callee"], MAX_ANCHOR_CHARS)
+                .or_else(|| first_named_child_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return classification_from_owner(
-                "call",
-                anchor,
-                &candidate,
-                symbol,
-                false,
-            );
+            return classification_from_owner("call", anchor, &candidate, symbol, false);
         }
 
         if k.contains("assignment")
@@ -577,26 +555,14 @@ fn classify_with_witness(
             )
             .or_else(|| first_named_child_text(&candidate, MAX_ANCHOR_CHARS))?;
 
-            return classification_from_owner(
-                "assignment",
-                anchor,
-                &candidate,
-                symbol,
-                false,
-            );
+            return classification_from_owner("assignment", anchor, &candidate, symbol, false);
         }
 
         if k.contains("declaration") || k.contains("definition") {
             let anchor = field_text(&candidate, &["name"], MAX_ANCHOR_CHARS)
                 .or_else(|| node_text(node, MAX_ANCHOR_CHARS))?;
 
-            return classification_from_owner(
-                "definition",
-                anchor,
-                &candidate,
-                symbol,
-                true,
-            );
+            return classification_from_owner("definition", anchor, &candidate, symbol, true);
         }
 
         current = candidate.parent();
@@ -638,7 +604,6 @@ fn node_text(node: &SgNode<'_>, limit: usize) -> Option<TextValue> {
     }
 }
 
-
 fn symbol_descriptor(
     symbol: Option<&SgNode<'_>>,
     source_line_count: usize,
@@ -676,11 +641,7 @@ fn symbol_descriptor(
     )
 }
 
-fn exact_match_text(
-    source: &str,
-    start: usize,
-    end: usize,
-) -> Option<TextValue> {
+fn exact_match_text(source: &str, start: usize, end: usize) -> Option<TextValue> {
     if start >= end || end > source.len() {
         return None;
     }
@@ -698,8 +659,7 @@ fn exact_match_text(
 }
 
 fn has_parse_errors(root: &SgNode<'_>) -> bool {
-    root.dfs()
-        .any(|node| node.is_error() || node.is_missing())
+    root.dfs().any(|node| node.is_error() || node.is_missing())
 }
 
 fn distill_source_ast_grep(
@@ -725,11 +685,8 @@ fn distill_source_ast_grep(
             continue;
         };
 
-        let Some(node) = find_node_by_exact_range(
-            &root,
-            resolved.node_start,
-            resolved.node_end,
-        ) else {
+        let Some(node) = find_node_by_exact_range(&root, resolved.node_start, resolved.node_end)
+        else {
             continue;
         };
 
@@ -739,12 +696,10 @@ fn distill_source_ast_grep(
             stats.exact_span_hits += 1;
         }
 
-        let match_value = if let (Some(start), Some(end)) = (
-            resolved.exact_match_start,
-            resolved.exact_match_end,
-        ) {
-            exact_match_text(source, start, end)
-                .or_else(|| node_text(&node, MAX_MATCH_TEXT_CHARS))
+        let match_value = if let (Some(start), Some(end)) =
+            (resolved.exact_match_start, resolved.exact_match_end)
+        {
+            exact_match_text(source, start, end).or_else(|| node_text(&node, MAX_MATCH_TEXT_CHARS))
         } else {
             node_text(&node, MAX_MATCH_TEXT_CHARS)
         };
@@ -755,22 +710,15 @@ fn distill_source_ast_grep(
 
         let symbol = enclosing_symbol(&node);
 
-        let Some(classification) =
-            classify_with_witness(&node, symbol.as_ref())
-        else {
+        let Some(classification) = classify_with_witness(&node, symbol.as_ref()) else {
             continue;
         };
 
         stats.anchored_hits += 1;
         stats.witness_hits += 1;
 
-        let (
-            symbol_kind,
-            symbol_name,
-            start_line,
-            end_line,
-            symbol_name_truncated,
-        ) = symbol_descriptor(symbol.as_ref(), line_count);
+        let (symbol_kind, symbol_name, start_line, end_line, symbol_name_truncated) =
+            symbol_descriptor(symbol.as_ref(), line_count);
 
         if match_value.truncated
             || classification.anchor.truncated
@@ -815,18 +763,12 @@ fn distill_source_ast_grep(
 fn canonical_candidate(root: &Path, relative_file: &str) -> Result<PathBuf> {
     let rel = Path::new(relative_file);
 
-    anyhow::ensure!(
-        !rel.is_absolute(),
-        "absolute file paths are not allowed"
-    );
+    anyhow::ensure!(!rel.is_absolute(), "absolute file paths are not allowed");
 
     let candidate = fs::canonicalize(root.join(rel))
         .with_context(|| format!("cannot resolve {relative_file}"))?;
 
-    anyhow::ensure!(
-        candidate.starts_with(root),
-        "path escapes project root"
-    );
+    anyhow::ensure!(candidate.starts_with(root), "path escapes project root");
 
     Ok(candidate)
 }
@@ -840,16 +782,11 @@ fn main() -> Result<()> {
         .read_to_string(&mut input)
         .context("failed to read stdin")?;
 
-    let request: Request =
-        serde_json::from_str(&input).context("invalid request JSON")?;
+    let request: Request = serde_json::from_str(&input).context("invalid request JSON")?;
 
-    let project_root =
-        fs::canonicalize(&request.root).context("cannot resolve project root")?;
+    let project_root = fs::canonicalize(&request.root).context("cannot resolve project root")?;
 
-    anyhow::ensure!(
-        project_root.is_dir(),
-        "project root is not a directory"
-    );
+    anyhow::ensure!(project_root.is_dir(), "project root is not a directory");
 
     let budget = request
         .budget_bytes
@@ -880,8 +817,7 @@ fn main() -> Result<()> {
     let mut lossy_hits = 0usize;
 
     for (relative_file, hits) in by_file {
-        let candidate = match canonical_candidate(&project_root, &relative_file)
-        {
+        let candidate = match canonical_candidate(&project_root, &relative_file) {
             Ok(path) => path,
             Err(error) => {
                 errors.push(FileError {
@@ -906,9 +842,7 @@ fn main() -> Result<()> {
         if metadata.len() > MAX_FILE_BYTES {
             errors.push(FileError {
                 file: relative_file,
-                error: format!(
-                    "file exceeds {MAX_FILE_BYTES} bytes"
-                ),
+                error: format!("file exceeds {MAX_FILE_BYTES} bytes"),
             });
             continue;
         }
@@ -929,13 +863,7 @@ fn main() -> Result<()> {
             }
         };
 
-        match distill_source_ast_grep(
-            &relative_file,
-            &source,
-            lang,
-            &hits,
-            &mut aggregates,
-        ) {
+        match distill_source_ast_grep(&relative_file, &source, lang, &hits, &mut aggregates) {
             Ok(stats) => {
                 parsed_files += 1;
                 mapped_hits += stats.mapped_hits;
@@ -1011,8 +939,7 @@ fn main() -> Result<()> {
                 hit_count: aggregate.hit_count,
                 queries: aggregate.queries.into_iter().collect(),
                 hit_lines: group_lines,
-                lines_truncated: aggregate.lines.len()
-                    > MAX_REPORTED_LINES_PER_RECORD,
+                lines_truncated: aggregate.lines.len() > MAX_REPORTED_LINES_PER_RECORD,
                 variants,
             }
         })
@@ -1058,25 +985,20 @@ fn main() -> Result<()> {
 
     let location_complete = raw_hits > 0 && exact_span_hits == raw_hits;
 
-    let anchor_complete =
-        raw_hits > 0 && anchored_hits == raw_hits && lossy_hits == 0;
+    let anchor_complete = raw_hits > 0 && anchored_hits == raw_hits && lossy_hits == 0;
 
-    let witness_complete =
-        raw_hits > 0 && witness_hits == raw_hits && lossy_hits == 0;
+    let witness_complete = raw_hits > 0 && witness_hits == raw_hits && lossy_hits == 0;
 
     let distill_complete =
-        unsupported_files.is_empty()
-            && errors.is_empty()
-            && unresolved_hits == 0;
+        unsupported_files.is_empty() && errors.is_empty() && unresolved_hits == 0;
 
-    let ir_complete =
-        distill_complete
-            && location_complete
-            && anchor_complete
-            && witness_complete
-            && !truncated
-            && groups.len() == total_groups
-            && shown_variants == total_variants;
+    let ir_complete = distill_complete
+        && location_complete
+        && anchor_complete
+        && witness_complete
+        && !truncated
+        && groups.len() == total_groups
+        && shown_variants == total_variants;
 
     let representation = if groups.is_empty() {
         "none"
@@ -1137,13 +1059,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn exact_hit(
-        file: &str,
-        source: &str,
-        needle: &str,
-        occurrence: usize,
-        query: usize,
-    ) -> Hit {
+    fn exact_hit(file: &str, source: &str, needle: &str, occurrence: usize, query: usize) -> Hit {
         assert!(occurrence >= 1);
 
         let mut from = 0usize;
@@ -1187,22 +1103,12 @@ mod tests {
     ) -> (SourceStats, BTreeMap<GroupKey, GroupAggregate>) {
         let mut aggregates = BTreeMap::new();
 
-        let stats = distill_source_ast_grep(
-            file,
-            source,
-            lang,
-            &hits,
-            &mut aggregates,
-        )
-        .unwrap();
+        let stats = distill_source_ast_grep(file, source, lang, &hits, &mut aggregates).unwrap();
 
         (stats, aggregates)
     }
 
-    fn count_for_anchor(
-        aggregates: &BTreeMap<GroupKey, GroupAggregate>,
-        anchor: &str,
-    ) -> usize {
+    fn count_for_anchor(aggregates: &BTreeMap<GroupKey, GroupAggregate>, anchor: &str) -> usize {
         aggregates
             .iter()
             .filter(|(key, _)| key.anchor == anchor)
@@ -1236,8 +1142,7 @@ def load():
             exact_hit("sample.py", source, "requests.get", 3, 1),
         ];
 
-        let (stats, aggregates) =
-            distill_for_test("sample.py", source, SupportLang::Python, hits);
+        let (stats, aggregates) = distill_for_test("sample.py", source, SupportLang::Python, hits);
 
         assert_eq!(stats.mapped_hits, 3);
         assert_eq!(stats.exact_span_hits, 3);
@@ -1277,8 +1182,7 @@ def load():
             exact_hit("sample.py", source, "requests.get", 3, 1),
         ];
 
-        let (_, aggregates) =
-            distill_for_test("sample.py", source, SupportLang::Python, hits);
+        let (_, aggregates) = distill_for_test("sample.py", source, SupportLang::Python, hits);
 
         let variants = variants_for_anchor(&aggregates, "requests.get");
         assert_eq!(variants.len(), 1);
@@ -1297,8 +1201,7 @@ def load():
             exact_hit("sample.py", source, "baz", 1, 1),
         ];
 
-        let (stats, aggregates) =
-            distill_for_test("sample.py", source, SupportLang::Python, hits);
+        let (stats, aggregates) = distill_for_test("sample.py", source, SupportLang::Python, hits);
 
         assert_eq!(stats.exact_span_hits, 3);
         assert_eq!(count_for_anchor(&aggregates, "foo"), 1);
@@ -1320,12 +1223,8 @@ function run() {
             exact_hit("sample.ts", source, "axios.get", 1, 1),
         ];
 
-        let (stats, aggregates) = distill_for_test(
-            "sample.ts",
-            source,
-            SupportLang::TypeScript,
-            hits,
-        );
+        let (stats, aggregates) =
+            distill_for_test("sample.ts", source, SupportLang::TypeScript, hits);
 
         assert_eq!(stats.exact_span_hits, 2);
         assert_eq!(stats.witness_hits, 2);
@@ -1347,8 +1246,7 @@ fn run() {
             exact_hit("sample.rs", source, "http::get", 1, 1),
         ];
 
-        let (stats, aggregates) =
-            distill_for_test("sample.rs", source, SupportLang::Rust, hits);
+        let (stats, aggregates) = distill_for_test("sample.rs", source, SupportLang::Rust, hits);
 
         assert_eq!(stats.exact_span_hits, 2);
         assert_eq!(stats.witness_hits, 2);
@@ -1372,13 +1270,56 @@ func run() {
             exact_hit("sample.go", source, "http.Get", 1, 1),
         ];
 
-        let (stats, aggregates) =
-            distill_for_test("sample.go", source, SupportLang::Go, hits);
+        let (stats, aggregates) = distill_for_test("sample.go", source, SupportLang::Go, hits);
 
         assert_eq!(stats.exact_span_hits, 2);
         assert_eq!(stats.witness_hits, 2);
         assert_eq!(count_for_anchor(&aggregates, "client.Fetch"), 1);
         assert_eq!(count_for_anchor(&aggregates, "http.Get"), 1);
+    }
+
+    #[test]
+    fn python_decorator_line_resolves_wrapped_function_owner() {
+        let source = "@decorator(\"x\")\ndef target():\n    return helper()\n";
+
+        let hit = Hit {
+            file: "sample.py".to_string(),
+            line: 1,
+            query: 1,
+            column: None,
+            start_byte: None,
+            end_byte: None,
+        };
+
+        let (stats, aggregates) =
+            distill_for_test("sample.py", source, SupportLang::Python, vec![hit]);
+
+        assert_eq!(stats.mapped_hits, 1);
+        assert_eq!(stats.exact_span_hits, 0);
+
+        let owners: Vec<_> = aggregates
+            .keys()
+            .map(|key| {
+                (
+                    key.symbol_kind.as_str(),
+                    key.symbol_name.as_str(),
+                    key.start_line,
+                    key.end_line,
+                )
+            })
+            .collect();
+
+        assert!(
+            owners
+                .iter()
+                .any(|owner| { *owner == ("function_definition", "target", 2, 3) }),
+            "decorator hit did not resolve wrapped function owner: {owners:?}"
+        );
+
+        assert!(
+            !owners.iter().any(|owner| owner.1 == "<module>"),
+            "decorator hit incorrectly fell back to module owner: {owners:?}"
+        );
     }
 
     #[test]
