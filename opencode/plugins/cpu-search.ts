@@ -25,6 +25,14 @@ const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
 const QUERY_TIMEOUT_MS = 1500
 
+// Structural BM25F/RRF is routing-only. Failure must preserve the existing
+// lexical relevance order and can never authorize mutation.
+const RETRIEVAL_RANKER_PROTOCOL = "retrieval-ranker-v1"
+const RETRIEVAL_RANKER_AUTHORITY = "routing_only"
+const RETRIEVAL_RANKER_TIMEOUT_MS = 1500
+const RETRIEVAL_RANKER_MAX_STDOUT_BYTES = 256 * 1024
+const RETRIEVAL_RANKER_MAX_FILES = 32
+
 const QUERY_COMPILER_MIN_TOKENS = 2
 const QUERY_COMPILER_MAX_TOKENS = 6
 
@@ -186,7 +194,7 @@ const EDIT_CAPSULE_WINDOW_RADIUS = 6
 const MUTATION_CANDIDATE_SET_PROTOCOL = "bounded-mutation-candidates-v1"
 const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
-const SEARCH_PROTOCOL = "search-v2.18.1-capability-hardening"
+const SEARCH_PROTOCOL = "search-v2.23.0-bm25f-rrf-routing"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -4051,6 +4059,459 @@ function rankDiscoveredFiles(discoveryResults) {
       b.pathAffinity - a.pathAffinity ||
       a.file.localeCompare(b.file),
   )
+}
+
+
+function retrievalRankerBinary() {
+  const override = process.env.OPENCODE_RETRIEVAL_RANKER
+  if (typeof override === "string" && override.length > 0) {
+    return override
+  }
+
+  const dir = runtimeStackDirectory()
+  if (!dir) return null
+
+  return path.join(dir, "opencode-retrieval-ranker")
+}
+
+function retrievalRankerQuery(queries) {
+  /*
+   * Reuse the already-proven lexical tokenization used by Scout path
+   * relevance. Do not pass regex punctuation into BM25F.
+   *
+   * Preserve first-seen order so identical search input is reproducible.
+   */
+  const terms = []
+  const seen = new Set()
+
+  for (const query of queries ?? []) {
+    for (const term of queryPathTokens(query)) {
+      if (seen.has(term)) continue
+      seen.add(term)
+      terms.push(term)
+
+      if (terms.length >= 32) {
+        return terms.join(" ")
+      }
+    }
+  }
+
+  return terms.join(" ")
+}
+
+function retrievalRankerFallback(
+  rankedFiles,
+  reason,
+  extra = {},
+) {
+  return {
+    attempted: extra.attempted === true,
+    ok: false,
+    reason,
+    elapsedMs:
+      Number.isFinite(extra.elapsedMs)
+        ? extra.elapsedMs
+        : 0,
+    inputFiles:
+      Number.isInteger(extra.inputFiles)
+        ? extra.inputFiles
+        : 0,
+    outputFiles: 0,
+    degradedFiles: 0,
+    errorFiles: 0,
+    rankedFiles,
+  }
+}
+
+function validateRetrievalRankerResponse(
+  response,
+  candidates,
+) {
+  if (
+    response?.protocol !== RETRIEVAL_RANKER_PROTOCOL ||
+    response?.authority !== RETRIEVAL_RANKER_AUTHORITY ||
+    !Array.isArray(response?.results)
+  ) {
+    return {
+      ok: false,
+      reason: "response_contract_invalid",
+    }
+  }
+
+  const allowed = new Set(
+    candidates.map((entry) =>
+      evidenceFileKey(entry.file),
+    ),
+  )
+
+  const seen = new Set()
+
+  for (
+    let index = 0;
+    index < response.results.length;
+    index += 1
+  ) {
+    const result = response.results[index]
+    const file = evidenceFileKey(result?.file)
+
+    if (
+      !file ||
+      !allowed.has(file) ||
+      seen.has(file) ||
+      result?.rank !== index + 1 ||
+      !Number.isFinite(result?.rrf_score) ||
+      !Number.isFinite(result?.bm25f_score)
+    ) {
+      return {
+        ok: false,
+        reason: "result_contract_invalid",
+      }
+    }
+
+    seen.add(file)
+  }
+
+  return {
+    ok: true,
+    reason: "ranked",
+  }
+}
+
+function runRetrievalRanker(
+  root,
+  queries,
+  lexicalRankedFiles,
+) {
+  return new Promise((resolve) => {
+    const query = retrievalRankerQuery(queries)
+
+    const candidates =
+      (lexicalRankedFiles ?? [])
+        .slice(0, RETRIEVAL_RANKER_MAX_FILES)
+
+    if (candidates.length < 2) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "not_needed",
+        ),
+      )
+      return
+    }
+
+    if (!query) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "no_query_terms",
+        ),
+      )
+      return
+    }
+
+    const binary = retrievalRankerBinary()
+
+    if (!binary) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "binary_unavailable",
+        ),
+      )
+      return
+    }
+
+    const started = performance.now()
+
+    let child
+
+    try {
+      child = spawn(binary, [], {
+        cwd: root,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    } catch (error) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "spawn_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs:
+              Math.round(
+                (performance.now() - started) * 100,
+              ) / 100,
+          },
+        ),
+      )
+      return
+    }
+
+    let stdout = []
+    let stdoutBytes = 0
+    let stderr = ""
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+
+    const elapsed = () =>
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, RETRIEVAL_RANKER_TIMEOUT_MS)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+
+      if (
+        stdoutBytes >
+        RETRIEVAL_RANKER_MAX_STDOUT_BYTES
+      ) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      stdout.push(Buffer.from(chunk))
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) {
+        stderr += chunk.toString("utf8")
+      }
+    })
+
+    child.on("error", () => {
+      finish(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "spawn_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs: elapsed(),
+          },
+        ),
+      )
+    })
+
+    child.on("close", (code) => {
+      if (settled) return
+
+      if (timedOut) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "timeout",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      if (outputLimited) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "stdout_limit",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      if (code !== 0) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "nonzero_exit",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      let response
+
+      try {
+        response = JSON.parse(
+          Buffer.concat(stdout).toString("utf8"),
+        )
+      } catch {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "invalid_json",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      const contract =
+        validateRetrievalRankerResponse(
+          response,
+          candidates,
+        )
+
+      if (!contract.ok) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            contract.reason,
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      const originalByFile = new Map(
+        candidates.map((entry, index) => [
+          evidenceFileKey(entry.file),
+          {
+            entry,
+            lexicalRank: index + 1,
+          },
+        ]),
+      )
+
+      const reranked = []
+      const rerankedKeys = new Set()
+
+      for (const result of response.results) {
+        const key = evidenceFileKey(result.file)
+        const original = originalByFile.get(key)
+
+        if (!original) continue
+
+        reranked.push({
+          ...original.entry,
+
+          // Routing telemetry only. These fields are never mutation
+          // authority and are not consumed as semantic evidence.
+          retrievalRank: result.rank,
+          retrievalRrfScore:
+            result.rrf_score,
+          retrievalBm25fScore:
+            result.bm25f_score,
+          retrievalLexicalRank:
+            result.exact_rank ?? original.lexicalRank,
+          retrievalBm25Rank:
+            result.bm25_rank ?? null,
+          retrievalStructuralComplete:
+            result.structural_complete === true,
+        })
+
+        rerankedKeys.add(key)
+      }
+
+      /*
+       * A candidate rejected by the ranker (for example >2 MiB) is not
+       * declared irrelevant. Keep it in the candidate universe in its
+       * original relative order after the successfully reranked prefix.
+       */
+      for (const entry of candidates) {
+        const key = evidenceFileKey(entry.file)
+        if (!rerankedKeys.has(key)) {
+          reranked.push(entry)
+        }
+      }
+
+      // Files outside the bounded rerank prefix retain original order.
+      const tail =
+        lexicalRankedFiles.slice(candidates.length)
+
+      finish({
+        attempted: true,
+        ok: true,
+        reason:
+          (response.errors?.length ?? 0) > 0
+            ? "ranked_partial"
+            : "ranked",
+        elapsedMs: elapsed(),
+        inputFiles: candidates.length,
+        outputFiles: response.results.length,
+        degradedFiles:
+          Array.isArray(response.degraded_files)
+            ? response.degraded_files.length
+            : 0,
+        errorFiles:
+          Array.isArray(response.errors)
+            ? response.errors.length
+            : 0,
+        rankedFiles: [
+          ...reranked,
+          ...tail,
+        ],
+      })
+    })
+
+    try {
+      child.stdin.end(
+        JSON.stringify({
+          root,
+          query,
+          files: candidates.map(
+            (entry, index) => ({
+              file: evidenceFileKey(entry.file),
+
+              // retrieval-ranker-v1 calls this exact_rank. In live Scout
+              // this is the deterministic lexical relevance rank.
+              exact_rank: index + 1,
+            }),
+          ),
+          max_results:
+            RETRIEVAL_RANKER_MAX_FILES,
+        }),
+      )
+    } catch {
+      child.kill("SIGKILL")
+
+      finish(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "stdin_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs: elapsed(),
+          },
+        ),
+      )
+    }
+  })
 }
 
 function selectFairFiles(rankedFiles, queryResults, limit) {
@@ -9205,7 +9666,7 @@ export default {
         name: "search",
         description:
           "Search the active project with 1 to 4 regular expressions in one call. " +
-          "Search first performs repository-wide file discovery, ranks lexical candidate files with fairness separated from relevance, " +
+          "Search first performs repository-wide lexical discovery, applies bounded deterministic structural BM25F/RRF reranking when available, and keeps query fairness separate from relevance, " +
           "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
           "Returns bounded line-numbered evidence and explicit completeness metadata. " +
           "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
@@ -9425,8 +9886,24 @@ export default {
           const discoveryComplete = discoveryResults.every(
             (result) => result.scanComplete,
           )
-          const rankedFiles = rankDiscoveredFiles(discoveryResults)
-          const probeFiles = selectProbeFiles(rankedFiles, discoveryResults)
+          const lexicalRankedFiles =
+            rankDiscoveredFiles(discoveryResults)
+
+          const retrievalRanking =
+            await runRetrievalRanker(
+              root,
+              queries,
+              lexicalRankedFiles,
+            )
+
+          const rankedFiles =
+            retrievalRanking.rankedFiles
+
+          const probeFiles =
+            selectProbeFiles(
+              rankedFiles,
+              discoveryResults,
+            )
           const probeFileSet = new Set(probeFiles.map((entry) => entry.file))
           const allDiscoveredFilesProbed =
             rankedFiles.length === probeFileSet.size
@@ -10994,6 +11471,25 @@ export default {
             execution_event: state?.executionEvent ?? null,
             next_action: nextActionForExecutionState(state),
             candidate_files: rankedFiles.length,
+            lexical_candidate_files: lexicalRankedFiles.length,
+
+            retrieval_ranker_attempted:
+              retrievalRanking.attempted,
+            retrieval_ranker_ok:
+              retrievalRanking.ok,
+            retrieval_ranker_reason:
+              retrievalRanking.reason,
+            retrieval_ranker_elapsed_ms:
+              retrievalRanking.elapsedMs,
+            retrieval_ranker_input_files:
+              retrievalRanking.inputFiles,
+            retrieval_ranker_output_files:
+              retrievalRanking.outputFiles,
+            retrieval_ranker_degraded_files:
+              retrievalRanking.degradedFiles,
+            retrieval_ranker_error_files:
+              retrievalRanking.errorFiles,
+
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
             probe_elapsed_ms: refineElapsedMs,
@@ -11108,8 +11604,27 @@ export default {
             probe_files: probeFiles.map((entry) => ({
               file: entry.file,
               queries: [...entry.queries].sort((a, b) => a - b),
+
+              // Effective rank entering the line-probe stage.
               initial_rank:
-                rankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
+                rankedFiles.findIndex(
+                  (candidate) => candidate.file === entry.file,
+                ) + 1,
+
+              // Independent routing provenance. These values prove whether
+              // BM25F/RRF changed lexical ordering; they are never authority.
+              lexical_rank:
+                entry.retrievalLexicalRank ?? null,
+              retrieval_rank:
+                entry.retrievalRank ?? null,
+              bm25_rank:
+                entry.retrievalBm25Rank ?? null,
+              bm25f_score:
+                entry.retrievalBm25fScore ?? null,
+              rrf_score:
+                entry.retrievalRrfScore ?? null,
+              structural_complete:
+                entry.retrievalStructuralComplete ?? null,
             })),
             lexical_probed_files: probeFileSet.size,
             impact_probed_files: impactValidation.queryCount,
@@ -11436,7 +11951,26 @@ export default {
               execution_event: state?.executionEvent ?? null,
               next_action: nextActionForExecutionState(state),
               candidate_files: rankedFiles.length,
+              lexical_candidate_files: lexicalRankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
+
+              retrieval_ranker_attempted:
+                retrievalRanking.attempted,
+              retrieval_ranker_ok:
+                retrievalRanking.ok,
+              retrieval_ranker_reason:
+                retrievalRanking.reason,
+              retrieval_ranker_elapsed_ms:
+                retrievalRanking.elapsedMs,
+              retrieval_ranker_input_files:
+                retrievalRanking.inputFiles,
+              retrieval_ranker_output_files:
+                retrievalRanking.outputFiles,
+              retrieval_ranker_degraded_files:
+                retrievalRanking.degradedFiles,
+              retrieval_ranker_error_files:
+                retrievalRanking.errorFiles,
+
               refine_elapsed_ms: refineElapsedMs,
               probe_elapsed_ms: refineElapsedMs,
             impact_index_ok: impactIndexShadow.ok,

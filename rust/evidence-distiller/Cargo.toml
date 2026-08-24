@@ -33,3 +33,11 @@ path = "src/patch_compiler.rs"
 [[bin]]
 name = "opencode-invariant-verifier"
 path = "src/invariant_verifier.rs"
+
+[[bin]]
+name = "opencode-structural-index"
+path = "src/structural_index.rs"
+
+[[bin]]
+name = "opencode-retrieval-ranker"
+path = "src/retrieval_ranker.rs"
