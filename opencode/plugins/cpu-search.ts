@@ -116,6 +116,7 @@ const PATCH_PERMISSION_ACTION = "execute_patch"
 const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v3"
 const PATCH_EDIT_PROTOCOL = "edit-script-v3-certified-slice"
 const MUTATION_CONFINEMENT_PROTOCOL = "mutation-slice-v1"
+const CANDIDATE_VALIDITY_PROTOCOL = "candidate-validity-v1"
 const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
 const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v2"
@@ -3777,6 +3778,7 @@ const PATCH_COMPILER_RETRY_REASONS = new Set([
   "mutation_slice_too_wide",
   "mutation_fragment_invalid",
   "mutation_replacement_invalid",
+  "candidate_language_invalid",
 ])
 
 const PATCH_COMPILER_RESCOUT_REASONS = new Set([
@@ -3831,6 +3833,7 @@ function proofObligationsForMutations(mutations) {
     { id: "changed_file_set", check_kind: "changed_file_set", disposition: "fatal" },
     { id: "replay_exact", check_kind: "replay_exact", disposition: "fatal" },
     { id: "ast_parse", check_kind: "ast_parse", disposition: "fatal" },
+    { id: "candidate_validity_barrier", check_kind: "candidate_validity_barrier", disposition: "fatal" },
     { id: "top_level_conservation", check_kind: "top_level_conservation", disposition: "repair" },
     { id: "target_cardinality", check_kind: "target_cardinality", disposition: "repair" },
   ]

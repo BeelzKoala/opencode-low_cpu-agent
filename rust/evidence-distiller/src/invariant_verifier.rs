@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
+use opencode_evidence_distiller::candidate_validity::validate_candidate;
 use opencode_evidence_distiller::impact_index_core::{
     SymbolClosureBinding, SymbolClosureResponse, resolve_symbol_closure,
 };
@@ -137,6 +138,8 @@ struct Response {
     changed_file_set: bool,
     replay_exact: bool,
     ast_parse: bool,
+    candidate_validity_barrier: bool,
+    candidate_validity_coverage: &'static str,
     top_level_conservation: bool,
     target_cardinality: bool,
     replace_node_confinement: bool,
@@ -165,6 +168,25 @@ impl Response {
         let changed_file_set = all_kind("changed_file_set");
         let replay_exact = all_kind("replay_exact");
         let ast_parse = all_kind("ast_parse");
+        let candidate_validity_barrier = all_kind("candidate_validity_barrier");
+        let candidate_validity_coverage = {
+            let mut native_enforced = false;
+            let mut structural_only = false;
+            for check in checks
+                .iter()
+                .filter(|check| check.kind == "candidate_validity_barrier")
+            {
+                let detail = check.detail.as_deref().unwrap_or_default();
+                native_enforced |= detail.contains("coverage=native_enforced");
+                structural_only |= detail.contains("coverage=structural_only");
+            }
+            match (native_enforced, structural_only) {
+                (true, true) => "mixed",
+                (true, false) => "native_enforced",
+                (false, true) => "structural_only",
+                (false, false) => "none",
+            }
+        };
         let top_level_conservation = all_kind("top_level_conservation");
         let target_cardinality = all_kind("target_cardinality");
         let replace_node_confinement = checks
@@ -197,6 +219,8 @@ impl Response {
             changed_file_set,
             replay_exact,
             ast_parse,
+            candidate_validity_barrier,
+            candidate_validity_coverage,
             top_level_conservation,
             target_cardinality,
             replace_node_confinement,
@@ -1218,6 +1242,17 @@ fn verify(request: &Request) -> Result<Response> {
                 file: Some(file.clone()),
                 detail: None,
             });
+            // Authoritative final barrier over the exact candidate replayed
+            // in the isolated worktree. It is mutation-kind agnostic, so future
+            // mutation operations inherit this verification boundary.
+            let validity = validate_candidate(&wt.join(file), &actual);
+            checks.push(Check {
+                kind: "candidate_validity_barrier".to_string(),
+                pass: validity.policy_pass(),
+                file: Some(file.clone()),
+                detail: Some(validity.detail()),
+            });
+
             let top_pass =
                 top_level_conserved(&root.join(file), &before[file], &actual, &edit_ranges[file]);
             checks.push(Check {

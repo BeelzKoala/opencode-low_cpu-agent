@@ -1,0 +1,46 @@
+{
+  "goal": "separate structural parse evidence from deterministic language validity before VERIFIED",
+  "invariants": {
+    "backend_failure_is_not_semantic_invalidity": true,
+    "compiler_early_barrier_replace_node": true,
+    "environment_failure_consumes_semantic_repair": false,
+    "executor_authority_changed": false,
+    "invalid_registered_candidate_can_verify": false,
+    "language_invalid_is_typed_not_any_nonzero": true,
+    "model_calls_added": 0,
+    "mutation_confinement_changed": false,
+    "python_isolation_flags": [
+      "-I",
+      "-S"
+    ],
+    "scout_semantics_changed": false,
+    "target_source_executed": false,
+    "validator_input": "stdin",
+    "validator_timeout_is_safe_failure": true,
+    "validator_timeout_ms": 1500,
+    "validator_unavailable_is_safe_failure": true,
+    "validator_uses_shell": false,
+    "verification_coverage_is_machine_readable": true,
+    "verifier_final_barrier_all_changed_files": true
+  },
+  "protocol": "candidate-validity-v1",
+  "registered_validators": {
+    "python": "python3-compile-v1"
+  },
+  "unregistered_policy": "structural_only_explicit",
+  "validator_exit_contract": {
+    "language_invalid": 10,
+    "other_exit_or_signal": "validator_failed",
+    "valid": 0
+  },
+  "verification_coverage": {
+    "field": "candidate_validity_coverage",
+    "values": [
+      "native_enforced",
+      "structural_only",
+      "mixed",
+      "none"
+    ]
+  },
+  "version": "v2.19.1"
+}

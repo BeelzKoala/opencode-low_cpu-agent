@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ast_grep_core::{Pattern, matcher::MatcherExt};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
+use opencode_evidence_distiller::candidate_validity::validate_candidate;
 use opencode_evidence_distiller::impact_index_core::{
     SymbolClosureBinding, resolve_symbol_closure,
 };
@@ -728,6 +729,14 @@ fn compile_replace_node(
         .any(|node| node.is_error() || node.is_missing())
     {
         return Err("mutation_replacement_invalid");
+    }
+
+    // Structural parse is necessary for confinement, but not sufficient for
+    // language validity. Registered deterministic validators get an early
+    // full-candidate barrier before Executor/Verifier work is spent.
+    let validity = validate_candidate(&file.path, &candidate);
+    if let Some(reason) = validity.failure_reason() {
+        return Err(reason);
     }
 
     Ok(Some(Edit {
