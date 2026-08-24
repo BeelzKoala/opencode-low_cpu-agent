@@ -13,6 +13,7 @@ use std::{
 
 const PROTOCOL: &str = "patch-executor-v2";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
+const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
 const EDIT_PROTOCOL: &str = "edit-script-v2";
 const MODE: &str = "guarded";
 const MAX_EDITS: usize = 4;
@@ -63,6 +64,12 @@ struct ScoutHandoff {
     blocking_reasons: Vec<String>,
     #[serde(default)]
     partial_reasons: Vec<String>,
+    #[serde(default)]
+    scope_mode: Option<String>,
+    #[serde(default)]
+    capability_protocol: Option<String>,
+    #[serde(default)]
+    allowed_mutations: Vec<String>,
     #[serde(default)]
     files: Vec<HandoffFile>,
 }
@@ -672,6 +679,23 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
     serde_json::from_slice(&bytes).context("handoff_json_invalid")
 }
 
+fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
+    match handoff.scope_mode.as_deref() {
+        None => Ok(()),
+        Some("local_mutation_capability") => {
+            if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
+                || handoff.files.len() != 1
+                || handoff.allowed_mutations.len() != 1
+                || handoff.allowed_mutations[0] != "replace_node"
+            {
+                return Err("local_capability_invalid");
+            }
+            Ok(())
+        }
+        Some(_) => Err("handoff_scope_mode_invalid"),
+    }
+}
+
 fn main_sources_unchanged(
     root: &Path,
     expected: &BTreeMap<String, HandoffFile>,
@@ -880,6 +904,10 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
         || !handoff.blocking_reasons.is_empty()
         || !handoff.partial_reasons.is_empty()
     {
+        return Ok(base);
+    }
+    if let Err(reason) = validate_handoff_capability(&handoff) {
+        base.reason = Some(reason.to_string());
         return Ok(base);
     }
 

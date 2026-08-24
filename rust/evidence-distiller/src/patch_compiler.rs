@@ -17,6 +17,7 @@ const PROTOCOL: &str = "patch-compiler-v1";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
 const EDIT_PROTOCOL: &str = "edit-script-v2";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
+const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
 const MAX_MUTATIONS: usize = 4;
 const MAX_LOWERED_EDITS: usize = 4;
 const MAX_CHANGED_FILES: usize = 2;
@@ -65,6 +66,12 @@ struct ScoutHandoff {
     blocking_reasons: Vec<String>,
     #[serde(default)]
     partial_reasons: Vec<String>,
+    #[serde(default)]
+    scope_mode: Option<String>,
+    #[serde(default)]
+    capability_protocol: Option<String>,
+    #[serde(default)]
+    allowed_mutations: Vec<String>,
     #[serde(default)]
     files: Vec<HandoffFile>,
 }
@@ -212,6 +219,33 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
     anyhow::ensure!(candidate.starts_with(&handoff_root), "handoff_path_escape");
     serde_json::from_slice(&fs::read(candidate).context("handoff_read_failed")?)
         .context("handoff_json_invalid")
+}
+
+fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
+    match handoff.scope_mode.as_deref() {
+        None => Ok(()),
+        Some("local_mutation_capability") => {
+            if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
+                || handoff.files.len() != 1
+                || handoff.allowed_mutations.len() != 1
+                || handoff.allowed_mutations[0] != "replace_node"
+            {
+                return Err("local_capability_invalid");
+            }
+            Ok(())
+        }
+        Some(_) => Err("handoff_scope_mode_invalid"),
+    }
+}
+
+fn handoff_allows_mutation(handoff: &ScoutHandoff, kind: &str) -> bool {
+    match handoff.scope_mode.as_deref() {
+        Some("local_mutation_capability") => {
+            handoff.allowed_mutations.iter().any(|value| value == kind)
+        }
+        None => true,
+        Some(_) => false,
+    }
 }
 
 fn nearest_evidence_distance(line: usize, evidence: &[usize]) -> Option<usize> {
@@ -1522,9 +1556,12 @@ fn compile(request: &Request) -> Result<Response> {
     {
         return Ok(Response::rejected(request, "handoff_not_ready", None));
     }
+    if let Err(reason) = validate_handoff_capability(&handoff) {
+        return Ok(Response::rejected(request, reason, None));
+    }
 
     let mut allowed = BTreeMap::<String, AllowedFile>::new();
-    for handoff_file in handoff.files {
+    for handoff_file in &handoff.files {
         let Some(rel) = safe_rel(&handoff_file.file) else {
             return Ok(Response::rejected(request, "handoff_file_invalid", None));
         };
@@ -1545,7 +1582,7 @@ fn compile(request: &Request) -> Result<Response> {
                 rel,
                 path,
                 source,
-                evidence_lines: handoff_file.evidence_lines,
+                evidence_lines: handoff_file.evidence_lines.clone(),
             },
         );
     }
@@ -1560,6 +1597,13 @@ fn compile(request: &Request) -> Result<Response> {
     let mut effective = 0usize;
 
     for (idx, mutation) in request.mutations.iter().enumerate() {
+        if !handoff_allows_mutation(&handoff, &mutation.kind) {
+            return Ok(Response::rejected(
+                request,
+                "mutation_not_authorized_by_handoff",
+                Some(idx),
+            ));
+        }
         if mutation.symbol.is_empty()
             || mutation.symbol.len() > 256
             || mutation.symbol.contains('\0')

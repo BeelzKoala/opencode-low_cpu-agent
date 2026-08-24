@@ -18,6 +18,7 @@ const VERIFICATION_PROTOCOL: &str = "verification-receipt-v1";
 const COMPILER_PROTOCOL: &str = "patch-compiler-v1";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
+const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
 const MAX_CHANGED_FILES: usize = 2;
 const MAX_EDITS: usize = 4;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -57,6 +58,16 @@ struct ScoutHandoff {
     #[serde(rename = "search_protocol")]
     _search_protocol: String,
     status: String,
+    #[serde(default)]
+    blocking_reasons: Vec<String>,
+    #[serde(default)]
+    partial_reasons: Vec<String>,
+    #[serde(default)]
+    scope_mode: Option<String>,
+    #[serde(default)]
+    capability_protocol: Option<String>,
+    #[serde(default)]
+    allowed_mutations: Vec<String>,
     #[serde(default)]
     files: Vec<HandoffFile>,
 }
@@ -211,6 +222,33 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
     anyhow::ensure!(candidate.starts_with(base), "handoff_path_escape");
     serde_json::from_slice(&fs::read(candidate).context("handoff_read_failed")?)
         .context("handoff_json_invalid")
+}
+
+fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
+    match handoff.scope_mode.as_deref() {
+        None => Ok(()),
+        Some("local_mutation_capability") => {
+            if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
+                || handoff.files.len() != 1
+                || handoff.allowed_mutations.len() != 1
+                || handoff.allowed_mutations[0] != "replace_node"
+            {
+                return Err("local_capability_invalid");
+            }
+            Ok(())
+        }
+        Some(_) => Err("handoff_scope_mode_invalid"),
+    }
+}
+
+fn handoff_allows_mutation(handoff: &ScoutHandoff, kind: &str) -> bool {
+    match handoff.scope_mode.as_deref() {
+        Some("local_mutation_capability") => {
+            handoff.allowed_mutations.iter().any(|value| value == kind)
+        }
+        None => true,
+        Some(_) => false,
+    }
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<()> {
@@ -560,7 +598,11 @@ fn verify(request: &Request) -> Result<Response> {
     let handoff = load_handoff(&root, &request.handoff)?;
     // Compatibility is defined by the stable handoff schema.
     // search_protocol is provenance only and may evolve independently.
-    if handoff.protocol != HANDOFF_PROTOCOL || handoff.status != "ready" {
+    if handoff.protocol != HANDOFF_PROTOCOL
+        || handoff.status != "ready"
+        || !handoff.blocking_reasons.is_empty()
+        || !handoff.partial_reasons.is_empty()
+    {
         return Ok(Response::finish(
             started,
             Vec::new(),
@@ -568,6 +610,26 @@ fn verify(request: &Request) -> Result<Response> {
             true,
             Some("handoff_not_ready".to_string()),
         ));
+    }
+    if let Err(reason) = validate_handoff_capability(&handoff) {
+        return Ok(Response::finish(
+            started,
+            Vec::new(),
+            checks,
+            true,
+            Some(reason.to_string()),
+        ));
+    }
+    for mutation in &request.mutations {
+        if !handoff_allows_mutation(&handoff, &mutation.kind) {
+            return Ok(Response::finish(
+                started,
+                Vec::new(),
+                checks,
+                true,
+                Some("mutation_not_authorized_by_handoff".to_string()),
+            ));
+        }
     }
     let allowed = handoff
         .files

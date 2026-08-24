@@ -94,6 +94,8 @@ const MAX_CONSECUTIVE_NO_PROGRESS = 2
 // deterministic, machine-readable handoff for the next execution stage.
 const SCOUT_HANDOFF_PROTOCOL = "scout-handoff-v1"
 const SCOUT_LOCAL_CAPABILITY_PROTOCOL = "scout-local-capability-v1"
+const SCOUT_OWNER_ATTESTATION_PROTOCOL = "owner-attestation-v1"
+const SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS = Object.freeze(["replace_node"])
 const SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES = 4
 const SCOUT_LOCAL_CAPABILITY_ALLOWED_PARTIAL_REASONS = new Set([
   "retained_unread_files",
@@ -157,8 +159,8 @@ const EDIT_CAPSULE_MAX_SCOPES = 4
 const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
 const EDIT_CAPSULE_WINDOW_RADIUS = 6
 
-const SEARCH_PROTOCOL = "search-v2.18.0-local-capability"
-const AGENT_PROTOCOL = "cpu-agent-v2.7.0-local-capability"
+const SEARCH_PROTOCOL = "search-v2.18.1-capability-hardening"
+const AGENT_PROTOCOL = "cpu-agent-v2.7.1-capability-hardening"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -601,6 +603,90 @@ function sameAuthorizedScopeIdentity(a, b) {
   )
 }
 
+function ownerEvidenceDistance(line, target) {
+  if (!Number.isInteger(line) || !target) return Number.MAX_SAFE_INTEGER
+  if (line < target.start_line) return target.start_line - line
+  if (line > target.end_line) return line - target.end_line
+  return 0
+}
+
+function buildOwnerAttestation(editCapsule, target, targetFile) {
+  const reject = (reason) => ({
+    ok: false,
+    protocol: SCOUT_OWNER_ATTESTATION_PROTOCOL,
+    reason,
+    evidence_lines: [],
+    structural_source: null,
+    max_distance_lines: null,
+  })
+
+  if (!target || !targetFile) return reject("owner_attestation_inputs_missing")
+
+  const evidenceLines = [...new Set(
+    (targetFile.evidence_lines ?? [])
+      .filter((line) => Number.isInteger(line) && line > 0),
+  )].sort((a, b) => a - b)
+
+  if (evidenceLines.length < 1) {
+    return reject("owner_attestation_evidence_missing")
+  }
+
+  const boundedEvidenceLines = evidenceLines.filter(
+    (line) => ownerEvidenceDistance(line, target) <= EDIT_CAPSULE_WINDOW_RADIUS,
+  )
+
+  if (boundedEvidenceLines.length < 1) {
+    return reject("owner_attestation_evidence_too_far")
+  }
+
+  const directEvidenceLines = boundedEvidenceLines.filter(
+    (line) => ownerEvidenceDistance(line, target) === 0,
+  )
+
+  if (directEvidenceLines.length > 0) {
+    return {
+      ok: true,
+      protocol: SCOUT_OWNER_ATTESTATION_PROTOCOL,
+      reason: "direct_owner_evidence",
+      evidence_lines: directEvidenceLines,
+      structural_source: editCapsule?.structuralSource ?? null,
+      max_distance_lines: 0,
+    }
+  }
+
+  // Evidence immediately adjacent to an owner (for example a Python/TS
+  // decorator or annotation) is accepted only when the deterministic
+  // structural pipeline independently selected and transactionally
+  // authorized exactly this owner. Capability code consumes this generic
+  // certificate and does not special-case a recovery algorithm or language.
+  if (
+    editCapsule?.mutationReady === true &&
+    typeof editCapsule?.structuralSource === "string" &&
+    editCapsule.structuralSource !== "none" &&
+    sameAuthorizedScopeIdentity(
+      target,
+      editCapsule?.primaryMutationCandidate,
+    ) &&
+    sameAuthorizedScopeIdentity(
+      target,
+      editCapsule?.authorizedMutationScope,
+    )
+  ) {
+    return {
+      ok: true,
+      protocol: SCOUT_OWNER_ATTESTATION_PROTOCOL,
+      reason: "structural_owner_certificate",
+      evidence_lines: boundedEvidenceLines,
+      structural_source: editCapsule.structuralSource,
+      max_distance_lines: Math.max(
+        ...boundedEvidenceLines.map((line) => ownerEvidenceDistance(line, target)),
+      ),
+    }
+  }
+
+  return reject("owner_attestation_structural_identity_unproven")
+}
+
 function ownerRecoveryResponseSafe(response, probe, inputCount) {
   return (
     probe?.ok === false &&
@@ -1019,16 +1105,19 @@ async function attestLocalMutationCapability(
     return reject("target_fingerprint_stale")
   }
 
-  const ownerEvidenceLines = (targetFile.evidence_lines ?? [])
-    .filter((line) =>
-      Number.isInteger(line) &&
-      line >= target.start_line &&
-      line <= target.end_line,
+  const ownerAttestation = buildOwnerAttestation(
+    editCapsule,
+    target,
+    targetFile,
+  )
+  if (!ownerAttestation.ok) {
+    return reject(
+      "target_owner_evidence_unavailable",
+      ownerAttestation.reason,
     )
-    .sort((a, b) => a - b)
-  if (ownerEvidenceLines.length < 1) {
-    return reject("target_owner_has_no_direct_evidence")
   }
+
+  const attestedEvidenceLines = ownerAttestation.evidence_lines
 
   const sourceHandoffSha256 = createHash("sha256").update(raw).digest("hex")
   const identity = {
@@ -1045,7 +1134,9 @@ async function attestLocalMutationCapability(
   const capability = {
     protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
     operation: "replace_node",
+    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
     basis: "single_full_source_validated_owner",
+    owner_attestation: ownerAttestation,
     source_handoff: rel,
     source_handoff_sha256: sourceHandoffSha256,
     source_handoff_status: bundle.status,
@@ -1055,7 +1146,7 @@ async function attestLocalMutationCapability(
     target: identity,
     target_identity_sha256: identitySha256,
     target_source_sha256: currentSha256,
-    direct_evidence_lines: ownerEvidenceLines,
+    attested_evidence_lines: attestedEvidenceLines,
     competitor_confirmation: competitorCheck,
     global_discovery_complete: globalReady,
   }
@@ -1071,6 +1162,8 @@ async function attestLocalMutationCapability(
     partial_reasons: [],
     scope_mode: "local_mutation_capability",
     capability_protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
+    owner_attestation: ownerAttestation,
     source_handoff: rel,
     source_handoff_sha256: sourceHandoffSha256,
     source_handoff_status: bundle.status,
@@ -1084,7 +1177,7 @@ async function attestLocalMutationCapability(
       {
         ...targetFile,
         file: wantedFile,
-        evidence_lines: ownerEvidenceLines,
+        evidence_lines: attestedEvidenceLines,
         fingerprint: {
           ...fingerprint,
           sha256: currentSha256,
@@ -1121,6 +1214,8 @@ async function attestLocalMutationCapability(
     targetSourceSha256: currentSha256,
     sourcePartialReasons: partialReasons,
     competitorCheck,
+    allowedMutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
+    ownerAttestation,
   }
 }
 
@@ -3595,6 +3690,17 @@ async function materializeCapabilityBoundMutation(
 
   let activeHandoffPath = null
   if (input.kind === "replace_node") {
+    if (
+      !Array.isArray(capability.allowedMutations) ||
+      !capability.allowedMutations.includes("replace_node")
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_not_authorized_by_handoff",
+        detail: "replace_node_not_in_local_capability",
+        rescout: false,
+      }
+    }
     activeHandoffPath = capability.localHandoffPath
   } else if (input.kind === "rename_symbol") {
     if (
@@ -3671,6 +3777,9 @@ const PATCH_COMPILER_RETRY_REASONS = new Set([
 
 const PATCH_COMPILER_RESCOUT_REASONS = new Set([
   "handoff_not_ready",
+  "local_capability_invalid",
+  "handoff_scope_mode_invalid",
+  "mutation_not_authorized_by_handoff",
   "handoff_scope_empty",
   "handoff_file_invalid",
   "handoff_file_unavailable",
@@ -8872,6 +8981,10 @@ export default {
               mutationLocalization.reason,
             scout_local_capability_protocol:
               localMutationCapability?.protocol ?? null,
+            scout_local_capability_reason:
+              localMutationCapability?.reason ?? null,
+            scout_local_capability_detail:
+              localMutationCapability?.detail ?? null,
             scout_local_replace_node_ready:
               localMutationCapability?.replaceNodeReady === true,
             scout_global_rename_ready:
@@ -8880,6 +8993,10 @@ export default {
               localMutationCapability?.localHandoffPath ?? null,
             scout_local_mutation_target:
               localMutationCapability?.target ?? null,
+            scout_local_allowed_mutations:
+              localMutationCapability?.allowedMutations ?? [],
+            scout_owner_attestation:
+              localMutationCapability?.ownerAttestation ?? null,
             scout_competitor_check:
               localCompetitorCheck ?? null,
             edit_capsule_protocol: editCapsule?.protocol ?? null,
@@ -8919,6 +9036,9 @@ export default {
             edit_capsule_coverage: editCapsule?.coverage ?? null,
             execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
             execution_state: state?.executionState ?? null,
+            execution_reason: state?.executionReason ?? null,
+            execution_event: state?.executionEvent ?? null,
+            next_action: nextActionForExecutionState(state),
             candidate_files: rankedFiles.length,
             discovery_elapsed_ms: discoveryElapsedMs,
             refine_elapsed_ms: refineElapsedMs,
@@ -9274,6 +9394,10 @@ export default {
               scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
               scout_local_capability_protocol:
                 localMutationCapability?.protocol ?? null,
+              scout_local_capability_reason:
+                localMutationCapability?.reason ?? null,
+              scout_local_capability_detail:
+                localMutationCapability?.detail ?? null,
               scout_local_replace_node_ready:
                 localMutationCapability?.replaceNodeReady === true,
               scout_global_rename_ready:
@@ -9282,6 +9406,10 @@ export default {
                 localMutationCapability?.localHandoffPath ?? null,
               scout_local_mutation_target:
                 localMutationCapability?.target ?? null,
+              scout_local_allowed_mutations:
+                localMutationCapability?.allowedMutations ?? [],
+              scout_owner_attestation:
+                localMutationCapability?.ownerAttestation ?? null,
               scout_competitor_check:
                 localCompetitorCheck ?? null,
               edit_capsule_protocol: editCapsule?.protocol ?? null,
@@ -9292,6 +9420,8 @@ export default {
               execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
               patch_permission_action: PATCH_PERMISSION_ACTION,
               execution_state: state?.executionState ?? null,
+              execution_reason: state?.executionReason ?? null,
+              execution_event: state?.executionEvent ?? null,
               next_action: nextActionForExecutionState(state),
               candidate_files: rankedFiles.length,
               discovery_elapsed_ms: discoveryElapsedMs,
