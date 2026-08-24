@@ -194,7 +194,7 @@ const EDIT_CAPSULE_WINDOW_RADIUS = 6
 const MUTATION_CANDIDATE_SET_PROTOCOL = "bounded-mutation-candidates-v1"
 const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
-const SEARCH_PROTOCOL = "search-v2.23.0-bm25f-rrf-routing"
+const SEARCH_PROTOCOL = "search-v2.23.1-provenance-bm25f-rrf-routing"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -4049,14 +4049,23 @@ function rankDiscoveredFiles(discoveryResults) {
     }, 0)
   }
 
-  // Relevance rank is deliberately separate from fairness. Direct lexical
-  // candidates are never filtered out. Query rarity is retained for telemetry
-  // and fairness reservation only; it must not make a semantically weak rare
-  // query outrank a stronger multi-query/path match.
+  // Relevance stays separate from fairness.
+  //
+  // Query specificity is intentionally only a tertiary tie-break:
+  //
+  //   coverage > path affinity > provenance specificity > stable path
+  //
+  // Therefore a weak rare query can never outrank stronger multi-query
+  // coverage or a better path match. It only replaces the previous
+  // arbitrary filename tie-break when lexical evidence is otherwise equal.
+  //
+  // The signal is free: discovery already measured the number of files
+  // matched by every query, so this adds no repository scan or model call.
   return [...byFile.values()].sort(
     (a, b) =>
       b.coverage - a.coverage ||
       b.pathAffinity - a.pathAffinity ||
+      b.rarity - a.rarity ||
       a.file.localeCompare(b.file),
   )
 }
