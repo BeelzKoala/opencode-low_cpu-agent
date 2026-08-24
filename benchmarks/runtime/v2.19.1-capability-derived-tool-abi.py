@@ -20,14 +20,25 @@ def main() -> None:
     plugin = PLUGIN.read_text(encoding="utf-8")
     spec = json.loads(SPEC.read_text(encoding="utf-8"))
 
-    start = plugin.index('        name: "execute_patch",')
-    end = plugin.index("\n        options:", start)
-    schema_block = plugin[start:end]
+    replace_start = plugin.index('        name: EXECUTE_REPLACE_NODE_TOOL,')
+    replace_end = plugin.index("\n        options:", replace_start)
+    replace_schema = plugin[replace_start:replace_end]
 
-    assert 'scope: {' not in schema_block
-    assert 'enum: ["handoff"]' not in schema_block
-    assert 'additionalProperties: false' in schema_block
-    assert 'Mutation scope is also capability-derived and MUST NOT be supplied' in schema_block
+    rename_start = plugin.index('        name: EXECUTE_RENAME_SYMBOL_TOOL,')
+    rename_end = plugin.index("\n        options:", rename_start)
+    rename_schema = plugin[rename_start:rename_end]
+
+    for schema_block in (replace_schema, rename_schema):
+        assert 'scope: {' not in schema_block
+        assert 'file: {' not in schema_block
+        assert 'symbol: {' not in schema_block
+        assert 'kind: {' not in schema_block
+        assert 'enum: ["handoff"]' not in schema_block
+        assert 'additionalProperties: false' in schema_block
+
+    assert 'required: ["before", "replacement"]' in replace_schema
+    assert 'required: ["new_name"]' in rename_schema
+    assert 'action-specific' in replace_schema or 'mutation kind' in replace_schema
 
     materialize_start = plugin.index("async function materializeCapabilityBoundMutation(")
     materialize_end = plugin.index("\nconst PATCH_COMPILER_RETRY_REASONS", materialize_start)
@@ -61,7 +72,7 @@ def main() -> None:
 
     print("PASS model cannot choose target or mutation authority scope")
     print("PASS rename handoff scope is deterministic internal metadata")
-    print("PASS replace_node cannot represent scope in model-facing ABI")
+    print("PASS action-specific tools cannot represent target/scope/kind in model-facing ABI")
     print("PASS Rust action/verification plane frozen")
     print("PASS v2.19.1-r3 capability-derived tool ABI")
 

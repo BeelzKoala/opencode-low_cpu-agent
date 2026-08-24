@@ -28,6 +28,14 @@ const QUERY_TIMEOUT_MS = 1500
 const QUERY_COMPILER_MIN_TOKENS = 2
 const QUERY_COMPILER_MAX_TOKENS = 6
 
+const QUERY_FORMULATION_PROTOCOL = "query-formulation-v2"
+const QUERY_FORMULATION_MAX_BRANCHES = 4
+const QUERY_FORMULATION_MAX_ATOMS = 8
+const QUERY_FORMULATION_MAX_ATOMS_PER_BRANCH = 5
+const QUERY_FORMULATION_MIN_FILE_ATOMS = 2
+const QUERY_FORMULATION_MIN_COVERAGE_RATIO = 0.5
+const QUERY_FORMULATION_MAX_FILES = PROBE_MAX_FILES * 3
+
 const QUERY_COMPILER_STOPWORDS = new Set([
   "the",
   "and",
@@ -112,6 +120,13 @@ const SCOUT_HANDOFF_MAX_LINES_PER_FILE = 32
 const PATCH_COMPILER_PROTOCOL = "patch-compiler-v2"
 const PATCH_MUTATION_PROTOCOL = "mutation-plan-v1"
 const PATCH_TOOL_PROTOCOL = "semantic-mutation-tool-v1"
+const MUTATION_TOOL_ABI_PROTOCOL = "capability-mutation-tools-v2"
+const EXECUTE_REPLACE_NODE_TOOL = "execute_replace_node"
+const EXECUTE_RENAME_SYMBOL_TOOL = "execute_rename_symbol"
+const MUTATION_TOOL_NAMES = Object.freeze([
+  EXECUTE_REPLACE_NODE_TOOL,
+  EXECUTE_RENAME_SYMBOL_TOOL,
+])
 const PATCH_PERMISSION_ACTION = "execute_patch"
 const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v3"
 const PATCH_EDIT_PROTOCOL = "edit-script-v3-certified-slice"
@@ -160,6 +175,8 @@ const EDIT_CAPSULE_MAX_BYTES = 4600
 const EDIT_CAPSULE_MAX_SCOPES = 4
 const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
 const EDIT_CAPSULE_WINDOW_RADIUS = 6
+const MUTATION_CANDIDATE_SET_PROTOCOL = "bounded-mutation-candidates-v1"
+const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
 const SEARCH_PROTOCOL = "search-v2.18.1-capability-hardening"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
@@ -179,12 +196,45 @@ const EXCLUDES = [
   "!.opencode/**",
   "!.agentbench/**",
   "!node_modules/**",
+  "!**/node_modules/**",
   "!.venv/**",
+  "!**/.venv/**",
   "!venv/**",
+  "!**/venv/**",
   "!__pycache__/**",
+  "!**/__pycache__/**",
   "!dist/**",
+  "!**/dist/**",
   "!build/**",
+  "!**/build/**",
 ]
+
+const SOURCE_GLOB_INVENTORY_PROTOCOL = "source-glob-inventory-v1"
+const SOURCE_GLOB_INVENTORY_TIMEOUT_MS = 500
+const SOURCE_GLOB_INVENTORY_MAX_FILES = 20_000
+const SOURCE_GLOB_INVENTORY_MAX_STDOUT_BYTES = 2 * 1024 * 1024
+const SOURCE_GLOB_FALLBACK_MAX_EXTENSIONS = 12
+const SOURCE_LANGUAGE_EXTENSIONS = Object.freeze([
+  "py",
+  "pyi",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "ts",
+  "tsx",
+  "mts",
+  "cts",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "sass",
+  "less",
+  "xml",
+  "sql",
+])
+const SOURCE_LANGUAGE_EXTENSION_SET = new Set(SOURCE_LANGUAGE_EXTENSIONS)
 
 function appendSearchGlobs(args, glob) {
   // ripgrep glob precedence is order-sensitive.
@@ -194,6 +244,309 @@ function appendSearchGlobs(args, glob) {
 
   for (const pattern of EXCLUDES) {
     args.push("-g", pattern)
+  }
+}
+
+function sourceExtensionFromFile(file) {
+  const normalized = evidenceFileKey(file).toLowerCase()
+  const ext = path.posix.extname(normalized)
+  return ext.startsWith(".") ? ext.slice(1) : ""
+}
+
+function parseSimpleLanguageGlob(glob) {
+  if (
+    typeof glob !== "string" ||
+    glob.length < 1 ||
+    glob.startsWith("!") ||
+    glob.includes("\\")
+  ) {
+    return null
+  }
+
+  let match = /^(.*\*)\.([a-z0-9]+)$/.exec(glob)
+  let extensions = null
+
+  if (match) {
+    extensions = [match[2]]
+  } else {
+    match = /^(.*\*)\.\{([a-z0-9]+(?:,[a-z0-9]+)+)\}$/.exec(glob)
+    if (match) extensions = match[2].split(",")
+  }
+
+  if (!match || !extensions) return null
+
+  const unique = [...new Set(extensions)]
+  if (
+    unique.length < 1 ||
+    unique.some((ext) => !SOURCE_LANGUAGE_EXTENSION_SET.has(ext))
+  ) {
+    return null
+  }
+
+  return {
+    prefix: match[1],
+    extensions: unique,
+  }
+}
+
+function buildLanguageGlob(prefix, extensions) {
+  const unique = [...new Set(extensions ?? [])]
+    .filter((ext) => SOURCE_LANGUAGE_EXTENSION_SET.has(ext))
+    .sort()
+
+  if (unique.length < 1) return null
+  if (unique.length === 1) return `${prefix}.${unique[0]}`
+  return `${prefix}.{${unique.join(",")}}`
+}
+
+function sourceInventoryCacheKey(target, prefix) {
+  return JSON.stringify({
+    protocol: SOURCE_GLOB_INVENTORY_PROTOCOL,
+    target,
+    prefix,
+  })
+}
+
+function runSourceGlobInventory(root, target, prefix) {
+  return new Promise((resolve) => {
+    const patterns = SOURCE_LANGUAGE_EXTENSIONS.map(
+      (ext) => `${prefix}.${ext}`,
+    )
+
+    const args = ["--files", "-0"]
+    for (const pattern of patterns) args.push("-g", pattern)
+    for (const pattern of EXCLUDES) args.push("-g", pattern)
+    args.push("--", target)
+
+    const child = spawn("rg", args, {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    const counts = new Map()
+    let files = 0
+    let stdoutBytes = 0
+    let stderr = ""
+    let pending = ""
+    let timedOut = false
+    let scanCapped = false
+    let settled = false
+    let spawnError = null
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, SOURCE_GLOB_INVENTORY_TIMEOUT_MS)
+
+    function consumeFile(raw) {
+      if (!raw || scanCapped) return
+
+      files += 1
+      if (files > SOURCE_GLOB_INVENTORY_MAX_FILES) {
+        scanCapped = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      const ext = sourceExtensionFromFile(raw)
+      if (!SOURCE_LANGUAGE_EXTENSION_SET.has(ext)) return
+      counts.set(ext, (counts.get(ext) ?? 0) + 1)
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+      if (stdoutBytes > SOURCE_GLOB_INVENTORY_MAX_STDOUT_BYTES) {
+        scanCapped = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      pending += chunk.toString("utf8")
+      let index
+      while ((index = pending.indexOf("\0")) >= 0) {
+        consumeFile(pending.slice(0, index))
+        pending = pending.slice(index + 1)
+        if (scanCapped) break
+      }
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) stderr += chunk.toString("utf8")
+    })
+
+    child.on("error", (error) => {
+      spawnError = String(error?.message ?? error)
+    })
+
+    child.on("close", (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+
+      if (pending.length > 0 && !scanCapped) consumeFile(pending)
+
+      const exitOk = code === 0 || code === 1
+      const error = spawnError ?? (!exitOk && !timedOut && !scanCapped
+        ? (stderr.trim() || `rg_exit_${code}`)
+        : null)
+      const complete =
+        !timedOut &&
+        !scanCapped &&
+        !error
+
+      resolve({
+        protocol: SOURCE_GLOB_INVENTORY_PROTOCOL,
+        complete,
+        timedOut,
+        scanCapped,
+        error,
+        files,
+        extensions: Object.fromEntries(
+          [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)),
+        ),
+      })
+    })
+  })
+}
+
+async function sourceGlobInventory(root, target, prefix, state) {
+  const key = sourceInventoryCacheKey(target, prefix)
+  const cached = state?.sourceInventoryCache?.get(key)
+  if (cached) return { ...cached, cacheHit: true }
+
+  const result = await runSourceGlobInventory(root, target, prefix)
+
+  if (state?.sourceInventoryCache instanceof Map) {
+    state.sourceInventoryCache.set(key, result)
+  }
+
+  return { ...result, cacheHit: false }
+}
+
+async function resolveSearchLanguageGlob(root, target, requestedGlob, state) {
+  const base = {
+    protocol: SOURCE_GLOB_INVENTORY_PROTOCOL,
+    requestedGlob: requestedGlob ?? null,
+    effectiveGlob: requestedGlob,
+    corrected: false,
+    reason: null,
+    inventoryComplete: null,
+    inventoryFiles: 0,
+    inventoryExtensions: {},
+    inventoryCacheHit: false,
+  }
+
+  const parsed = parseSimpleLanguageGlob(requestedGlob)
+  if (!parsed) return base
+
+  let info
+  try {
+    info = await stat(path.resolve(root, target))
+  } catch {
+    return {
+      ...base,
+      reason: "target_stat_unavailable",
+    }
+  }
+
+  if (info.isFile()) {
+    const ext = sourceExtensionFromFile(target)
+    if (
+      !SOURCE_LANGUAGE_EXTENSION_SET.has(ext) ||
+      parsed.extensions.includes(ext)
+    ) {
+      return {
+        ...base,
+        reason: "explicit_file_glob_compatible",
+      }
+    }
+
+    return {
+      ...base,
+      effectiveGlob: undefined,
+      corrected: true,
+      reason: "explicit_file_path_overrides_absent_language_glob",
+      inventoryComplete: true,
+      inventoryFiles: 1,
+      inventoryExtensions: { [ext]: 1 },
+    }
+  }
+
+  if (!info.isDirectory()) {
+    return {
+      ...base,
+      reason: "target_not_file_or_directory",
+    }
+  }
+
+  const inventory = await sourceGlobInventory(
+    root,
+    target,
+    parsed.prefix,
+    state,
+  )
+
+  const resultBase = {
+    ...base,
+    inventoryComplete: inventory.complete === true,
+    inventoryFiles: inventory.files ?? 0,
+    inventoryExtensions: inventory.extensions ?? {},
+    inventoryCacheHit: inventory.cacheHit === true,
+  }
+
+  if (inventory.complete !== true) {
+    return {
+      ...resultBase,
+      reason: "source_inventory_incomplete",
+    }
+  }
+
+  if (
+    parsed.extensions.some(
+      (ext) => (inventory.extensions?.[ext] ?? 0) > 0,
+    )
+  ) {
+    return {
+      ...resultBase,
+      reason: "requested_language_present",
+    }
+  }
+
+  const fallbackExtensions = Object.keys(inventory.extensions ?? {})
+    .filter((ext) => (inventory.extensions?.[ext] ?? 0) > 0)
+    .sort()
+
+  if (fallbackExtensions.length < 1) {
+    return {
+      ...resultBase,
+      reason: "no_supported_source_files",
+    }
+  }
+
+  if (fallbackExtensions.length > SOURCE_GLOB_FALLBACK_MAX_EXTENSIONS) {
+    return {
+      ...resultBase,
+      reason: "fallback_extension_set_too_wide",
+    }
+  }
+
+  const effectiveGlob = buildLanguageGlob(
+    parsed.prefix,
+    fallbackExtensions,
+  )
+
+  if (!effectiveGlob) {
+    return {
+      ...resultBase,
+      reason: "fallback_glob_unavailable",
+    }
+  }
+
+  return {
+    ...resultBase,
+    effectiveGlob,
+    corrected: true,
+    reason: "requested_language_absent",
   }
 }
 
@@ -307,6 +660,7 @@ async function writeLocalMutationHandoff(
   sessionID,
   turnID,
   bundle,
+  discriminator = "primary",
 ) {
   if (!root || !sessionID || !bundle) return null
 
@@ -317,7 +671,7 @@ async function writeLocalMutationHandoff(
     "capabilities",
   )
   const key = scoutOpaqueKey(
-    `${sessionID}:${turnID ?? ""}:local-mutation`,
+    `${sessionID}:${turnID ?? ""}:local-mutation:${discriminator}`,
   )
   const finalPath = path.join(dir, `${key}.json`)
   const tempPath = `${finalPath}.${process.pid}.${nowMs()}.tmp`
@@ -518,7 +872,9 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
   state.scoutHandoffPath = handoffPath
   state.localMutationHandoffPath = null
   state.localMutationCapability = null
+  state.localMutationCandidates = []
   state.activeMutationHandoffPath = null
+  state.boundMutationTarget = null
   return {
     protocol: SCOUT_HANDOFF_PROTOCOL,
     path: handoffPath,
@@ -710,6 +1066,446 @@ function ownerRecoveryResponseSafe(response, probe, inputCount) {
     response?.groups_shown === response.groups.length &&
     response?.variants_shown === response?.variants_total
   )
+}
+
+function mutationCandidateIdentity(scope) {
+  if (!scope) return null
+  return {
+    file: normalizeMutationFile(scope.file),
+    symbol_kind: scope.symbol_kind,
+    symbol_name: scope.symbol_name,
+    start_line: scope.start_line,
+    end_line: scope.end_line,
+  }
+}
+
+function normalizeMutationCandidateEol(value) {
+  return String(value ?? "")
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+}
+
+function mutationCandidateStrictAncestor(outer, inner) {
+  if (!outer || !inner) return false
+  const outerFile = normalizeMutationFile(outer.file)
+  const innerFile = normalizeMutationFile(inner.file)
+  if (!outerFile || outerFile !== innerFile) return false
+  if (
+    !Number.isInteger(outer.start_line) ||
+    !Number.isInteger(outer.end_line) ||
+    !Number.isInteger(inner.start_line) ||
+    !Number.isInteger(inner.end_line)
+  ) return false
+
+  const contains =
+    outer.start_line <= inner.start_line &&
+    outer.end_line >= inner.end_line
+  const strict =
+    outer.start_line < inner.start_line ||
+    outer.end_line > inner.end_line
+  return contains && strict
+}
+
+function reduceMostSpecificMutationCandidates(candidates) {
+  const values = Array.isArray(candidates) ? candidates : []
+  return values.filter(
+    (candidate) =>
+      !values.some(
+        (other) =>
+          other !== candidate &&
+          mutationCandidateStrictAncestor(candidate, other),
+      ),
+  )
+}
+
+function normalizeMutationCandidateSlice(value) {
+  return normalizeMutationCandidateEol(value).trim()
+}
+
+function mutationCandidateContainsBefore(candidate, before) {
+  if (
+    !candidate ||
+    typeof candidate.live_source !== "string" ||
+    typeof before !== "string" ||
+    before.length < 1
+  ) return false
+
+  const wanted = normalizeMutationCandidateSlice(before)
+  if (wanted.length < 1) return false
+
+  const source = normalizeMutationCandidateSlice(candidate.live_source)
+  if (source.includes(wanted)) return true
+
+  const sourceLines = source.split("\n")
+  const wantedLines = wanted.split("\n")
+  const width = wantedLines.length
+
+  for (let start = 0; start + width <= sourceLines.length; start++) {
+    const slice = sourceLines.slice(start, start + width).join("\n")
+    if (normalizeMutationCandidateSlice(slice) === wanted) return true
+  }
+
+  return false
+}
+
+function selectExactMutationCandidate(candidates, before, boundTarget = null) {
+  const values = Array.isArray(candidates) ? candidates : []
+
+  if (boundTarget) {
+    const bound =
+      values.find((entry) =>
+        sameAuthorizedScopeIdentity(entry.target, boundTarget),
+      ) ?? null
+
+    if (!bound || !mutationCandidateContainsBefore(bound, before)) {
+      return {
+        ok: false,
+        reason: "mutation_owner_repair_target_mismatch",
+        repairable: false,
+        candidate: null,
+        matches: [],
+      }
+    }
+
+    return {
+      ok: true,
+      reason: "mutation_owner_sticky_exact_match",
+      repairable: false,
+      candidate: bound,
+      matches: [bound],
+    }
+  }
+
+  const exact =
+    values.filter((entry) =>
+      mutationCandidateContainsBefore(entry, before),
+    )
+
+  if (exact.length < 1) {
+    return {
+      ok: false,
+      reason: "mutation_owner_no_exact_match",
+      repairable: true,
+      candidate: null,
+      matches: [],
+    }
+  }
+
+  const mostSpecific =
+    reduceMostSpecificMutationCandidates(
+      exact.map((entry) => entry.target),
+    )
+
+  if (mostSpecific.length !== 1) {
+    return {
+      ok: false,
+      reason: "mutation_owner_ambiguous_exact_match",
+      repairable: true,
+      candidate: null,
+      matches: mostSpecific,
+    }
+  }
+
+  const selectedTarget = mostSpecific[0]
+  const selected =
+    exact.find((entry) =>
+      sameAuthorizedScopeIdentity(entry.target, selectedTarget),
+    ) ?? null
+
+  return {
+    ok: selected !== null,
+    reason:
+      selected !== null
+        ? "mutation_owner_unique_exact_match"
+        : "mutation_owner_ambiguous_exact_match",
+    repairable: selected === null,
+    candidate: selected,
+    matches: mostSpecific,
+  }
+}
+
+function validatedImpactMutationCandidateHits(selectedImpactFiles) {
+  const unique = new Map()
+
+  for (const entry of selectedImpactFiles ?? []) {
+    if (
+      entry?.origin !== "impact" ||
+      entry?.impact?.validationKind !== "forward_scope_definition"
+    ) continue
+
+    const file = evidenceFileKey(entry?.file)
+    const line = entry?.impact?.sample?.line
+    if (!file || !Number.isInteger(line) || line < 1) continue
+
+    const queryIndex =
+      [...(entry?.queries ?? [])]
+        .filter((value) => Number.isInteger(value) && value >= 0)
+        .sort((a, b) => a - b)[0]
+
+    if (!Number.isInteger(queryIndex)) continue
+
+    const key = `${file}\\0${line}\\0${queryIndex}`
+    if (!unique.has(key)) {
+      unique.set(key, {
+        file,
+        line,
+        query: queryIndex + 1,
+      })
+    }
+  }
+
+  return [...unique.values()].sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.line - b.line ||
+      a.query - b.query,
+  )
+}
+
+async function recoverValidatedImpactMutationCandidateGroups(
+  root,
+  selectedImpactFiles,
+) {
+  const hits = validatedImpactMutationCandidateHits(selectedImpactFiles)
+
+  if (hits.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_validated_forward_impact_candidate",
+      groups: [],
+      hits: 0,
+      files: 0,
+      rejected_files: [],
+    }
+  }
+
+  if (hits.length > FOCUSED_PROBE_MAX_LINE_HITS) {
+    return {
+      attempted: false,
+      ok: false,
+      reason: "impact_candidate_hit_budget_exceeded",
+      groups: [],
+      hits: hits.length,
+      files: 0,
+      rejected_files: [],
+    }
+  }
+
+  const byFile = new Map()
+  for (const hit of hits) {
+    const batch = byFile.get(hit.file) ?? []
+    batch.push(hit)
+    byFile.set(hit.file, batch)
+  }
+
+  const groups = []
+  const rejected = []
+
+  for (
+    const [file, fileHits]
+    of [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b))
+  ) {
+    const probe = await runDistiller(root, fileHits)
+    const response = probe?.response
+
+    if (!ownerRecoveryResponseSafe(response, probe, fileHits.length)) {
+      rejected.push({
+        file,
+        reason:
+          probe?.reason ??
+          "impact_candidate_structural_validation_failed",
+      })
+      continue
+    }
+
+    for (const group of response.groups ?? []) {
+      if (
+        typeof group?.symbol_kind !== "string" ||
+        typeof group?.symbol_name !== "string" ||
+        group.symbol_kind === "module" ||
+        group.symbol_name === "<module>" ||
+        group.symbol_name === "<evidence>"
+      ) continue
+
+      groups.push({
+        ...group,
+        mutation_candidate_basis:
+          "validated_forward_impact_definition",
+      })
+    }
+  }
+
+  return {
+    attempted: true,
+    ok: rejected.length === 0,
+    reason:
+      rejected.length === 0
+        ? "validated_forward_impact_candidates_recovered"
+        : "impact_candidate_structural_validation_partial",
+    groups: rejected.length === 0 ? groups : [],
+    hits: hits.length,
+    files: byFile.size,
+    rejected_files: rejected.slice(0, 16),
+  }
+}
+
+async function loadLivePreauthorizedMutationCandidates(root, state) {
+  const loaded = await readAuthorizedEditCapsule(root, state)
+  if (!loaded.ok) return { ...loaded, candidates: [] }
+
+  const capsule = loaded.capsule
+  const preauthorized =
+    Array.isArray(state?.localMutationCandidates)
+      ? state.localMutationCandidates
+      : []
+
+  if (
+    capsule?.mutation_candidate_protocol !== MUTATION_CANDIDATE_SET_PROTOCOL ||
+    !Number.isInteger(capsule?.mutation_candidate_count) ||
+    capsule.mutation_candidate_count < 1 ||
+    capsule.mutation_candidate_count > MUTATION_CANDIDATE_MAX ||
+    !Array.isArray(capsule?.mutation_candidates) ||
+    capsule.mutation_candidates.length !== capsule.mutation_candidate_count ||
+    preauthorized.length < 1 ||
+    preauthorized.length > MUTATION_CANDIDATE_MAX
+  ) {
+    return {
+      ok: false,
+      reason: "mutation_candidate_set_contract_invalid",
+      candidates: [],
+    }
+  }
+
+  const sealed = capsule.mutation_candidates
+  const candidates = []
+  const bodies = new Map()
+
+  for (const entry of preauthorized) {
+    const capability = entry?.capability
+    const target = entry?.target
+    if (
+      capability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
+      capability?.replaceNodeReady !== true ||
+      !Array.isArray(capability?.allowedMutations) ||
+      !capability.allowedMutations.includes("replace_node") ||
+      typeof capability?.localHandoffPath !== "string" ||
+      !target
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_capability_invalid",
+        candidates: [],
+      }
+    }
+
+    const metadata =
+      sealed.find((candidate) =>
+        sameAuthorizedScopeIdentity(candidate, target),
+      ) ?? null
+
+    if (!metadata) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_not_sealed",
+        candidates: [],
+      }
+    }
+
+    const file = canonicalMutationFile(root, target.file)
+    if (!file) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_file_invalid",
+        candidates: [],
+      }
+    }
+
+    let body = bodies.get(file)
+    if (!body) {
+      try {
+        body = await readFile(path.resolve(root, file))
+      } catch {
+        return {
+          ok: false,
+          reason: "mutation_candidate_file_unavailable",
+          candidates: [],
+        }
+      }
+      bodies.set(file, body)
+    }
+
+    const currentSha256 =
+      createHash("sha256").update(body).digest("hex")
+
+    if (
+      currentSha256 !== metadata.source_sha256 ||
+      currentSha256 !== capability.targetSourceSha256
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_source_stale",
+        candidates: [],
+      }
+    }
+
+    const lines =
+      normalizeMutationCandidateEol(
+        body.toString("utf8"),
+      ).split("\n")
+
+    if (
+      !Number.isInteger(target.start_line) ||
+      !Number.isInteger(target.end_line) ||
+      target.start_line < 1 ||
+      target.end_line < target.start_line ||
+      target.end_line > lines.length
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_live_range_invalid",
+        candidates: [],
+      }
+    }
+
+    candidates.push({
+      target,
+      capability,
+      live_source:
+        lines.slice(target.start_line - 1, target.end_line).join("\n"),
+    })
+  }
+
+  return {
+    ok: true,
+    capsule,
+    candidates,
+  }
+}
+
+async function bindReplaceNodeMutationCandidate(root, state, before) {
+  const loaded =
+    await loadLivePreauthorizedMutationCandidates(root, state)
+
+  if (!loaded.ok) {
+    return {
+      ...loaded,
+      repairable: false,
+      candidate: null,
+    }
+  }
+
+  const selected =
+    selectExactMutationCandidate(
+      loaded.candidates,
+      before,
+      state?.boundMutationTarget ?? null,
+    )
+
+  return {
+    ...selected,
+    candidate_count: loaded.candidates.length,
+  }
 }
 
 async function confirmLocalMutationCompetitors(
@@ -950,6 +1746,7 @@ async function attestLocalMutationCapability(
   scoutHandoff,
   editCapsule,
   competitorCheck,
+  targetOverride = null,
 ) {
   const reject = (reason, detail = null) => ({
     ok: false,
@@ -1048,9 +1845,45 @@ async function attestLocalMutationCapability(
     return reject("authorized_scope_cardinality", String(authorizedScopes.length))
   }
 
-  const target = authorizedScopes[0]
-  if (!sameAuthorizedScopeIdentity(target, capsule.authorized_mutation_scope)) {
+  const initialTarget = authorizedScopes[0]
+  if (!sameAuthorizedScopeIdentity(initialTarget, capsule.authorized_mutation_scope)) {
     return reject("authorized_scope_attestation_mismatch")
+  }
+
+  let target = initialTarget
+  let candidateMeta = null
+
+  if (targetOverride) {
+    candidateMeta =
+      (editCapsule?.mutationCandidates ?? [])
+        .find((candidate) =>
+          sameAuthorizedScopeIdentity(candidate, targetOverride),
+        ) ?? null
+
+    if (!candidateMeta) {
+      return reject("mutation_candidate_not_preauthorized")
+    }
+
+    const candidateScope =
+      (editCapsule?.scopeRecords ?? [])
+        .find((scope) =>
+          scope?.context === "full" &&
+          scope?.mutation_candidate === true &&
+          sameAuthorizedScopeIdentity(scope, candidateMeta),
+        ) ?? null
+
+    if (!candidateScope) {
+      return reject("mutation_candidate_scope_missing")
+    }
+
+    if (
+      !globalReady &&
+      !sameAuthorizedScopeIdentity(initialTarget, candidateScope)
+    ) {
+      return reject("partial_candidate_rebind_requires_rescout")
+    }
+
+    target = candidateScope
   }
 
   if (
@@ -1107,10 +1940,37 @@ async function attestLocalMutationCapability(
     return reject("target_fingerprint_stale")
   }
 
+  const attestationTargetFile = {
+    ...targetFile,
+    evidence_lines:
+      [...new Set([
+        ...(targetFile.evidence_lines ?? []),
+        ...(candidateMeta?.evidence_lines ?? []),
+      ])]
+        .filter((line) => Number.isInteger(line) && line > 0)
+        .sort((a, b) => a - b),
+  }
+
+  const attestationCapsule =
+    targetOverride
+      ? {
+          ...editCapsule,
+          mutationReady: true,
+          structuralSource:
+            candidateMeta?.structural_source ??
+            editCapsule?.structuralSource ??
+            "candidate_set",
+          primaryMutationCandidate:
+            mutationCandidateIdentity(target),
+          authorizedMutationScope:
+            mutationCandidateIdentity(target),
+        }
+      : editCapsule
+
   const ownerAttestation = buildOwnerAttestation(
-    editCapsule,
+    attestationCapsule,
     target,
-    targetFile,
+    attestationTargetFile,
   )
   if (!ownerAttestation.ok) {
     return reject(
@@ -1196,6 +2056,7 @@ async function attestLocalMutationCapability(
     sessionID,
     state.turnID,
     localBundle,
+    targetOverride ? identitySha256 : "primary",
   )
   if (!localHandoffPath) {
     return reject("local_mutation_handoff_write_failed")
@@ -1218,6 +2079,71 @@ async function attestLocalMutationCapability(
     competitorCheck,
     allowedMutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
     ownerAttestation,
+  }
+}
+
+async function attestLocalMutationCandidateSet(
+  root,
+  sessionID,
+  state,
+  scoutHandoff,
+  editCapsule,
+  competitorCheck,
+) {
+  const candidates =
+    Array.isArray(editCapsule?.mutationCandidates)
+      ? editCapsule.mutationCandidates
+      : []
+
+  const initial = editCapsule?.authorizedMutationScope ?? null
+  const globalReady = scoutHandoff?.status === "ready"
+
+  const eligibleCandidates =
+    globalReady
+      ? candidates
+      : candidates.filter((candidate) =>
+          sameAuthorizedScopeIdentity(candidate, initial),
+        )
+
+  const preauthorized = []
+  const rejected = []
+
+  for (const candidate of eligibleCandidates) {
+    const capability = await attestLocalMutationCapability(
+      root,
+      sessionID,
+      state,
+      scoutHandoff,
+      editCapsule,
+      competitorCheck,
+      candidate,
+    )
+
+    if (capability?.ok === true) {
+      preauthorized.push({
+        target: capability.target,
+        capability,
+      })
+    } else {
+      rejected.push({
+        target: mutationCandidateIdentity(candidate),
+        reason: capability?.reason ?? "candidate_attestation_failed",
+        detail: capability?.detail ?? null,
+      })
+    }
+  }
+
+  const primary =
+    preauthorized.find((entry) =>
+      sameAuthorizedScopeIdentity(entry.target, initial),
+    )?.capability ?? null
+
+  return {
+    ok: primary?.ok === true && preauthorized.length > 0,
+    protocol: MUTATION_CANDIDATE_SET_PROTOCOL,
+    primary,
+    candidates: preauthorized,
+    rejected,
   }
 }
 
@@ -1268,6 +2194,7 @@ function getSessionState(sessionID) {
       evidenceBytes: 0,
       signatures: new Set(),
       queryCache: new Map(),
+      sourceInventoryCache: new Map(),
       evidenceLedger: new Set(),
       routeLedger: new Set(),
       contextualizedHitLines: new Set(),
@@ -1280,7 +2207,9 @@ function getSessionState(sessionID) {
       scoutHandoffPath: null,
       localMutationHandoffPath: null,
       localMutationCapability: null,
+      localMutationCandidates: [],
       activeMutationHandoffPath: null,
+      boundMutationTarget: null,
       mutationAttempts: 0,
       repairAttempts: 0,
       compilerRuns: 0,
@@ -1289,6 +2218,9 @@ function getSessionState(sessionID) {
       executedPatches: 0,
       patchSignatures: new Set(),
       contractFailureSignatures: new Set(),
+      contractFailures: 0,
+      activeMutationTool: null,
+      visibleToolSchemaSha256: null,
       patchAccepted: false,
       patchReceiptPath: null,
       executionState: EXEC_STATE_LOCATE,
@@ -1317,6 +2249,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.evidenceBytes = 0
   state.signatures.clear()
   state.queryCache.clear()
+  state.sourceInventoryCache.clear()
   state.evidenceLedger.clear()
   state.routeLedger.clear()
   state.contextualizedHitLines.clear()
@@ -1329,7 +2262,9 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.scoutHandoffPath = null
   state.localMutationHandoffPath = null
   state.localMutationCapability = null
+  state.localMutationCandidates = []
   state.activeMutationHandoffPath = null
+  state.boundMutationTarget = null
   state.mutationAttempts = 0
   state.repairAttempts = 0
   state.compilerRuns = 0
@@ -1338,6 +2273,9 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.executedPatches = 0
   state.patchSignatures.clear()
   state.contractFailureSignatures.clear()
+  state.contractFailures = 0
+  state.activeMutationTool = null
+  state.visibleToolSchemaSha256 = null
   state.patchAccepted = false
   state.patchReceiptPath = null
   state.executionState = EXEC_STATE_LOCATE
@@ -1365,7 +2303,52 @@ function transitionExecutionState(current, event) {
 
 function allowedToolsForExecutionState(executionState) {
   if (executionState === EXEC_STATE_LOCATE) return ["search"]
-  if (executionState === EXEC_STATE_MUTATE || executionState === EXEC_STATE_REPAIR) return ["execute_patch"]
+  if (executionState === EXEC_STATE_MUTATE || executionState === EXEC_STATE_REPAIR) {
+    return [...MUTATION_TOOL_NAMES]
+  }
+  return []
+}
+
+function mutationToolsForState(state) {
+  if (
+    state?.executionState !== EXEC_STATE_MUTATE &&
+    state?.executionState !== EXEC_STATE_REPAIR
+  ) {
+    return []
+  }
+
+  const tools = []
+  const capability = state?.localMutationCapability ?? null
+
+  if (
+    capability?.replaceNodeReady === true &&
+    Array.isArray(state?.localMutationCandidates) &&
+    state.localMutationCandidates.length > 0
+  ) {
+    tools.push(EXECUTE_REPLACE_NODE_TOOL)
+  }
+
+  if (
+    capability?.renameSymbolReady === true &&
+    capability?.globalReady === true &&
+    typeof state?.scoutHandoffPath === "string" &&
+    state.scoutHandoffPath.length > 0
+  ) {
+    tools.push(EXECUTE_RENAME_SYMBOL_TOOL)
+  }
+
+  return tools
+}
+
+function allowedToolsForState(state) {
+  if (!state) return []
+  if (state.executionState === EXEC_STATE_LOCATE) return ["search"]
+  if (
+    state.executionState === EXEC_STATE_MUTATE ||
+    state.executionState === EXEC_STATE_REPAIR
+  ) {
+    return mutationToolsForState(state)
+  }
   return []
 }
 
@@ -1375,19 +2358,23 @@ function applyExecutionEvent(state, event, reason, details = null) {
   state.executionState = next
   state.executionReason = reason ?? event
   state.executionEvent = event
-  if (event !== "patch_rescout" && event !== "verification_rescout") state.pendingRescout = null
-  else state.pendingRescout = details ?? { reason: reason ?? event }
+  if (event !== "patch_rescout" && event !== "verification_rescout") {
+    state.pendingRescout = null
+  } else {
+    state.pendingRescout = details ?? { reason: reason ?? event }
+    state.activeMutationTool = null
+  }
   state.lastSeen = nowMs()
   return next
 }
 
 function toolAllowedForExecutionState(state, toolName) {
   if (!state) return false
-  return allowedToolsForExecutionState(state.executionState).includes(toolName)
+  return allowedToolsForState(state).includes(toolName)
 }
 
 function nextActionForExecutionState(state) {
-  const tools = allowedToolsForExecutionState(state?.executionState)
+  const tools = allowedToolsForState(state)
   return tools[0] ?? "report_result"
 }
 
@@ -2144,6 +3131,339 @@ function queryCompilerAnchorToken(tokens) {
   )[0] ?? null
 }
 
+function splitTopLevelRegexAlternatives(query) {
+  const text = String(query ?? "")
+  const branches = []
+  let current = ""
+  let escaped = false
+  let classDepth = 0
+  let parenDepth = 0
+
+  for (const ch of text) {
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+
+    if (ch === "\\") {
+      current += ch
+      escaped = true
+      continue
+    }
+
+    if (ch === "[" && classDepth === 0) {
+      classDepth = 1
+      current += ch
+      continue
+    }
+
+    if (ch === "]" && classDepth === 1) {
+      classDepth = 0
+      current += ch
+      continue
+    }
+
+    if (classDepth === 0) {
+      if (ch === "(") {
+        parenDepth += 1
+        current += ch
+        continue
+      }
+
+      if (ch === ")") {
+        if (parenDepth < 1) return null
+        parenDepth -= 1
+        current += ch
+        continue
+      }
+
+      if (ch === "|" && parenDepth === 0) {
+        if (!current.trim()) return null
+        branches.push(current)
+        current = ""
+        if (branches.length >= QUERY_FORMULATION_MAX_BRANCHES) return null
+        continue
+      }
+    }
+
+    current += ch
+  }
+
+  if (escaped || classDepth !== 0 || parenDepth !== 0 || !current.trim()) {
+    return null
+  }
+
+  branches.push(current)
+  return branches
+}
+
+function queryFormulationAtoms(fragment) {
+  const chunks = String(fragment ?? "").match(
+    /[A-Za-z][A-Za-z0-9_-]{2,}|\d{2,8}/g,
+  )
+
+  if (!chunks) return []
+
+  const atoms = []
+  const seen = new Set()
+
+  const add = (raw) => {
+    const atom = String(raw ?? "").toLowerCase()
+    if (
+      atom.length < 2 ||
+      atom.length > 32 ||
+      QUERY_COMPILER_STOPWORDS.has(atom) ||
+      seen.has(atom)
+    ) {
+      return
+    }
+
+    seen.add(atom)
+    atoms.push(atom)
+  }
+
+  for (const chunk of chunks) {
+    if (/^\d+$/.test(chunk)) {
+      add(chunk)
+      continue
+    }
+
+    const parts = chunk
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/[_\-\s]+/)
+
+    for (const part of parts) add(part)
+  }
+
+  return atoms
+}
+
+function buildQueryFormulationPlan(query) {
+  const rawBranches = splitTopLevelRegexAlternatives(query)
+  if (
+    !Array.isArray(rawBranches) ||
+    rawBranches.length < 1 ||
+    rawBranches.length > QUERY_FORMULATION_MAX_BRANCHES
+  ) {
+    return null
+  }
+
+  const branches = []
+  const atoms = []
+  const seen = new Set()
+
+  for (const raw of rawBranches) {
+    const branchAtoms = queryFormulationAtoms(raw)
+
+    if (
+      branchAtoms.length < 1 ||
+      branchAtoms.length > QUERY_FORMULATION_MAX_ATOMS_PER_BRANCH
+    ) {
+      return null
+    }
+
+    branches.push({ raw, atoms: branchAtoms })
+
+    for (const atom of branchAtoms) {
+      if (seen.has(atom)) continue
+      seen.add(atom)
+      atoms.push(atom)
+      if (atoms.length > QUERY_FORMULATION_MAX_ATOMS) return null
+    }
+  }
+
+  if (
+    atoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
+    !atoms.some((atom) => /[a-z]/.test(atom))
+  ) {
+    return null
+  }
+
+  return {
+    protocol: QUERY_FORMULATION_PROTOCOL,
+    branches,
+    atoms,
+  }
+}
+
+function queryFormulationLineHasAtom(text, atom) {
+  const line = String(text ?? "").toLowerCase()
+  if (!line || !atom) return false
+
+  if (/^\d+$/.test(atom)) {
+    const escaped = escapeRegexLiteral(atom)
+    return new RegExp(`(?:^|\\D)${escaped}(?=\\D|$)`).test(line)
+  }
+
+  return line.includes(atom)
+}
+
+async function runQueryFormulationDiscovery(
+  root,
+  query,
+  queryIndex,
+  target,
+  glob,
+  plan = null,
+) {
+  const formulation = plan ?? buildQueryFormulationPlan(query)
+  if (!formulation) return null
+
+  const anchorQuery =
+    `(?i:${formulation.atoms.map(escapeRegexLiteral).join("|")})`
+
+  const probe = await runQuery(
+    root,
+    anchorQuery,
+    queryIndex,
+    [target],
+    glob,
+  )
+
+  if (
+    probe.scanComplete !== true ||
+    probe.timedOut === true ||
+    probe.scanCapped === true ||
+    probe.error
+  ) {
+    return null
+  }
+
+  const atomsByFile = new Map()
+  const globalObserved = new Set()
+
+  for (const match of probe.matches ?? []) {
+    const file = evidenceFileKey(match?.file)
+    if (!file) continue
+
+    let fileAtoms = atomsByFile.get(file)
+    if (!fileAtoms) {
+      fileAtoms = new Set()
+      atomsByFile.set(file, fileAtoms)
+    }
+
+    for (const atom of formulation.atoms) {
+      if (!queryFormulationLineHasAtom(match?.text, atom)) continue
+      fileAtoms.add(atom)
+      globalObserved.add(atom)
+    }
+  }
+
+  const scoreByFile = new Map()
+  const branchEvidence = []
+
+  formulation.branches.forEach((branch, branchIndex) => {
+    const sourceBackedAtoms = branch.atoms.filter((atom) =>
+      globalObserved.has(atom),
+    )
+
+    if (
+      sourceBackedAtoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
+      !sourceBackedAtoms.some((atom) => /[a-z]/.test(atom))
+    ) {
+      return
+    }
+
+    const requiredAtoms = Math.max(
+      QUERY_FORMULATION_MIN_FILE_ATOMS,
+      Math.ceil(
+        sourceBackedAtoms.length * QUERY_FORMULATION_MIN_COVERAGE_RATIO,
+      ),
+    )
+
+    branchEvidence.push({
+      branchIndex,
+      sourceBackedAtoms,
+      requiredAtoms,
+    })
+
+    for (const [file, observedAtoms] of atomsByFile.entries()) {
+      const matchedAtoms = sourceBackedAtoms.filter((atom) =>
+        observedAtoms.has(atom),
+      )
+
+      if (matchedAtoms.length < requiredAtoms) continue
+
+      const ratio = matchedAtoms.length / sourceBackedAtoms.length
+      const prior = scoreByFile.get(file) ?? {
+        file,
+        maxAtoms: 0,
+        maxRatio: 0,
+        matchedBranches: 0,
+      }
+
+      prior.maxAtoms = Math.max(prior.maxAtoms, matchedAtoms.length)
+      prior.maxRatio = Math.max(prior.maxRatio, ratio)
+      prior.matchedBranches += 1
+      scoreByFile.set(file, prior)
+    }
+  })
+
+  const ranked = [...scoreByFile.values()].sort(
+    (a, b) =>
+      b.maxAtoms - a.maxAtoms ||
+      b.maxRatio - a.maxRatio ||
+      b.matchedBranches - a.matchedBranches ||
+      a.file.localeCompare(b.file),
+  )
+
+  if (
+    ranked.length < 1 ||
+    ranked.length > QUERY_FORMULATION_MAX_FILES
+  ) {
+    return null
+  }
+
+  const files = ranked.map((entry) => entry.file)
+  const allowed = new Set(files)
+  const matches = (probe.matches ?? [])
+    .filter((match) => allowed.has(evidenceFileKey(match?.file)))
+    .map((match) => ({
+      ...match,
+      exactSpans: [],
+      matchTexts: [],
+    }))
+
+  if (matches.length < 1) return null
+
+  const compiledProbe = {
+    ...probe,
+    query,
+    requestedQuery: query,
+    matchMode: "token_file_cooccurrence",
+    matches,
+  }
+
+  return {
+    query,
+    requestedQuery: query,
+    effectiveQuery: anchorQuery,
+    cacheQuery: `token-file:${formulation.branches
+      .map((branch) => branch.atoms.join("&"))
+      .join("||")}`,
+    queryIndex,
+    files,
+    timedOut: false,
+    scanCapped: false,
+    error: null,
+    scanComplete: true,
+    matchMode: "token_file_cooccurrence",
+    compilerTokens: formulation.atoms,
+    compiledProbe,
+    queryFormulation: {
+      protocol: QUERY_FORMULATION_PROTOCOL,
+      branches: formulation.branches.map((branch) => branch.atoms),
+      source_backed_branches: branchEvidence.map((entry) => ({
+        branch_index: entry.branchIndex,
+        atoms: entry.sourceBackedAtoms,
+        required_atoms: entry.requiredAtoms,
+      })),
+      selected_files: files.length,
+    },
+  }
+}
+
 function queryCompilerProbeResult(
   result,
   requestedQuery,
@@ -2256,7 +3576,24 @@ async function runCompiledDiscovery(
     return exactResult
   }
 
-  // Stage 2: order-independent recovery, but only when ALL significant
+  const formulationPlan = buildQueryFormulationPlan(query)
+
+  // Stage 2a: top-level alternation is usually a set of independent search
+  // hypotheses. Requiring every token from every alternative on one line is
+  // structurally impossible, so try bounded same-file co-occurrence first.
+  if ((formulationPlan?.branches?.length ?? 0) > 1) {
+    const formulated = await runQueryFormulationDiscovery(
+      root,
+      query,
+      queryIndex,
+      target,
+      glob,
+      formulationPlan,
+    )
+    if (formulated) return formulated
+  }
+
+  // Stage 2b: order-independent recovery, but only when ALL significant
   // query tokens occur on the SAME physical source line.
   //
   // One longest token is used as a cheap rg anchor; JS then validates
@@ -2303,7 +3640,15 @@ async function runCompiledDiscovery(
     }))
 
   if (matches.length < 1) {
-    return exactResult
+    const formulated = await runQueryFormulationDiscovery(
+      root,
+      query,
+      queryIndex,
+      target,
+      glob,
+      formulationPlan,
+    )
+    return formulated ?? exactResult
   }
 
   const files = [
@@ -3627,6 +4972,37 @@ async function readAuthorizedEditCapsule(root, state) {
     }
   }
 
+if (
+    capsule?.mutation_candidate_protocol !== MUTATION_CANDIDATE_SET_PROTOCOL ||
+    capsule?.mutation_candidate_limit !== MUTATION_CANDIDATE_MAX ||
+    !Array.isArray(capsule?.mutation_candidates) ||
+    !Number.isInteger(capsule?.mutation_candidate_count) ||
+    capsule.mutation_candidate_count !== capsule.mutation_candidates.length ||
+    capsule.mutation_candidate_count < 1 ||
+    capsule.mutation_candidate_count > MUTATION_CANDIDATE_MAX
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_candidate_set_invalid",
+    }
+  }
+
+  for (const candidate of capsule.mutation_candidates) {
+    const matches = capsule.scopes.filter(
+      (scope) =>
+        scope?.mutation_candidate === true &&
+        scope?.context === "full" &&
+        sameAuthorizedScopeIdentity(scope, candidate),
+    )
+
+    if (matches.length !== 1) {
+      return {
+        ok: false,
+        reason: "edit_capsule_candidate_attestation_mismatch",
+      }
+    }
+  }
+
   return {
     ok: true,
     capsule,
@@ -3655,31 +5031,20 @@ async function materializeCapabilityBoundMutation(
     }
   }
 
-  const target = authorizedScopes[0]
-  const file = canonicalMutationFile(root, target?.file)
-  const symbol =
-    typeof target?.symbol_name === "string" ? target.symbol_name : ""
-  if (!file || !symbol) {
-    return {
-      ok: false,
-      reason: "mutation_capability_invalid",
-      detail: "authorized_target_identity_invalid",
-      rescout: false,
-    }
-  }
+  const primaryTarget = authorizedScopes[0]
+  const primaryCapability = state?.localMutationCapability ?? null
 
-  const capability = state?.localMutationCapability ?? null
   if (
-    capability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
-    capability?.replaceNodeReady !== true ||
+    primaryCapability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
+    primaryCapability?.replaceNodeReady !== true ||
     !sameAuthorizedScopeIdentity(
-      target,
+      primaryTarget,
       {
-        file: capability?.target?.file,
-        symbol_name: capability?.target?.symbol_name,
-        symbol_kind: capability?.target?.symbol_kind,
-        start_line: capability?.target?.start_line,
-        end_line: capability?.target?.end_line,
+        file: primaryCapability?.target?.file,
+        symbol_name: primaryCapability?.target?.symbol_name,
+        symbol_kind: primaryCapability?.target?.symbol_kind,
+        start_line: primaryCapability?.target?.start_line,
+        end_line: primaryCapability?.target?.end_line,
       },
     )
   ) {
@@ -3691,8 +5056,32 @@ async function materializeCapabilityBoundMutation(
     }
   }
 
+  let target = primaryTarget
+  let capability = primaryCapability
   let activeHandoffPath = null
+
   if (input.kind === "replace_node") {
+    const binding =
+      await bindReplaceNodeMutationCandidate(
+        root,
+        state,
+        input.before,
+      )
+
+    if (!binding.ok) {
+      return {
+        ok: false,
+        reason: binding.reason,
+        detail: binding.reason,
+        repairable: binding.repairable === true,
+        rescout: false,
+        candidate_count: binding.candidate_count ?? null,
+      }
+    }
+
+    target = binding.candidate.target
+    capability = binding.candidate.capability
+
     if (
       !Array.isArray(capability.allowedMutations) ||
       !capability.allowedMutations.includes("replace_node")
@@ -3704,11 +5093,13 @@ async function materializeCapabilityBoundMutation(
         rescout: false,
       }
     }
+
     activeHandoffPath = capability.localHandoffPath
+    state.boundMutationTarget = mutationCandidateIdentity(target)
   } else if (input.kind === "rename_symbol") {
     if (
-      capability.globalReady !== true ||
-      capability.renameSymbolReady !== true ||
+      primaryCapability.globalReady !== true ||
+      primaryCapability.renameSymbolReady !== true ||
       typeof state?.scoutHandoffPath !== "string"
     ) {
       return {
@@ -3719,6 +5110,19 @@ async function materializeCapabilityBoundMutation(
       }
     }
     activeHandoffPath = state.scoutHandoffPath
+  }
+
+  const file = canonicalMutationFile(root, target?.file)
+  const symbol =
+    typeof target?.symbol_name === "string" ? target.symbol_name : ""
+
+  if (!file || !symbol) {
+    return {
+      ok: false,
+      reason: "mutation_capability_invalid",
+      detail: "authorized_target_identity_invalid",
+      rescout: false,
+    }
   }
 
   if (
@@ -3759,7 +5163,6 @@ async function materializeCapabilityBoundMutation(
     },
   }
 }
-
 const PATCH_COMPILER_RETRY_REASONS = new Set([
   "mutation_contract_invalid",
   "mutation_kind_invalid",
@@ -4016,6 +5419,10 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
     verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
     verification_receipt: path.relative(root, verificationPath),
     execution_protocol: EXECUTION_LOOP_PROTOCOL,
+    mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+    mutation_tool: state.activeMutationTool,
+    visible_tool_schema_sha256: state.visibleToolSchemaSha256,
+    tool_contract_failures: state.contractFailures,
     compiler_protocol: PATCH_COMPILER_PROTOCOL,
     mutation_protocol: PATCH_MUTATION_PROTOCOL,
     executor_protocol: PATCH_EXECUTOR_PROTOCOL,
@@ -5720,6 +7127,7 @@ function focusedScopesFromGroups(groups) {
         anchors: new Set(),
         roles: new Set(),
         queries: new Set(),
+        mutationCandidateBases: new Set(),
         hitCount: 0,
         roleScore: 0,
       }
@@ -5734,6 +7142,9 @@ function focusedScopesFromGroups(groups) {
     if (group.role) {
       scope.roles.add(group.role)
       scope.roleScore = Math.max(scope.roleScore, focusedRoleScore(group.role))
+    }
+    if (typeof group.mutation_candidate_basis === "string") {
+      scope.mutationCandidateBases.add(group.mutation_candidate_basis)
     }
     for (const line of group.hit_lines ?? []) {
       if (Number.isInteger(line) && line > 0) scope.hitLines.add(line)
@@ -6171,6 +7582,8 @@ async function buildEditCapsule(
         .sort((a, b) => a - b),
       context: full ? "full" : "evidence_window",
       mutation_authorized: mutationAuthorized,
+      mutation_candidate_bases:
+        [...(scope.mutationCandidateBases ?? [])].sort(),
       source: source.join("\n"),
     })
 
@@ -6179,6 +7592,81 @@ async function buildEditCapsule(
     } else {
       windowScopes += 1
     }
+  }
+
+const fileEntriesByCanonical =
+    new Map(
+      files
+        .map((entry) => [
+          canonicalMutationFile(root, entry?.file),
+          entry,
+        ])
+        .filter(([file]) => file),
+    )
+
+  const candidateScopePool =
+    capsuleScopes.filter(
+      (scope) =>
+        scope?.context === "full" &&
+        scope?.symbol_kind !== "evidence_window" &&
+        scope?.symbol_kind !== "module" &&
+        scope?.symbol_name !== "<evidence>" &&
+        scope?.symbol_name !== "<module>" &&
+        Array.isArray(scope?.evidence_lines) &&
+        scope.evidence_lines.length > 0,
+    )
+
+  const candidateScopes =
+    scoutHandoff?.status === "ready"
+      ? candidateScopePool.slice(0, MUTATION_CANDIDATE_MAX)
+      : candidateScopePool
+          .filter((scope) => scope?.mutation_authorized === true)
+          .slice(0, 1)
+
+  const mutationCandidates = []
+
+  for (const scope of capsuleScopes) {
+    scope.mutation_candidate = false
+  }
+
+  for (const scope of candidateScopes) {
+    const file = canonicalMutationFile(root, scope.file)
+    const fileEntry = fileEntriesByCanonical.get(file)
+    const fingerprint = fileEntry?.fingerprint
+
+    if (
+      !file ||
+      fingerprint?.kind !== "sha256" ||
+      fingerprint?.strong !== true ||
+      fingerprint?.evidence_fresh !== true ||
+      typeof fingerprint?.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
+      fileEntry?.changed_during_scout === true
+    ) continue
+
+    const impactRecovered =
+      (scope.mutation_candidate_bases ?? [])
+        .includes("validated_forward_impact_definition")
+
+    scope.mutation_candidate = true
+
+    mutationCandidates.push({
+      file,
+      symbol_kind: scope.symbol_kind,
+      symbol_name: scope.symbol_name,
+      start_line: scope.start_line,
+      end_line: scope.end_line,
+      evidence_lines: [...scope.evidence_lines],
+      source_sha256: fingerprint.sha256,
+      structural_source:
+        impactRecovered
+          ? "line_owner_recovery"
+          : structuralSource,
+      proof_basis:
+        impactRecovered
+          ? "validated_forward_impact_definition"
+          : "direct_structural_evidence",
+    })
   }
 
   const strongFingerprints =
@@ -6239,6 +7727,10 @@ async function buildEditCapsule(
     readinessBlockers.push("mutation_scope_unavailable")
   }
 
+  if (mutationCandidates.length < 1) {
+    readinessBlockers.push("mutation_candidate_set_unavailable")
+  }
+
   const readinessWarnings = []
 
   if (!allHandoffFilesContextualized) {
@@ -6282,6 +7774,10 @@ async function buildEditCapsule(
     readiness_blockers: readinessBlockers,
     readiness_warnings: readinessWarnings,
     structural_source: structuralSource,
+    mutation_candidate_protocol: MUTATION_CANDIDATE_SET_PROTOCOL,
+    mutation_candidate_limit: MUTATION_CANDIDATE_MAX,
+    mutation_candidate_count: mutationCandidates.length,
+    mutation_candidates: mutationCandidates,
 
     // Deterministic candidate selected before byte-budget rendering.
     // This is NOT mutation authority by itself.
@@ -6368,6 +7864,14 @@ async function buildEditCapsule(
     readinessBlockers,
     readinessWarnings,
     structuralSource,
+    mutationCandidateProtocol:
+      capsule.mutation_candidate_protocol,
+    mutationCandidateCount:
+      capsule.mutation_candidate_count,
+    mutationCandidates:
+      capsule.mutation_candidates,
+    scopeRecords:
+      capsule.scopes,
     primaryMutationCandidate:
       capsule.primary_mutation_candidate,
     authorizedMutationScope:
@@ -7375,7 +8879,7 @@ export default {
           "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
           "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
           "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
-          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only execute_patch.",
+          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only capability-derived action-specific mutation tools.",
         input: {
           type: "object",
           properties: {
@@ -7499,7 +9003,20 @@ export default {
             return { content: "SEARCH_ERROR: " + String(error?.message ?? error) }
           }
 
-          const glob = typeof input?.glob === "string" ? input.glob : undefined
+          const requestedGlob =
+            typeof input?.glob === "string"
+              ? input.glob
+              : undefined
+
+          const globResolution =
+            await resolveSearchLanguageGlob(
+              root,
+              target,
+              requestedGlob,
+              state,
+            )
+
+          const glob = globResolution.effectiveGlob
           const signature = searchSignature(queries, target, glob)
 
           if (state && state.signatures.has(signature)) {
@@ -7507,6 +9024,9 @@ export default {
               queries,
               path: target,
               glob: glob ?? null,
+              requested_glob: requestedGlob ?? null,
+              effective_glob: glob ?? null,
+              glob_correction_reason: globResolution.reason,
             })
           }
 
@@ -7532,6 +9052,9 @@ export default {
               queries,
               path: target,
               glob: glob ?? null,
+              requested_glob: requestedGlob ?? null,
+              effective_glob: glob ?? null,
+              glob_correction_reason: globResolution.reason,
             })
           }
 
@@ -7824,6 +9347,11 @@ export default {
           if (!selectedEvidenceComplete) rawReasons.push("output_budget")
 
           const rawHeader = [
+            ...(globResolution.corrected
+              ? [
+                  `GLOB_CORRECTED requested=${JSON.stringify(requestedGlob)} effective=${JSON.stringify(glob ?? null)} reason=${globResolution.reason}`,
+                ]
+              : []),
             `SEARCH complete=${rawComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${rawEvidenceComplete} selected_evidence_complete=${selectedEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawRendered.shown.size}`,
             ...querySummary,
           ]
@@ -8880,20 +10408,30 @@ export default {
               ? ownerRecoveryGroups
               : null
 
-          const capsuleGroups =
-            exactStructuralGroups ?? recoveredStructuralGroups
+          const impactMutationCandidateRecovery =
+            await recoverValidatedImpactMutationCandidateGroups(
+              root,
+              selectedImpactFiles,
+            )
+
+          const capsuleGroups = [
+            ...(exactStructuralGroups ?? recoveredStructuralGroups ?? []),
+            ...(impactMutationCandidateRecovery.groups ?? []),
+          ]
 
           const capsuleStructuralSource =
             existingExactStructuralGroups
               ? "evidence_ir"
               : capsuleExactProbeGroups
                 ? "exact_structural_probe"
-                : recoveredStructuralGroups
+                : recoveredStructuralGroups ||
+                    impactMutationCandidateRecovery.groups.length > 0
                   ? "line_owner_recovery"
                   : "none"
 
           let editCapsule = null
           let localMutationCapability = null
+          let localMutationCandidateSet = null
           let localCompetitorCheck = null
 
           if (mutationLocalization.eligible) {
@@ -8920,20 +10458,27 @@ export default {
               )
 
               if (localCompetitorCheck.ok === true) {
-                localMutationCapability = await attestLocalMutationCapability(
-                  root,
-                  sessionID,
-                  state,
-                  scoutHandoff,
-                  editCapsule,
-                  localCompetitorCheck,
-                )
+                localMutationCandidateSet =
+                  await attestLocalMutationCandidateSet(
+                    root,
+                    sessionID,
+                    state,
+                    scoutHandoff,
+                    editCapsule,
+                    localCompetitorCheck,
+                  )
+
+                localMutationCapability =
+                  localMutationCandidateSet.primary
               }
 
               if (localMutationCapability?.ok === true) {
                 state.localMutationHandoffPath =
                   localMutationCapability.localHandoffPath
                 state.localMutationCapability = localMutationCapability
+                state.localMutationCandidates =
+                  localMutationCandidateSet?.candidates ?? []
+                state.boundMutationTarget = null
                 state.activeMutationHandoffPath = null
                 applyExecutionEvent(
                   state,
@@ -8943,6 +10488,8 @@ export default {
               } else {
                 state.localMutationHandoffPath = null
                 state.localMutationCapability = null
+                state.localMutationCandidates = []
+                state.boundMutationTarget = null
                 state.activeMutationHandoffPath = null
                 applyExecutionEvent(
                   state,
@@ -8980,6 +10527,14 @@ export default {
             queries,
             path: target,
             glob: glob ?? null,
+            requested_glob: requestedGlob ?? null,
+            effective_glob: glob ?? null,
+            glob_corrected: globResolution.corrected === true,
+            glob_correction_reason: globResolution.reason,
+            glob_inventory_complete: globResolution.inventoryComplete,
+            glob_inventory_files: globResolution.inventoryFiles,
+            glob_inventory_extensions: globResolution.inventoryExtensions,
+            glob_inventory_cache_hit: globResolution.inventoryCacheHit,
             file_discovery_cap_per_query: FILE_DISCOVERY_CAP_PER_QUERY,
             line_hit_cap_per_query: LINE_HIT_CAP_PER_QUERY,
             lexical_discovery_complete: discoveryComplete,
@@ -9020,6 +10575,18 @@ export default {
               localMutationCapability?.ownerAttestation ?? null,
             scout_competitor_check:
               localCompetitorCheck ?? null,
+            mutation_candidate_protocol:
+              editCapsule?.mutationCandidateProtocol ?? null,
+            mutation_candidate_count:
+              editCapsule?.mutationCandidateCount ?? 0,
+            mutation_candidates_preauthorized:
+              localMutationCandidateSet?.candidates?.length ?? 0,
+            mutation_candidates_rejected:
+              localMutationCandidateSet?.rejected?.length ?? 0,
+            impact_mutation_candidate_recovery_reason:
+              impactMutationCandidateRecovery?.reason ?? null,
+            impact_mutation_candidate_recovery_groups:
+              impactMutationCandidateRecovery?.groups?.length ?? 0,
             edit_capsule_protocol: editCapsule?.protocol ?? null,
             edit_capsule_path: editCapsule?.path ?? null,
             edit_capsule_sha256: editCapsule?.sha256 ?? null,
@@ -9217,12 +10784,27 @@ export default {
               match_mode: result.matchMode ?? "exact",
               effective_query: result.effectiveQuery ?? result.query,
               compiler_tokens: result.compilerTokens ?? [],
+              query_formulation_protocol:
+                result.queryFormulation?.protocol ?? null,
+              query_formulation:
+                result.queryFormulation ?? null,
             })),
             query_compiler_fallbacks: discoveryResults
               .filter((result) => result.matchMode && result.matchMode !== "exact")
               .map((result) => ({
                 query_index: result.queryIndex,
                 match_mode: result.matchMode,
+              })),
+            query_formulation_protocol: QUERY_FORMULATION_PROTOCOL,
+            query_formulation_fallbacks: discoveryResults
+              .filter((result) => result.queryFormulation)
+              .map((result) => ({
+                query_index: result.queryIndex,
+                match_mode: result.matchMode,
+                branches:
+                  result.queryFormulation?.branches?.length ?? 0,
+                selected_files:
+                  result.queryFormulation?.selected_files ?? 0,
               })),
             reused_query_count: reusedQueryCount,
             executed_query_count: executedQueryCount,
@@ -9376,12 +10958,13 @@ export default {
           // an authorized mutation capsule, raw discovery evidence is no
           // longer model-facing. The user task remains in conversation and
           // the capsule contains the bounded source context required for the
-          // only exposed next action: execute_patch.
+          // only exposed next action(s): capability-derived mutation tools.
           //
           // Full Scout evidence remains persisted in search trace / handoff
           // artifacts; this changes only the next model-facing projection.
-          const actionableContent = localMutationCapability?.replaceNodeReady === true
-            ? `${editCapsule.text}\nNEXT_ACTION=execute_patch reason=edit_capsule_ready search_locked=true`
+          const mutationFrontier = mutationToolsForState(state)
+          const actionableContent = mutationFrontier.length > 0
+            ? `${editCapsule.text}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=edit_capsule_ready search_locked=true`
             : content
 
           return {
@@ -9396,6 +10979,26 @@ export default {
               turn_evidence_bytes: state?.evidenceBytes ?? null,
               representation,
               source_representation: sourceRepresentation,
+              requested_glob: requestedGlob ?? null,
+              effective_glob: glob ?? null,
+              glob_corrected: globResolution.corrected === true,
+              glob_correction_reason: globResolution.reason,
+              glob_inventory_complete: globResolution.inventoryComplete,
+              glob_inventory_files: globResolution.inventoryFiles,
+              glob_inventory_extensions: globResolution.inventoryExtensions,
+              glob_inventory_cache_hit: globResolution.inventoryCacheHit,
+              query_formulation_protocol: QUERY_FORMULATION_PROTOCOL,
+              query_formulation_used: discoveryResults.some(
+                (result) => result?.queryFormulation != null,
+              ),
+              query_formulation_fallbacks: discoveryResults
+                .filter((result) => result?.queryFormulation != null)
+                .map((result) => ({
+                  query_index: result.queryIndex,
+                  match_mode: result.matchMode ?? null,
+                  branches: result.queryFormulation?.branches?.length ?? 0,
+                  selected_files: result.queryFormulation?.selected_files ?? 0,
+                })),
               unique_hits: hits.size,
               shown_hits: shownHits,
               scan_complete: scanComplete,
@@ -9433,6 +11036,18 @@ export default {
                 localMutationCapability?.ownerAttestation ?? null,
               scout_competitor_check:
                 localCompetitorCheck ?? null,
+              mutation_candidate_protocol:
+                editCapsule?.mutationCandidateProtocol ?? null,
+              mutation_candidate_count:
+                editCapsule?.mutationCandidateCount ?? 0,
+              mutation_candidates_preauthorized:
+                localMutationCandidateSet?.candidates?.length ?? 0,
+              mutation_candidates_rejected:
+                localMutationCandidateSet?.rejected?.length ?? 0,
+              impact_mutation_candidate_recovery_reason:
+                impactMutationCandidateRecovery?.reason ?? null,
+              impact_mutation_candidate_recovery_groups:
+                impactMutationCandidateRecovery?.groups?.length ?? 0,
               edit_capsule_protocol: editCapsule?.protocol ?? null,
               edit_capsule_path: editCapsule?.path ?? null,
               edit_capsule_sha256: editCapsule?.sha256 ?? null,
@@ -9496,54 +11111,11 @@ export default {
     }))
 
     await track(ctx.tool.transform((tools) => {
-      tools.add({
-        name: "execute_patch",
-        description:
-          "Submit exactly ONE semantic mutation inside the single mutation-authorized CAPSULE_SCOPE. " +
-          "The target file and symbol are implicit capabilities and MUST NOT be supplied. " +
-          "Mutation scope is also capability-derived and MUST NOT be supplied; rename_symbol is deterministically bound to handoff scope. " +
-          "Prefer replace_node: before is a canonical exact source slice, never a pattern; only outer whitespace and line endings are normalized deterministically. Copy the smallest complete structural slice from the authorized scope and provide only its replacement. " +
-          "A slice may be one named AST node, a bounded contiguous sibling sequence, or the full authorized owner when copied exactly. " +
-          "The deterministic compiler NEVER expands the physical edit beyond before; it certifies exact byte offsets and the verifier re-derives them independently. " +
-          "PATCH_RETRY means revise semantic intent once; PATCH_RESCOUT means new evidence is required.",
-        input: {
-          type: "object",
-          properties: {
-            kind: {
-              type: "string",
-              enum: [
-                "replace_node",
-                "rename_symbol",
-              ],
-            },
-            before: {
-              type: "string",
-              minLength: 1,
-              maxLength: 4096,
-              description:
-                "Canonical exact source slice inside the authorized owner. Outer whitespace/EOL are normalized deterministically; no fuzzy AST matching is used. The slice must align to one named AST node, a bounded contiguous sibling sequence, or the exact full owner.",
-            },
-            replacement: {
-              type: "string",
-              maxLength: 4096,
-              description:
-                "Replacement for exactly the before slice. Use relative indentation. Reproduce the enclosing function only when before is the exact full authorized owner.",
-            },
-            new_name: {
-              type: "string",
-              minLength: 1,
-              maxLength: 256,
-            },
-          },
-          required: ["kind"],
-          additionalProperties: false,
-        },
-        options: {
-          codemode: false,
-          permission: PATCH_PERMISSION_ACTION,
-        },
-
-        execute: async (input, toolContext) => {
+      const executeCapabilityMutation = async (rawInput, toolContext, forcedKind, toolName) => {
+        const input = {
+          ...(rawInput ?? {}),
+          kind: forcedKind,
+        }
           const started = performance.now()
           const sessionID =
             typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
@@ -9569,9 +11141,16 @@ export default {
               turn_model_calls: state?.modelCalls ?? null,
               scout_handoff_path: state?.scoutHandoffPath ?? null,
               edit_capsule_path: state?.editCapsulePath ?? null,
+              bound_mutation_target: state?.boundMutationTarget ?? null,
+              preauthorized_mutation_candidates:
+                state?.localMutationCandidates?.length ?? 0,
               execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
               execution_state: state?.executionState ?? null,
               execution_reason: state?.executionReason ?? null,
+              mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+              mutation_tool: toolName,
+              semantic_kind: forcedKind,
+              tool_contract_failures: state?.contractFailures ?? null,
               ...runtimeIdentity,
               ...record,
               tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
@@ -9582,7 +11161,7 @@ export default {
             await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
             return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
           }
-          if (!toolAllowedForExecutionState(state, "execute_patch")) {
+          if (!toolAllowedForExecutionState(state, toolName)) {
             const next = nextActionForExecutionState(state)
             const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
             await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
@@ -9634,92 +11213,98 @@ export default {
             }
           }
 
+          const forbiddenRawAuthorityField = [
+            "kind",
+            "file",
+            "symbol",
+            "scope",
+          ].find((field) => mutationFieldPresent(rawInput, field))
+
+          const shape = forbiddenRawAuthorityField
+            ? mutationShapeFailure(
+                forcedKind,
+                `action_tool_forbids_${forbiddenRawAuthorityField}`,
+              )
+            : validateMutationShape(input)
+
+          // Tool-schema/transport violations are not semantic patch attempts.
+          // With action-specific top-level required fields these should be
+          // unreachable under a conforming provider; if they reach runtime,
+          // fail closed without consuming the one semantic repair.
+          if (shape.ok !== true) {
+            state.contractFailures += 1
+            const repeated = state.contractFailureSignatures.has(shape.signature)
+            state.contractFailureSignatures.add(shape.signature)
+            applyExecutionEvent(state, "fatal", "tool_contract_violation")
+
+            await trace({
+              admitted: false,
+              failure_layer: "tool_contract",
+              reason: "tool_contract_violation",
+              contract_detail: shape.detail,
+              contract_signature: shape.signature,
+              repeated_contract_failure: repeated,
+              action: "stop",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_STOP reason=tool_contract_violation ` +
+                `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `contract_failures=${state.contractFailures} action=report_blocked`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason: "tool_contract_violation",
+                detail: shape.detail,
+                failure_layer: "tool_contract",
+                semantic_attempt_consumed: false,
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          if (
+            state.activeMutationTool &&
+            state.activeMutationTool !== toolName
+          ) {
+            applyExecutionEvent(state, "fatal", "mutation_action_changed_during_attempt")
+            await trace({
+              admitted: false,
+              failure_layer: "orchestrator_contract",
+              reason: "mutation_action_changed_during_attempt",
+              previous_tool: state.activeMutationTool,
+              attempted_tool: toolName,
+              action: "stop",
+              compiler_run: false,
+              executor_run: false,
+            })
+            return {
+              content:
+                `PATCH_STOP reason=mutation_action_changed_during_attempt ` +
+                `expected=${state.activeMutationTool} got=${toolName} action=report_blocked`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason: "mutation_action_changed_during_attempt",
+                failure_layer: "orchestrator_contract",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          state.activeMutationTool = toolName
+
           if (state.executionState === EXEC_STATE_REPAIR) {
             state.repairAttempts += 1
           }
 
           state.mutationAttempts += 1
           state.lastSeen = nowMs()
-
-          const shape = validateMutationShape(input)
-
-          if (shape.ok !== true) {
-            const repeated =
-              state.contractFailureSignatures.has(shape.signature)
-
-            state.contractFailureSignatures.add(shape.signature)
-
-            const canRetry =
-              !repeated &&
-              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
-
-            const reason = repeated
-              ? "duplicate_mutation_shape"
-              : shape.reason
-
-            const action = canRetry ? "retry" : "stop"
-
-            if (canRetry) {
-              applyExecutionEvent(
-                state,
-                "patch_retry",
-                reason,
-              )
-            } else {
-              applyExecutionEvent(
-                state,
-                "fatal",
-                reason,
-              )
-            }
-
-            await trace({
-              admitted: false,
-              failure_layer: "tool_contract",
-              reason,
-              contract_detail: shape.detail,
-              contract_signature: shape.signature,
-              action,
-              compiler_run: false,
-              executor_run: false,
-            })
-
-            if (canRetry) {
-              return {
-                content:
-                  `PATCH_RETRY reason=${reason} ` +
-                  `detail=${shape.detail} ` +
-                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                  `action=revise_mutation_shape`,
-                metadata: {
-                  protocol: EXECUTION_LOOP_PROTOCOL,
-                  action,
-                  reason,
-                  detail: shape.detail,
-                  failure_layer: "tool_contract",
-                  compiler_run: false,
-                  executor_run: false,
-                },
-              }
-            }
-
-            return {
-              content:
-                `PATCH_STOP reason=${reason} ` +
-                `detail=${shape.detail} ` +
-                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                `action=report_blocked`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action,
-                reason,
-                detail: shape.detail,
-                failure_layer: "tool_contract",
-                compiler_run: false,
-                executor_run: false,
-              },
-            }
-          }
 
           const authorization =
             await materializeCapabilityBoundMutation(
@@ -9738,6 +11323,45 @@ export default {
               typeof authorization.detail === "string"
                 ? authorization.detail
                 : reason
+
+            const canRetryAuthorization =
+              authorization.repairable === true &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+
+            if (canRetryAuthorization) {
+              applyExecutionEvent(
+                state,
+                "patch_retry",
+                reason,
+              )
+
+              await trace({
+                admitted: false,
+                failure_layer: "scope_authorization",
+                reason,
+                scope_detail: detail,
+                action: "retry",
+                compiler_run: false,
+                executor_run: false,
+              })
+
+              return {
+                content:
+                  `PATCH_RETRY reason=${reason} ` +
+                  `detail=${detail} ` +
+                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                  `action=revise_semantic_owner_binding`,
+                metadata: {
+                  protocol: EXECUTION_LOOP_PROTOCOL,
+                  action: "retry",
+                  reason,
+                  detail,
+                  failure_layer: "scope_authorization",
+                  compiler_run: false,
+                  executor_run: false,
+                },
+              }
+            }
 
             if (authorization.rescout === true) {
               applyExecutionEvent(
@@ -10114,7 +11738,75 @@ export default {
             content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
             metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
           }
+      }
+
+      tools.add({
+        name: EXECUTE_REPLACE_NODE_TOOL,
+        description:
+          "Submit exactly ONE bounded replace_node semantic mutation. " +
+          "The target file, symbol, mutation kind, and authority scope are capability-derived and MUST NOT be supplied. " +
+          "before is a canonical exact source slice, never a pattern; only outer whitespace and line endings are normalized deterministically. " +
+          "Copy the smallest complete structural slice from the sealed preauthorized CAPSULE_SCOPE; replacement replaces exactly that slice. No fuzzy matching or authority expansion is permitted.",
+        input: {
+          type: "object",
+          properties: {
+            before: {
+              type: "string",
+              minLength: 1,
+              maxLength: 4096,
+              description: "Canonical exact structural source slice copied from a sealed preauthorized CAPSULE_SCOPE.",
+            },
+            replacement: {
+              type: "string",
+              maxLength: 4096,
+              description: "Replacement for exactly before; empty string is an intentional exact deletion.",
+            },
+          },
+          required: ["before", "replacement"],
+          additionalProperties: false,
         },
+        options: {
+          codemode: false,
+          permission: PATCH_PERMISSION_ACTION,
+        },
+        execute: async (input, toolContext) =>
+          executeCapabilityMutation(
+            input,
+            toolContext,
+            "replace_node",
+            EXECUTE_REPLACE_NODE_TOOL,
+          ),
+      })
+
+      tools.add({
+        name: EXECUTE_RENAME_SYMBOL_TOOL,
+        description:
+          "Submit exactly ONE globally-authorized rename_symbol semantic mutation. " +
+          "The target file, symbol, mutation kind, and handoff scope are capability-derived and MUST NOT be supplied. " +
+          "This tool is exposed only when Scout has a complete global handoff and rename capability.",
+        input: {
+          type: "object",
+          properties: {
+            new_name: {
+              type: "string",
+              minLength: 1,
+              maxLength: 256,
+            },
+          },
+          required: ["new_name"],
+          additionalProperties: false,
+        },
+        options: {
+          codemode: false,
+          permission: PATCH_PERMISSION_ACTION,
+        },
+        execute: async (input, toolContext) =>
+          executeCapabilityMutation(
+            input,
+            toolContext,
+            "rename_symbol",
+            EXECUTE_RENAME_SYMBOL_TOOL,
+          ),
       })
     }))
 
@@ -10124,10 +11816,13 @@ export default {
       }
 
       // Stable model-facing surface. This filter is deliberately idempotent:
-      // search and execute_patch are never removed based on FSM state, so a
-      // reused mutable event.tools object cannot lose the next state's schema.
+      // search and both action-specific mutation tools are never removed from
+      // the materialized base surface, so a reused mutable event.tools object
+      // cannot lose the next state's schema before the capability frontier is
+      // applied below.
+      const stableToolSurface = new Set(["search", ...MUTATION_TOOL_NAMES])
       for (const name of Object.keys(event.tools)) {
-        if (name !== "search" && name !== "execute_patch") {
+        if (!stableToolSurface.has(name)) {
           delete event.tools[name]
         }
       }
@@ -10155,7 +11850,7 @@ export default {
       }
 
       const materializedToolNames = Object.keys(event.tools).sort()
-      const requiredSurface = ["execute_patch", "search"]
+      const requiredSurface = ["search", ...MUTATION_TOOL_NAMES]
       const missingSurface = requiredSurface.filter(
         (name) => !Object.prototype.hasOwnProperty.call(event.tools, name),
       )
@@ -10181,12 +11876,19 @@ export default {
         )
       }
 
-      const allowedTools = allowedToolsForExecutionState(state.executionState)
+      const allowedTools = allowedToolsForState(state)
       const allowedSet = new Set(allowedTools)
       for (const name of Object.keys(event.tools)) {
         if (!allowedSet.has(name)) delete event.tools[name]
       }
       const frontierToolNames = Object.keys(event.tools).sort()
+      const frontierToolSchema = Object.fromEntries(
+        frontierToolNames.map((name) => [name, event.tools[name]]),
+      )
+      const frontierToolSchemaSha256 = createHash("sha256")
+        .update(JSON.stringify(frontierToolSchema))
+        .digest("hex")
+      state.visibleToolSchemaSha256 = frontierToolSchemaSha256
 
       const elapsed = Math.max(0, nowMs() - state.turnStartedAt)
 
@@ -10293,8 +11995,10 @@ export default {
             : [],
         execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
         tool_frontier_protocol: TOOL_FRONTIER_PROTOCOL,
+        mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
         materialized_tool_surface: materializedToolNames,
         tool_frontier_names: frontierToolNames,
+        tool_frontier_schema_sha256: frontierToolSchemaSha256,
         execution_state: state.executionState,
         execution_reason: state.executionReason,
         execution_event: state.executionEvent,
@@ -10306,6 +12010,8 @@ export default {
         turn_executed_searches: state.executedSearches,
         turn_mutation_attempts: state.mutationAttempts,
         turn_repair_attempts: state.repairAttempts,
+        turn_tool_contract_failures: state.contractFailures,
+        active_mutation_tool: state.activeMutationTool,
         turn_compiler_runs: state.compilerRuns,
         turn_patch_attempts: state.patchAttempts,
         turn_executor_runs: state.executorRuns,

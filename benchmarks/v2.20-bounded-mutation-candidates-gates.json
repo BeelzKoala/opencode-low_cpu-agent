@@ -1,0 +1,37 @@
+{
+  "protocol": "bounded-mutation-candidates-v1",
+  "version": "v2.20",
+  "evidence": {
+    "real_task_failures": [
+      "direct-dependent-shipping",
+      "transitive-dependent-risk"
+    ],
+    "failure_class": "architecture_bug",
+    "failure_layer": "scout_mutation_authority_collapsed_before_semantic_intent",
+    "false_verified_observed": 0
+  },
+  "invariants": {
+    "context_ranking_changed": false,
+    "candidate_authority_issued_before_model_patch": true,
+    "candidate_limit": "EDIT_CAPSULE_MAX_SCOPES",
+    "model_supplies_target": false,
+    "model_supplies_scope": false,
+    "post_model_authority_issuance": false,
+    "post_model_repository_discovery": false,
+    "late_binding_uses_live_source": true,
+    "impact_edge_alone_authorizes": false,
+    "impact_forward_definition_source_validation_required": true,
+    "impact_structural_recovery_required": true,
+    "reverse_impact_usage_authorizes": false,
+    "nested_owner_resolution": "most_specific_structural_scope",
+    "disjoint_exact_match": "safe_ambiguity",
+    "repair_owner_is_sticky": true,
+    "partial_handoff_cross_owner_candidates": false,
+    "global_ready_candidates": "preissued_scout-local-capability-v1",
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false,
+    "repair_budget_changed": false,
+    "model_calls_added": 0
+  }
+}

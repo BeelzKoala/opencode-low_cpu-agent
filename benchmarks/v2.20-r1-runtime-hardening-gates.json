@@ -1,0 +1,37 @@
+{
+  "protocol": "v2.20-r1-runtime-hardening-v1",
+  "version": "v2.20-r1",
+  "evidence": {
+    "real_runtime_failures": {
+      "mutation_candidate_live_range_invalid": [
+        "direct-dependent-shipping",
+        "transitive-dependent-risk"
+      ],
+      "absent_language_glob": [
+        "aliased-dependent-sku"
+      ]
+    }
+  },
+  "invariants": {
+    "candidate_eol_normalization": "canonical_lf",
+    "candidate_fingerprint_revalidation": true,
+    "candidate_live_range_fail_closed": true,
+    "language_glob_correction_requires_complete_inventory": true,
+    "language_glob_correction_simple_suffix_only": true,
+    "language_glob_correction_preserves_prefix": true,
+    "language_glob_correction_when_requested_language_present": false,
+    "language_glob_correction_on_incomplete_inventory": false,
+    "language_glob_inventory_cache_scope": "turn",
+    "language_glob_fallback_max_extensions": 12,
+    "explicit_file_path_may_drop_contradictory_language_glob": true,
+    "post_model_authority_issuance": false,
+    "post_model_repository_discovery": false,
+    "context_ranking_changed": false,
+    "repair_budget_changed": false,
+    "search_budget_changed": false,
+    "model_calls_added": 0,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false
+  }
+}

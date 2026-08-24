@@ -1,0 +1,25 @@
+{
+  "protocol": "v2.20-r2-tool-schema-contract-v2-split-actions",
+  "invariants": {
+    "replace_node_schema_requires": [
+      "before",
+      "replacement"
+    ],
+    "rename_symbol_schema_requires": [
+      "new_name"
+    ],
+    "runtime_shape_validation_retained": true,
+    "empty_replacement_allowed": true,
+    "model_supplies_target": false,
+    "model_supplies_scope": false,
+    "mutation_budget_changed": false,
+    "scout_ranking_changed": false,
+    "candidate_authority_changed": false,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false,
+    "split_action_tools": true,
+    "model_supplies_kind": false,
+    "conditional_schema": false
+  }
+}

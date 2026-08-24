@@ -1,0 +1,26 @@
+{
+  "protocol": "v2.21-mastery-contracts-2.0",
+  "goal": "reduce model-facing ambiguity and make stage contracts, failure accounting, and deterministic Scout activation directly auditable without expanding inference or mutation authority",
+  "invariants": {
+    "split_action_tools": true,
+    "model_supplies_kind": false,
+    "model_supplies_target": false,
+    "model_supplies_scope": false,
+    "conditional_schema": false,
+    "capability_aware_tool_frontier": true,
+    "contract_failure_consumes_semantic_repair": false,
+    "repair_action_sticky": true,
+    "query_formulation_activation_observable": true,
+    "visible_tool_schema_hashed": true,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false,
+    "model_call_budget_changed": false,
+    "search_budget_changed": false,
+    "semantic_repair_budget_changed": false,
+    "new_model_calls": 0,
+    "new_models": 0,
+    "new_repository_authority": false,
+    "legacy_confinement_exact_slice_contract_retained": true
+  }
+}

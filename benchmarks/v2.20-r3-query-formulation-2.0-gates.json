@@ -1,0 +1,19 @@
+{
+  "protocol": "query-formulation-v2",
+  "invariants": {
+    "exact_regex_remains_authoritative": true,
+    "fallback_requires_complete_exact_and_casefold_zero": true,
+    "fallback_evidence_exact_spans": 0,
+    "top_level_alternation_only": true,
+    "same_file_source_backed_atom_quorum": true,
+    "pure_numeric_fallback": false,
+    "incomplete_or_capped_fallback": false,
+    "fallback_file_cap": 24,
+    "model_calls_added": 0,
+    "search_budget_changed": false,
+    "ranking_changed": false,
+    "compiler_changed": false,
+    "executor_changed": false,
+    "verifier_changed": false
+  }
+}
