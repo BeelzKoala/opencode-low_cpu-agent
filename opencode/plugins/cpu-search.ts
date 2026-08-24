@@ -102,6 +102,7 @@ const MAX_CONSECUTIVE_NO_PROGRESS = 2
 // deterministic, machine-readable handoff for the next execution stage.
 const SCOUT_HANDOFF_PROTOCOL = "scout-handoff-v1"
 const SCOUT_LOCAL_CAPABILITY_PROTOCOL = "scout-local-capability-v1"
+const SCOUT_RENAME_TARGET_PROTOCOL = "scout-rename-target-v2"
 const SCOUT_OWNER_ATTESTATION_PROTOCOL = "owner-attestation-v1"
 const SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS = Object.freeze(["replace_node"])
 const SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES = 4
@@ -136,11 +137,18 @@ const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
 const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v2"
 const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
-const PATCH_COMPILER_TIMEOUT_MS = 2500
+// Wall-clock limits in the deterministic mutation plane are hard liveness
+// watchdogs, not capability or correctness budgets. Actual mutation scope is
+// bounded independently by files, edits, lines, bytes, checks, evidence and
+// attempt budgets. Keep one conservative ceiling so transient CPU/I/O pressure
+// cannot turn the same valid bounded plan into a different correctness result.
+const PATCH_STAGE_HARD_WATCHDOG_MS = 30_000
+
+const PATCH_COMPILER_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const PATCH_COMPILER_MAX_STDOUT_BYTES = 256 * 1024
-const PATCH_EXECUTOR_TIMEOUT_MS = 5000
+const PATCH_EXECUTOR_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const PATCH_EXECUTOR_MAX_STDOUT_BYTES = 256 * 1024
-const INVARIANT_VERIFIER_TIMEOUT_MS = 5000
+const INVARIANT_VERIFIER_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
 const MAX_PATCH_ATTEMPTS_PER_TURN = 2
 
@@ -873,6 +881,7 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
   state.localMutationHandoffPath = null
   state.localMutationCapability = null
   state.localMutationCandidates = []
+  state.renameMutationCapability = null
   state.activeMutationHandoffPath = null
   state.boundMutationTarget = null
   return {
@@ -1739,6 +1748,284 @@ async function confirmLocalMutationCompetitors(
   }
 }
 
+function simpleRenameIdentifierQuery(value) {
+  const query = String(value ?? "")
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(query)
+    ? query
+    : null
+}
+
+function selectRenameTargetFromExactEvidence(
+  root,
+  queries,
+  discoveryResults,
+  exactStructuralGroups,
+  handoffFiles,
+) {
+  const reject = (reason, detail = null) => ({
+    ok: false,
+    reason,
+    detail,
+    target: null,
+  })
+
+  if (
+    typeof root !== "string" ||
+    !Array.isArray(queries) ||
+    !Array.isArray(discoveryResults) ||
+    !Array.isArray(exactStructuralGroups) ||
+    !Array.isArray(handoffFiles)
+  ) {
+    return reject("rename_target_inputs_incomplete")
+  }
+
+  const handoffFileKeys = new Set(
+    handoffFiles
+      .map((entry) => canonicalMutationFile(root, entry?.file))
+      .filter(Boolean),
+  )
+  const candidates = new Map()
+
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+    const identifier = simpleRenameIdentifierQuery(queries[queryIndex])
+    if (!identifier) continue
+
+    const result = discoveryResults[queryIndex]
+    if (
+      result?.scanComplete !== true ||
+      result?.timedOut === true ||
+      result?.scanCapped === true ||
+      result?.error ||
+      result?.queryFormulation != null
+    ) {
+      continue
+    }
+
+    const discoveryFiles = [
+      ...new Set(
+        (result.files ?? [])
+          .map((file) => canonicalMutationFile(root, file))
+          .filter(Boolean),
+      ),
+    ].sort()
+
+    // A global rename target is not bound from an emitted subset. Every file
+    // discovered for the exact identifier query must survive into the sealed
+    // complete handoff; otherwise later closure validation would start from
+    // incomplete source evidence.
+    if (
+      discoveryFiles.length < 1 ||
+      discoveryFiles.some((file) => !handoffFileKeys.has(file))
+    ) {
+      continue
+    }
+
+    const queryNumber = queryIndex + 1
+    const definitions = new Map()
+
+    for (const group of exactStructuralGroups) {
+      if (!validateEvidenceGroup(group)) continue
+      if (group.role !== "definition") continue
+      if (group.symbol_name !== identifier) continue
+      if (!(group.queries ?? []).includes(queryNumber)) continue
+
+      const file = canonicalMutationFile(root, group.file)
+      if (!file || !discoveryFiles.includes(file)) continue
+      if (
+        !Number.isInteger(group.start_line) ||
+        !Number.isInteger(group.end_line) ||
+        group.start_line < 1 ||
+        group.end_line < group.start_line
+      ) {
+        continue
+      }
+
+      const identity = {
+        file,
+        symbol_kind: group.symbol_kind,
+        symbol_name: identifier,
+        start_line: group.start_line,
+        end_line: group.end_line,
+      }
+      const key = JSON.stringify(identity)
+
+      if (!definitions.has(key)) {
+        definitions.set(key, {
+          target: identity,
+          queryIndex,
+          queryNumber,
+          identifier,
+          evidenceLines: [...new Set(group.hit_lines ?? [])]
+            .filter((line) => Number.isInteger(line) && line > 0)
+            .sort((a, b) => a - b),
+          discoveryFiles,
+          exactHitCount: Number.isInteger(group.hit_count)
+            ? group.hit_count
+            : 0,
+        })
+      }
+    }
+
+    if (definitions.size > 1) {
+      return reject(
+        "rename_target_ambiguous_definition",
+        `query_${queryNumber}:${identifier}:definitions_${definitions.size}`,
+      )
+    }
+
+    if (definitions.size === 1) {
+      const candidate = [...definitions.values()][0]
+      candidates.set(JSON.stringify(candidate.target), candidate)
+    }
+  }
+
+  if (candidates.size < 1) {
+    return reject("rename_target_not_proven")
+  }
+  if (candidates.size > 1) {
+    return reject(
+      "rename_target_multiple_exact_definitions",
+      `targets_${candidates.size}`,
+    )
+  }
+
+  return {
+    ok: true,
+    reason: "unique_exact_identifier_definition",
+    ...[...candidates.values()][0],
+  }
+}
+
+async function attestRenameTargetCapability(
+  root,
+  state,
+  queries,
+  discoveryResults,
+  exactStructuralGroups,
+) {
+  const reject = (reason, detail = null) => ({
+    ok: false,
+    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
+    reason,
+    detail,
+    ready: false,
+    globalReady: false,
+    target: null,
+  })
+
+  const rel = normalizeMutationFile(state?.scoutHandoffPath)
+  if (!rel.startsWith(".opencode/scout-handoffs/")) {
+    return reject("rename_target_handoff_unavailable")
+  }
+
+  const handoffRoot = path.resolve(root, ".opencode", "scout-handoffs")
+  const absolute = path.resolve(root, rel)
+  if (
+    absolute !== handoffRoot &&
+    !absolute.startsWith(handoffRoot + path.sep)
+  ) {
+    return reject("rename_target_handoff_escape")
+  }
+
+  let raw
+  let bundle
+  try {
+    raw = await readFile(absolute)
+    bundle = JSON.parse(raw.toString("utf8"))
+  } catch {
+    return reject("rename_target_handoff_unreadable")
+  }
+
+  const blockingReasons = Array.isArray(bundle?.blocking_reasons)
+    ? bundle.blocking_reasons
+    : []
+  const partialReasons = Array.isArray(bundle?.partial_reasons)
+    ? bundle.partial_reasons
+    : []
+
+  if (
+    bundle?.protocol !== SCOUT_HANDOFF_PROTOCOL ||
+    bundle?.status !== "ready" ||
+    blockingReasons.length > 0 ||
+    partialReasons.length > 0
+  ) {
+    return reject(
+      "rename_target_requires_complete_handoff",
+      `${bundle?.status ?? "missing"}:${[
+        ...blockingReasons,
+        ...partialReasons,
+      ].join(",")}`,
+    )
+  }
+
+  const handoffFiles = Array.isArray(bundle.files) ? bundle.files : []
+  const selected = selectRenameTargetFromExactEvidence(
+    root,
+    queries,
+    discoveryResults,
+    exactStructuralGroups,
+    handoffFiles,
+  )
+  if (selected.ok !== true) {
+    return reject(selected.reason, selected.detail ?? null)
+  }
+
+  const target = selected.target
+  const targetFile = handoffFiles.find(
+    (entry) => canonicalMutationFile(root, entry?.file) === target.file,
+  )
+  const fingerprint = targetFile?.fingerprint
+  if (
+    fingerprint?.kind !== "sha256" ||
+    fingerprint?.strong !== true ||
+    fingerprint?.evidence_fresh !== true ||
+    typeof fingerprint?.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
+    targetFile?.changed_during_scout === true
+  ) {
+    return reject("rename_target_fingerprint_not_strong_current")
+  }
+
+  let body
+  try {
+    body = await readFile(path.resolve(root, target.file))
+  } catch {
+    return reject("rename_target_file_unavailable")
+  }
+
+  const currentSha256 = createHash("sha256").update(body).digest("hex")
+  if (currentSha256 !== fingerprint.sha256) {
+    return reject("rename_target_fingerprint_stale")
+  }
+
+  const targetIdentitySha256 = createHash("sha256")
+    .update(JSON.stringify(target))
+    .digest("hex")
+  const sourceHandoffSha256 = createHash("sha256")
+    .update(raw)
+    .digest("hex")
+
+  return {
+    ok: true,
+    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
+    operation: "rename_symbol",
+    reason: selected.reason,
+    ready: true,
+    globalReady: true,
+    sourceHandoffPath: rel,
+    sourceHandoffSha256,
+    target,
+    targetIdentitySha256,
+    targetSourceSha256: currentSha256,
+    queryIndex: selected.queryIndex,
+    queryNumber: selected.queryNumber,
+    identifier: selected.identifier,
+    evidenceLines: selected.evidenceLines,
+    exactHitCount: selected.exactHitCount,
+    discoveryFiles: selected.discoveryFiles,
+  }
+}
+
 async function attestLocalMutationCapability(
   root,
   sessionID,
@@ -2070,7 +2357,9 @@ async function attestLocalMutationCapability(
       : "partial_global_local_scope_attested",
     globalReady,
     replaceNodeReady: true,
-    renameSymbolReady: globalReady,
+    // Rename authority is a distinct capability derived from exact symbol
+    // identity. A replace-node owner must never implicitly authorize rename.
+    renameSymbolReady: false,
     sourceHandoffPath: rel,
     localHandoffPath,
     target: identity,
@@ -2208,6 +2497,7 @@ function getSessionState(sessionID) {
       localMutationHandoffPath: null,
       localMutationCapability: null,
       localMutationCandidates: [],
+      renameMutationCapability: null,
       activeMutationHandoffPath: null,
       boundMutationTarget: null,
       mutationAttempts: 0,
@@ -2263,6 +2553,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.localMutationHandoffPath = null
   state.localMutationCapability = null
   state.localMutationCandidates = []
+  state.renameMutationCapability = null
   state.activeMutationHandoffPath = null
   state.boundMutationTarget = null
   state.mutationAttempts = 0
@@ -2328,9 +2619,13 @@ function mutationToolsForState(state) {
     tools.push(EXECUTE_REPLACE_NODE_TOOL)
   }
 
+  const renameCapability = state?.renameMutationCapability ?? null
   if (
-    capability?.renameSymbolReady === true &&
-    capability?.globalReady === true &&
+    renameCapability?.protocol === SCOUT_RENAME_TARGET_PROTOCOL &&
+    renameCapability?.ready === true &&
+    renameCapability?.globalReady === true &&
+    renameCapability?.operation === "rename_symbol" &&
+    renameCapability?.sourceHandoffPath === state?.scoutHandoffPath &&
     typeof state?.scoutHandoffPath === "string" &&
     state.scoutHandoffPath.length > 0
   ) {
@@ -5034,33 +5329,33 @@ async function materializeCapabilityBoundMutation(
   const primaryTarget = authorizedScopes[0]
   const primaryCapability = state?.localMutationCapability ?? null
 
-  if (
-    primaryCapability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
-    primaryCapability?.replaceNodeReady !== true ||
-    !sameAuthorizedScopeIdentity(
-      primaryTarget,
-      {
-        file: primaryCapability?.target?.file,
-        symbol_name: primaryCapability?.target?.symbol_name,
-        symbol_kind: primaryCapability?.target?.symbol_kind,
-        start_line: primaryCapability?.target?.start_line,
-        end_line: primaryCapability?.target?.end_line,
-      },
-    )
-  ) {
-    return {
-      ok: false,
-      reason: "mutation_capability_unavailable",
-      detail: "local_capability_target_mismatch",
-      rescout: false,
-    }
-  }
-
-  let target = primaryTarget
-  let capability = primaryCapability
+  let target = null
+  let capability = null
   let activeHandoffPath = null
 
   if (input.kind === "replace_node") {
+    if (
+      primaryCapability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
+      primaryCapability?.replaceNodeReady !== true ||
+      !sameAuthorizedScopeIdentity(
+        primaryTarget,
+        {
+          file: primaryCapability?.target?.file,
+          symbol_name: primaryCapability?.target?.symbol_name,
+          symbol_kind: primaryCapability?.target?.symbol_kind,
+          start_line: primaryCapability?.target?.start_line,
+          end_line: primaryCapability?.target?.end_line,
+        },
+      )
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_capability_unavailable",
+        detail: "local_capability_target_mismatch",
+        rescout: false,
+      }
+    }
+
     const binding =
       await bindReplaceNodeMutationCandidate(
         root,
@@ -5097,19 +5392,60 @@ async function materializeCapabilityBoundMutation(
     activeHandoffPath = capability.localHandoffPath
     state.boundMutationTarget = mutationCandidateIdentity(target)
   } else if (input.kind === "rename_symbol") {
+    const renameCapability = state?.renameMutationCapability ?? null
+    target = renameCapability?.target ?? null
+    capability = renameCapability
+
+    const identitySha256 = target
+      ? createHash("sha256")
+          .update(JSON.stringify(target))
+          .digest("hex")
+      : null
+
     if (
-      primaryCapability.globalReady !== true ||
-      primaryCapability.renameSymbolReady !== true ||
+      renameCapability?.protocol !== SCOUT_RENAME_TARGET_PROTOCOL ||
+      renameCapability?.operation !== "rename_symbol" ||
+      renameCapability?.ready !== true ||
+      renameCapability?.globalReady !== true ||
+      renameCapability?.sourceHandoffPath !== state?.scoutHandoffPath ||
+      renameCapability?.targetIdentitySha256 !== identitySha256 ||
       typeof state?.scoutHandoffPath !== "string"
     ) {
       return {
         ok: false,
-        reason: "rename_requires_global_handoff_complete",
-        detail: "rename_requires_global_handoff_complete",
+        reason: "rename_target_capability_invalid",
+        detail: "rename_target_capability_invalid",
         rescout: true,
       }
     }
+
+    const renameFile = canonicalMutationFile(root, target?.file)
+    let currentBody
+    try {
+      currentBody = await readFile(path.resolve(root, renameFile ?? ""))
+    } catch {
+      return {
+        ok: false,
+        reason: "rename_target_file_unavailable",
+        detail: "rename_target_file_unavailable",
+        rescout: true,
+      }
+    }
+
+    const currentSha256 = createHash("sha256")
+      .update(currentBody)
+      .digest("hex")
+    if (currentSha256 !== renameCapability.targetSourceSha256) {
+      return {
+        ok: false,
+        reason: "rename_target_stale",
+        detail: "rename_target_stale",
+        rescout: true,
+      }
+    }
+
     activeHandoffPath = state.scoutHandoffPath
+    state.boundMutationTarget = mutationCandidateIdentity(target)
   }
 
   const file = canonicalMutationFile(root, target?.file)
@@ -5434,9 +5770,17 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
       state.activeMutationHandoffPath ?? state.scoutHandoffPath,
     discovery_handoff: state.scoutHandoffPath,
     mutation_capability_protocol:
-      state.localMutationCapability?.protocol ?? null,
+      state.activeMutationTool === EXECUTE_RENAME_SYMBOL_TOOL
+        ? state.renameMutationCapability?.protocol ?? null
+        : state.localMutationCapability?.protocol ?? null,
     mutation_capability_target:
-      state.localMutationCapability?.target ?? null,
+      state.activeMutationTool === EXECUTE_RENAME_SYMBOL_TOOL
+        ? state.renameMutationCapability?.target ?? null
+        : state.localMutationCapability?.target ?? null,
+    rename_target_capability_protocol:
+      state.renameMutationCapability?.protocol ?? null,
+    rename_target_capability_target:
+      state.renameMutationCapability?.target ?? null,
     mutation_confinement_protocol:
       (compilerResponse?.edits ?? []).some((edit) => edit?.kind === "replace_slice")
         ? MUTATION_CONFINEMENT_PROTOCOL
@@ -10408,6 +10752,19 @@ export default {
               ? ownerRecoveryGroups
               : null
 
+          const renameMutationCapability =
+            await attestRenameTargetCapability(
+              root,
+              state,
+              queries,
+              discoveryResults,
+              exactStructuralGroups ?? [],
+            )
+          state.renameMutationCapability =
+            renameMutationCapability?.ok === true
+              ? renameMutationCapability
+              : null
+
           const impactMutationCandidateRecovery =
             await recoverValidatedImpactMutationCandidateGroups(
               root,
@@ -10433,7 +10790,6 @@ export default {
           let localMutationCapability = null
           let localMutationCandidateSet = null
           let localCompetitorCheck = null
-
           if (mutationLocalization.eligible) {
             editCapsule = await buildEditCapsule(
               root,
@@ -10564,7 +10920,17 @@ export default {
             scout_local_replace_node_ready:
               localMutationCapability?.replaceNodeReady === true,
             scout_global_rename_ready:
-              localMutationCapability?.renameSymbolReady === true,
+              renameMutationCapability?.ok === true &&
+              renameMutationCapability?.ready === true,
+            scout_rename_target_protocol:
+              renameMutationCapability?.protocol ?? SCOUT_RENAME_TARGET_PROTOCOL,
+            scout_rename_target_reason:
+              renameMutationCapability?.reason ?? null,
+            scout_rename_target_ready:
+              renameMutationCapability?.ok === true &&
+              renameMutationCapability?.ready === true,
+            scout_rename_target:
+              renameMutationCapability?.target ?? null,
             scout_local_mutation_handoff:
               localMutationCapability?.localHandoffPath ?? null,
             scout_local_mutation_target:
@@ -11025,7 +11391,17 @@ export default {
               scout_local_replace_node_ready:
                 localMutationCapability?.replaceNodeReady === true,
               scout_global_rename_ready:
-                localMutationCapability?.renameSymbolReady === true,
+                renameMutationCapability?.ok === true &&
+                renameMutationCapability?.ready === true,
+              scout_rename_target_protocol:
+                renameMutationCapability?.protocol ?? SCOUT_RENAME_TARGET_PROTOCOL,
+              scout_rename_target_reason:
+                renameMutationCapability?.reason ?? null,
+              scout_rename_target_ready:
+                renameMutationCapability?.ok === true &&
+                renameMutationCapability?.ready === true,
+              scout_rename_target:
+                renameMutationCapability?.target ?? null,
               scout_local_mutation_handoff:
                 localMutationCapability?.localHandoffPath ?? null,
               scout_local_mutation_target:
