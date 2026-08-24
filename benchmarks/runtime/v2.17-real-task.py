@@ -262,15 +262,20 @@ def preserve_agent_artifacts(worktree: Path, out: Path) -> None:
     ):
         copy_if_exists(dot / name, out)
 
-    patches = dot / "patches"
+    for dirname in (
+        "patches",
+        "scout-handoffs",
+        "edit-capsules",
+    ):
+        source = dot / dirname
+        if not source.is_dir():
+            continue
 
-    if patches.is_dir():
-        target = out / "patches"
-        target.mkdir(parents=True, exist_ok=True)
-
-        for item in patches.iterdir():
-            if item.is_file():
-                shutil.copy2(item, target / item.name)
+        shutil.copytree(
+            source,
+            out / dirname,
+            dirs_exist_ok=True,
+        )
 
 
 def changed_stats(worktree: Path) -> tuple[int, int]:
@@ -652,12 +657,28 @@ def run_task(
         searches = tool_records(rows, "search")
         patches = tool_records(rows, "execute_patch")
 
+        cpu_trace_rows = load_json_lines(
+            worktree / ".opencode" / "cpu-agent-trace.jsonl"
+        )
+        dispatch_calls = [
+            row.get("model_call")
+            for row in cpu_trace_rows
+            if row.get("kind") == "model_dispatch"
+        ]
         model_calls = max_number(
-            [
-                tool_metadata(row).get("turn_model_calls")
-                for row in searches + patches
-            ],
-            0,
+            dispatch_calls,
+            max_number(
+                [
+                    tool_metadata(row).get("turn_model_calls")
+                    for row in searches + patches
+                ],
+                0,
+            ),
+        )
+        model_dispatches = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "model_dispatch"
         )
 
         files_considered = max_number(
@@ -674,6 +695,7 @@ def run_task(
             "cli_timed_out": agent["timed_out"],
             "wall_s": agent["elapsed_s"],
             "model_calls": model_calls,
+            "model_dispatches": model_dispatches,
             "search_calls": len(searches),
             "execute_patch_calls": len(patches),
             "files_considered": files_considered,
