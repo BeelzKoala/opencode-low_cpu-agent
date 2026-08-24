@@ -11,10 +11,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const PROTOCOL: &str = "patch-executor-v2";
+const PROTOCOL: &str = "patch-executor-v3";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
 const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
-const EDIT_PROTOCOL: &str = "edit-script-v2";
+const MUTATION_CONFINEMENT_PROTOCOL: &str = "mutation-slice-v1";
+const EDIT_PROTOCOL: &str = "edit-script-v3-certified-slice";
 const MODE: &str = "guarded";
 const MAX_EDITS: usize = 4;
 const MAX_HANDOFF_FILES: usize = 16;
@@ -40,11 +41,25 @@ struct Request {
 }
 
 #[derive(Debug, Deserialize)]
+struct SliceConfinement {
+    protocol: String,
+    mutation_index: usize,
+    owner_symbol: String,
+    owner_start: usize,
+    owner_end: usize,
+    start_byte: usize,
+    end_byte: usize,
+    envelope: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct Edit {
     file: String,
     kind: String,
     before: String,
     after: String,
+    #[serde(default)]
+    confinement: Option<SliceConfinement>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +86,22 @@ struct ScoutHandoff {
     #[serde(default)]
     allowed_mutations: Vec<String>,
     #[serde(default)]
+    capability: Option<LocalMutationCapability>,
+    #[serde(default)]
     files: Vec<HandoffFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalMutationCapability {
+    protocol: String,
+    operation: String,
+    target: LocalMutationTarget,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalMutationTarget {
+    file: String,
+    symbol_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -369,6 +399,53 @@ fn syntax_is_valid(path: &Path, source: &str) -> Option<bool> {
     let ast = lang.ast_grep(source);
     let root = ast.root();
     Some(!root.dfs().any(|node| node.is_error() || node.is_missing()))
+}
+
+fn is_definition_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition"
+            | "function_declaration"
+            | "function_item"
+            | "method_definition"
+            | "method_declaration"
+            | "method_signature"
+    )
+}
+
+fn certified_owner_matches(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+    owner_start: usize,
+    owner_end: usize,
+) -> bool {
+    let Some(lang) = SupportLang::from_path(path) else {
+        return false;
+    };
+    let ast = lang.ast_grep(source);
+    let root = ast.root();
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
+        return false;
+    }
+    let mut matches = root.dfs().filter(|node| {
+        if !node.is_named() || !is_definition_kind(node.kind().as_ref()) {
+            return false;
+        }
+        let range = node.range();
+        range.start == owner_start
+            && range.end == owner_end
+            && node
+                .field("name")
+                .map(|name| name.text().as_ref() == symbol)
+                .unwrap_or(false)
+            && node.field("body").is_some()
+    });
+    matches.next().is_some() && matches.next().is_none()
 }
 
 fn structural_match_range(
@@ -683,16 +760,56 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
     match handoff.scope_mode.as_deref() {
         None => Ok(()),
         Some("local_mutation_capability") => {
+            let Some(capability) = handoff.capability.as_ref() else {
+                return Err("local_capability_invalid");
+            };
+            let Some(target_file) = safe_rel(&capability.target.file) else {
+                return Err("local_capability_invalid");
+            };
+            let Some(handoff_file) = handoff
+                .files
+                .first()
+                .and_then(|value| safe_rel(&value.file))
+            else {
+                return Err("local_capability_invalid");
+            };
             if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
                 || handoff.files.len() != 1
                 || handoff.allowed_mutations.len() != 1
                 || handoff.allowed_mutations[0] != "replace_node"
+                || capability.protocol != LOCAL_CAPABILITY_PROTOCOL
+                || capability.operation != "replace_node"
+                || capability.target.symbol_name.is_empty()
+                || target_file != handoff_file
             {
                 return Err("local_capability_invalid");
             }
             Ok(())
         }
         Some(_) => Err("handoff_scope_mode_invalid"),
+    }
+}
+
+fn local_capability_allows_edit(
+    scope_mode: Option<&str>,
+    capability: Option<&LocalMutationCapability>,
+    rel: &str,
+    edit: &Edit,
+) -> bool {
+    match scope_mode {
+        Some("local_mutation_capability") => {
+            let Some(capability) = capability else {
+                return false;
+            };
+            let Some(confinement) = edit.confinement.as_ref() else {
+                return false;
+            };
+            edit.kind == "replace_slice"
+                && safe_rel(&capability.target.file).as_deref() == Some(rel)
+                && confinement.owner_symbol == capability.target.symbol_name
+        }
+        None => true,
+        Some(_) => false,
     }
 }
 
@@ -863,13 +980,17 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
         ));
     }
     if request.edits.iter().any(|edit| {
-        !matches!(edit.kind.as_str(), "replace_exact" | "replace_ast")
-            || edit.before.is_empty()
+        !matches!(
+            edit.kind.as_str(),
+            "replace_exact" | "replace_ast" | "replace_slice"
+        ) || edit.before.is_empty()
             || edit.before.len() > MAX_BEFORE_BYTES
             || edit.after.len() > MAX_AFTER_BYTES
             || edit.before == edit.after
             || edit.before.contains('\0')
             || edit.after.contains('\0')
+            || (edit.kind == "replace_slice" && edit.confinement.is_none())
+            || (edit.kind != "replace_slice" && edit.confinement.is_some())
     }) {
         return Ok(Response::rejected(
             started,
@@ -963,6 +1084,7 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
     let mut nearest_distances = BTreeMap::<String, usize>::new();
     let mut edits_accepted = 0usize;
     let mut structural_edits = 0usize;
+    let mut certified_slice_files = BTreeSet::new();
 
     for edit in &request.edits {
         let Some(rel) = safe_rel(&edit.file) else {
@@ -973,6 +1095,19 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
             base.reason = Some("file_outside_handoff".to_string());
             return Ok(base);
         };
+        if !local_capability_allows_edit(
+            handoff.scope_mode.as_deref(),
+            handoff.capability.as_ref(),
+            &rel,
+            edit,
+        ) {
+            base.reason = Some("mutation_not_authorized_by_handoff".to_string());
+            return Ok(base);
+        }
+        if edit.kind == "replace_slice" && !certified_slice_files.insert(rel.clone()) {
+            base.reason = Some("mutation_slice_transaction_unsupported".to_string());
+            return Ok(base);
+        }
         if !originals.contains_key(&rel) {
             let Some(path) = safe_existing_file(&root, &rel) else {
                 base.reason = Some("edit_file_unavailable".to_string());
@@ -990,7 +1125,61 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
         }
 
         let current = candidates.get(&rel).expect("candidate exists").clone();
-        let (next, line, distance) = if edit.kind == "replace_exact" {
+        /*
+         * Certified slices are compiler output, not model-selected offsets.
+         * Executor still binds them to the fingerprinted source, exact bytes,
+         * structural owner identity, and evidence radius before mutation.
+         */
+        let (next, line, distance) = if edit.kind == "replace_slice" {
+            let Some(confinement) = edit.confinement.as_ref() else {
+                base.reason = Some("slice_certificate_missing".to_string());
+                return Ok(base);
+            };
+            if confinement.protocol != MUTATION_CONFINEMENT_PROTOCOL
+                || confinement.mutation_index >= MAX_EDITS
+                || confinement.owner_symbol.is_empty()
+                || confinement.start_byte >= confinement.end_byte
+                || confinement.owner_start > confinement.start_byte
+                || confinement.end_byte > confinement.owner_end
+                || confinement.owner_end > current.len()
+                || confinement.end_byte > current.len()
+                || !current.is_char_boundary(confinement.start_byte)
+                || !current.is_char_boundary(confinement.end_byte)
+                || confinement.end_byte - confinement.start_byte != edit.before.len()
+                || !matches!(confinement.envelope.as_str(), "node" | "siblings" | "owner")
+            {
+                base.reason = Some("slice_certificate_invalid".to_string());
+                return Ok(base);
+            }
+            if &current[confinement.start_byte..confinement.end_byte] != edit.before.as_str() {
+                base.reason = Some("slice_precondition_mismatch".to_string());
+                return Ok(base);
+            }
+            if !certified_owner_matches(
+                &root.join(&rel),
+                &current,
+                &confinement.owner_symbol,
+                confinement.owner_start,
+                confinement.owner_end,
+            ) {
+                base.reason = Some("slice_owner_mismatch".to_string());
+                return Ok(base);
+            }
+            let line = line_for_byte(&current, confinement.start_byte);
+            let Some(distance) = nearest_evidence_distance(line, &handoff_file.evidence_lines)
+            else {
+                base.reason = Some("evidence_anchor_missing".to_string());
+                return Ok(base);
+            };
+            if distance > MAX_EVIDENCE_DISTANCE_LINES {
+                base.reason = Some("edit_outside_evidence_radius".to_string());
+                return Ok(base);
+            }
+            let mut next = current.clone();
+            next.replace_range(confinement.start_byte..confinement.end_byte, &edit.after);
+            structural_edits += 1;
+            (next, line, distance)
+        } else if edit.kind == "replace_exact" {
             let (count, byte) = count_exact(&current, &edit.before);
             if count != 1 {
                 base.reason = Some("precondition_not_unique".to_string());

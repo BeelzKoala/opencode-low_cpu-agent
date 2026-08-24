@@ -13,11 +13,13 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const PROTOCOL: &str = "patch-compiler-v1";
+const PROTOCOL: &str = "patch-compiler-v2";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
-const EDIT_PROTOCOL: &str = "edit-script-v2";
+const EDIT_PROTOCOL: &str = "edit-script-v3-certified-slice";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
 const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
+const MUTATION_CONFINEMENT_PROTOCOL: &str = "mutation-slice-v1";
+const MAX_STRUCTURAL_SLICE_NODES: usize = 16;
 const MAX_MUTATIONS: usize = 4;
 const MAX_LOWERED_EDITS: usize = 4;
 const MAX_CHANGED_FILES: usize = 2;
@@ -73,7 +75,22 @@ struct ScoutHandoff {
     #[serde(default)]
     allowed_mutations: Vec<String>,
     #[serde(default)]
+    capability: Option<LocalMutationCapability>,
+    #[serde(default)]
     files: Vec<HandoffFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalMutationCapability {
+    protocol: String,
+    operation: String,
+    target: LocalMutationTarget,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalMutationTarget {
+    file: String,
+    symbol_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,11 +101,25 @@ struct HandoffFile {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct SliceConfinement {
+    protocol: String,
+    mutation_index: usize,
+    owner_symbol: String,
+    owner_start: usize,
+    owner_end: usize,
+    start_byte: usize,
+    end_byte: usize,
+    envelope: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct Edit {
     file: String,
     kind: String,
     before: String,
     after: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confinement: Option<SliceConfinement>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -225,10 +256,27 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
     match handoff.scope_mode.as_deref() {
         None => Ok(()),
         Some("local_mutation_capability") => {
+            let Some(capability) = handoff.capability.as_ref() else {
+                return Err("local_capability_invalid");
+            };
+            let Some(target_file) = safe_rel(&capability.target.file) else {
+                return Err("local_capability_invalid");
+            };
+            let Some(handoff_file) = handoff
+                .files
+                .first()
+                .and_then(|value| safe_rel(&value.file))
+            else {
+                return Err("local_capability_invalid");
+            };
             if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
                 || handoff.files.len() != 1
                 || handoff.allowed_mutations.len() != 1
                 || handoff.allowed_mutations[0] != "replace_node"
+                || capability.protocol != LOCAL_CAPABILITY_PROTOCOL
+                || capability.operation != "replace_node"
+                || capability.target.symbol_name.is_empty()
+                || target_file != handoff_file
             {
                 return Err("local_capability_invalid");
             }
@@ -238,10 +286,19 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
     }
 }
 
-fn handoff_allows_mutation(handoff: &ScoutHandoff, kind: &str) -> bool {
+fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool {
     match handoff.scope_mode.as_deref() {
         Some("local_mutation_capability") => {
-            handoff.allowed_mutations.iter().any(|value| value == kind)
+            let Some(capability) = handoff.capability.as_ref() else {
+                return false;
+            };
+            handoff
+                .allowed_mutations
+                .iter()
+                .any(|value| value == &mutation.kind)
+                && capability.operation == mutation.kind
+                && capability.target.symbol_name == mutation.symbol
+                && safe_rel(&capability.target.file) == safe_rel(&mutation.file)
         }
         None => true,
         Some(_) => false,
@@ -396,6 +453,7 @@ fn compile_replace_body(
         kind: "replace_exact".to_string(),
         before,
         after,
+        confinement: None,
     }))
 }
 
@@ -454,6 +512,7 @@ fn compile_replace_expr(
         kind: "replace_exact".to_string(),
         before,
         after,
+        confinement: None,
     }))
 }
 
@@ -486,79 +545,206 @@ fn format_node_replacement(source: &str, node_range: &Range<usize>, replacement:
     out
 }
 
-fn compile_replace_node(
+/*
+ * Mutation Confinement 2.0:
+ *
+ * `before` is a semantic precondition, never authority to widen an edit.
+ * We canonicalize only outer whitespace/EOL, find one exact source slice
+ * inside the authorized owner, prove that slice is structural, and emit
+ * certified byte offsets.  No AST-pattern match may promote the physical
+ * range beyond the bytes the model actually supplied.
+ */
+fn source_newline_style(source: &str) -> std::result::Result<&'static str, &'static str> {
+    let has_crlf = source.contains("\r\n");
+    let without_crlf = source.replace("\r\n", "");
+    let has_bare_lf = without_crlf.contains('\n');
+    if has_crlf && has_bare_lf {
+        return Err("mutation_source_eol_mixed");
+    }
+    Ok(if has_crlf { "\r\n" } else { "\n" })
+}
+
+fn normalize_fragment_for_source(
+    source: &str,
+    fragment: &str,
+) -> std::result::Result<String, &'static str> {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let normalized = trimmed.replace("\r\n", "\n");
+    if normalized.contains('\r') {
+        return Err("mutation_fragment_invalid");
+    }
+    if source_newline_style(source)? == "\r\n" {
+        Ok(normalized.replace('\n', "\r\n"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn exact_slice_range(
+    source: &str,
+    owner: &Range<usize>,
+    needle: &str,
+) -> std::result::Result<Range<usize>, &'static str> {
+    if needle.is_empty() || owner.start >= owner.end || owner.end > source.len() {
+        return Err("mutation_slice_not_exact");
+    }
+    let haystack = &source[owner.clone()];
+    let mut matches = haystack.match_indices(needle);
+    let Some((relative_start, _)) = matches.next() else {
+        return Err("mutation_slice_not_exact");
+    };
+    if matches.next().is_some() {
+        return Err("mutation_slice_ambiguous");
+    }
+    let start = owner.start + relative_start;
+    Ok(start..start + needle.len())
+}
+
+fn structural_slice_envelope(
     file: &AllowedFile,
-    mutation: &Mutation,
-) -> std::result::Result<Option<Edit>, &'static str> {
-    let before_pattern = mutation
-        .before
-        .as_deref()
-        .ok_or("mutation_contract_invalid")?;
-
-    let replacement = mutation
-        .replacement
-        .as_deref()
-        .ok_or("mutation_contract_invalid")?;
-
-    if before_pattern.is_empty()
-        || before_pattern.len() > MAX_FRAGMENT_BYTES
-        || replacement.len() > MAX_NODE_REPLACEMENT_BYTES
-        || before_pattern.contains('\0')
-        || replacement.contains('\0')
-    {
-        return Err("mutation_contract_invalid");
+    owner: &Range<usize>,
+    slice: &Range<usize>,
+) -> std::result::Result<&'static str, &'static str> {
+    if slice.start < owner.start || slice.end > owner.end || slice.start >= slice.end {
+        return Err("mutation_slice_not_structural");
     }
-
-    if before_pattern == replacement {
-        return Ok(None);
+    if slice.start == owner.start && slice.end == owner.end {
+        return Ok("owner");
     }
-
-    let (def_range, _) = symbol_target_ranges(file, &mutation.symbol)?;
 
     let lang = SupportLang::from_path(&file.path).ok_or("language_unsupported")?;
-
-    let pattern = Pattern::try_new(before_pattern, lang).map_err(|_| "node_pattern_invalid")?;
-
     let ast = lang.ast_grep(&file.source);
     let root = ast.root();
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
+        return Err("source_syntax_invalid");
+    }
 
-    let mut matched = Vec::new();
-
-    for node in root.dfs().filter(|node| node.is_named()) {
+    for node in root.clone().dfs().filter(|node| node.is_named()) {
         let range = node.range();
+        if range.start == slice.start && range.end == slice.end {
+            return Ok("node");
+        }
+    }
 
-        if (range.start < def_range.start || range.end > def_range.end) {
+    let mut saw_too_wide = false;
+    for parent in root.dfs().filter(|node| node.is_named()) {
+        let parent_range = parent.range();
+        if parent_range.start > slice.start
+            || parent_range.end < slice.end
+            || parent_range.start < owner.start
+            || parent_range.end > owner.end
+        {
             continue;
         }
-
-        if pattern.match_node(node.clone()).is_some() {
-            matched.push(range);
-
-            if matched.len() > 1 {
-                return Err("node_ambiguous");
+        let children = parent
+            .children()
+            .filter(|node| node.is_named())
+            .map(|node| node.range())
+            .collect::<Vec<_>>();
+        for start_idx in 0..children.len() {
+            if children[start_idx].start != slice.start {
+                continue;
+            }
+            for end_idx in start_idx..children.len() {
+                let count = end_idx - start_idx + 1;
+                if count > MAX_STRUCTURAL_SLICE_NODES {
+                    saw_too_wide = true;
+                    break;
+                }
+                let end = children[end_idx].end;
+                if end == slice.end {
+                    return Ok("siblings");
+                }
+                if end > slice.end {
+                    break;
+                }
             }
         }
     }
 
-    let Some(node_range) = matched.into_iter().next() else {
-        return Err("node_not_found");
+    if saw_too_wide {
+        Err("mutation_slice_too_wide")
+    } else {
+        Err("mutation_slice_not_structural")
+    }
+}
+
+fn compile_replace_node(
+    file: &AllowedFile,
+    mutation: &Mutation,
+    mutation_index: usize,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let before_raw = mutation
+        .before
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+    let replacement_raw = mutation
+        .replacement
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+
+    if before_raw.is_empty()
+        || before_raw.len() > MAX_FRAGMENT_BYTES
+        || replacement_raw.len() > MAX_NODE_REPLACEMENT_BYTES
+        || before_raw.contains('\0')
+        || replacement_raw.contains('\0')
+    {
+        return Err("mutation_contract_invalid");
+    }
+
+    let (owner_range, _) = symbol_target_ranges(file, &mutation.symbol)?;
+    let before = normalize_fragment_for_source(&file.source, before_raw)?;
+    if before.is_empty() {
+        return Err("mutation_contract_invalid");
+    }
+    let slice_range = exact_slice_range(&file.source, &owner_range, &before)?;
+    let envelope = structural_slice_envelope(file, &owner_range, &slice_range)?;
+    let replacement = normalize_fragment_for_source(&file.source, replacement_raw)?;
+    let formatted = format_node_replacement(&file.source, &slice_range, &replacement);
+    let formatted = if source_newline_style(&file.source)? == "\r\n" {
+        formatted.replace('\n', "\r\n")
+    } else {
+        formatted
     };
 
-    let formatted = format_node_replacement(&file.source, &node_range, replacement);
-
-    let before = file.source[def_range.clone()].to_string();
-
-    let after = apply_range(&file.source, def_range, node_range, &formatted);
-
-    if before == after {
+    if before == formatted {
         return Ok(None);
+    }
+
+    let mut candidate = file.source.clone();
+    candidate.replace_range(slice_range.clone(), &formatted);
+    let lang = SupportLang::from_path(&file.path).ok_or("language_unsupported")?;
+    let ast = lang.ast_grep(&candidate);
+    if ast
+        .root()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
+        return Err("mutation_replacement_invalid");
     }
 
     Ok(Some(Edit {
         file: file.rel.clone(),
-        kind: "replace_exact".to_string(),
+        kind: "replace_slice".to_string(),
         before,
-        after,
+        after: formatted,
+        confinement: Some(SliceConfinement {
+            protocol: MUTATION_CONFINEMENT_PROTOCOL.to_string(),
+            mutation_index,
+            owner_symbol: mutation.symbol.clone(),
+            owner_start: owner_range.start,
+            owner_end: owner_range.end,
+            start_byte: slice_range.start,
+            end_byte: slice_range.end,
+            envelope: envelope.to_string(),
+        }),
     }))
 }
 
@@ -1043,6 +1229,7 @@ fn compile_python_import_binding(
         kind: "replace_exact".to_string(),
         before: binding.witness.clone(),
         after: import_after,
+        confinement: None,
     }];
 
     /*
@@ -1149,6 +1336,7 @@ fn compile_python_import_binding(
                 kind: "replace_exact".to_string(),
                 before,
                 after,
+                confinement: None,
             });
         }
     }
@@ -1477,6 +1665,7 @@ fn compile_rename(
                 kind: "replace_exact".to_string(),
                 before,
                 after,
+                confinement: None,
             });
         }
     }
@@ -1597,7 +1786,7 @@ fn compile(request: &Request) -> Result<Response> {
     let mut effective = 0usize;
 
     for (idx, mutation) in request.mutations.iter().enumerate() {
-        if !handoff_allows_mutation(&handoff, &mutation.kind) {
+        if !handoff_allows_mutation(&handoff, mutation) {
             return Ok(Response::rejected(
                 request,
                 "mutation_not_authorized_by_handoff",
@@ -1640,7 +1829,7 @@ fn compile(request: &Request) -> Result<Response> {
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
-            "replace_node" => match compile_replace_node(file, mutation) {
+            "replace_node" => match compile_replace_node(file, mutation, idx) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
@@ -1667,6 +1856,19 @@ fn compile(request: &Request) -> Result<Response> {
         } else {
             effective += 1;
             edits.extend(compiled);
+        }
+    }
+
+    // Certified offsets are baseline-relative. Until a transaction protocol
+    // explicitly rebases offsets, allow at most one certified slice per file.
+    let mut certified_slice_files = BTreeSet::new();
+    for edit in &edits {
+        if edit.kind == "replace_slice" && !certified_slice_files.insert(edit.file.clone()) {
+            return Ok(Response::rejected(
+                request,
+                "mutation_slice_transaction_unsupported",
+                None,
+            ));
         }
     }
 

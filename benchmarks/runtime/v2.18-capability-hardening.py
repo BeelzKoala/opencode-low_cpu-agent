@@ -78,6 +78,16 @@ def write_handoff(
         body["capability_protocol"] = capability_protocol
     if allowed_mutations is not None:
         body["allowed_mutations"] = allowed_mutations
+    if scope_mode == "local_mutation_capability" and files:
+        operation = (allowed_mutations or ["replace_node"])[0]
+        body["capability"] = {
+            "protocol": "scout-local-capability-v1",
+            "operation": operation,
+            "target": {
+                "file": files[0]["file"],
+                "symbol_name": "calculate",
+            },
+        }
     path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
     return rel
 
@@ -254,7 +264,7 @@ def main() -> None:
                 "root": str(root),
                 "handoff": malformed,
                 "mode": "guarded",
-                "edit_protocol": "edit-script-v2",
+                "edit_protocol": "edit-script-v3-certified-slice",
                 "edits": compiled["edits"],
                 "checks": compiled.get("checks") or [],
             },
@@ -269,7 +279,7 @@ def main() -> None:
                 "root": str(root),
                 "handoff": local,
                 "mode": "guarded",
-                "edit_protocol": "edit-script-v2",
+                "edit_protocol": "edit-script-v3-certified-slice",
                 "edits": compiled["edits"],
                 "checks": compiled.get("checks") or [],
             },
@@ -286,7 +296,7 @@ def main() -> None:
                 "root": str(root),
                 "handoff": local,
                 "patch": patch,
-                "compiler_protocol": "patch-compiler-v1",
+                "compiler_protocol": "patch-compiler-v2",
                 "mutation_protocol": "mutation-plan-v1",
                 "mutations": [replace_node_mutation()],
                 "changed_files": compiled["changed_files"],
@@ -302,7 +312,7 @@ def main() -> None:
                 "root": str(root),
                 "handoff": malformed,
                 "patch": patch,
-                "compiler_protocol": "patch-compiler-v1",
+                "compiler_protocol": "patch-compiler-v2",
                 "mutation_protocol": "mutation-plan-v1",
                 "mutations": [replace_node_mutation()],
                 "changed_files": compiled["changed_files"],
@@ -319,7 +329,7 @@ def main() -> None:
                 "root": str(root),
                 "handoff": local,
                 "patch": patch,
-                "compiler_protocol": "patch-compiler-v1",
+                "compiler_protocol": "patch-compiler-v2",
                 "mutation_protocol": "mutation-plan-v1",
                 "mutations": [rename_mutation()],
                 "changed_files": compiled["changed_files"],

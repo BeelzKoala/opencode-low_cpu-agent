@@ -1,0 +1,35 @@
+{
+  "version": "v2.19-MC2",
+  "protocol": "mutation-slice-v1",
+  "compiler_protocol": "patch-compiler-v2",
+  "executor_protocol": "patch-executor-v3",
+  "edit_protocol": "edit-script-v3-certified-slice",
+  "verifier_protocol": "invariant-verifier-v2",
+  "mutation_protocol": "mutation-plan-v1",
+  "goal": "Make physical mutation authority deterministic: replace_node may mutate only an exact structural source slice certified by the compiler and independently re-derived by the verifier.",
+  "gates": [
+    "partial owner prefix cannot escalate to whole-owner replacement",
+    "exact full-owner replacement remains available when the full owner is supplied explicitly",
+    "one named node and bounded contiguous sibling sequences are valid structural slices",
+    "duplicate exact slices fail closed as ambiguous",
+    "compiler emits replace_slice with certified owner and byte offsets instead of owner-wide replace_exact",
+    "executor binds certified offsets to strong source fingerprint, exact bytes, structural owner identity and evidence radius",
+    "local capability binds operation, target file, target owner and certified edit kind at Rust downstream boundaries",
+    "verifier ignores compiler authority and independently re-derives owner, slice, envelope and rendered replacement from baseline plus semantic mutation",
+    "multiple baseline-relative certified slices in one file fail closed until an explicit offset-rebasing transaction protocol exists",
+    "tampered or promoted certified edit cannot pass replace_node_confinement",
+    "LF model fragments are deterministically adapted to a CRLF baseline without broadening the slice",
+    "v2.18 local capability / rename restrictions remain green"
+  ],
+  "invariants": {
+    "model_facing_tools": 2,
+    "model_supplies_file_or_symbol": false,
+    "model_supplies_byte_offsets": false,
+    "ast_pattern_can_expand_replace_node": false,
+    "max_structural_sibling_nodes": 16,
+    "max_patch_attempts_per_turn": 2,
+    "global_rename_requires_global_handoff": true,
+    "unchecked_competitor_means_negative_evidence": false,
+    "max_certified_slices_per_file_per_plan": 1
+  }
+}

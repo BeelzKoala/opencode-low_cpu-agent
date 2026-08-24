@@ -106,18 +106,19 @@ const SCOUT_LOCAL_CAPABILITY_ALLOWED_PARTIAL_REASONS = new Set([
 const SCOUT_HANDOFF_HASH_MAX_BYTES = 8 * 1024 * 1024
 const SCOUT_HANDOFF_MAX_LINES_PER_FILE = 32
 
-// v2.14-C action-plane integration. Search semantics remain frozen; this layer
-// only exposes the already-guarded Rust executor to the model with a bounded
-// retry contract and a machine-readable receipt for the future verifier.
-const PATCH_COMPILER_PROTOCOL = "patch-compiler-v1"
+// Mutation/action plane. Search semantics stay independent: the model submits
+// semantic intent, while compiler/executor/verifier deterministically bind it
+// to capability-authorized source and bounded physical mutation.
+const PATCH_COMPILER_PROTOCOL = "patch-compiler-v2"
 const PATCH_MUTATION_PROTOCOL = "mutation-plan-v1"
 const PATCH_TOOL_PROTOCOL = "semantic-mutation-tool-v1"
 const PATCH_PERMISSION_ACTION = "execute_patch"
-const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v2"
-const PATCH_EDIT_PROTOCOL = "edit-script-v2"
+const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v3"
+const PATCH_EDIT_PROTOCOL = "edit-script-v3-certified-slice"
+const MUTATION_CONFINEMENT_PROTOCOL = "mutation-slice-v1"
 const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
-const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v1"
+const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v2"
 const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
 const PATCH_COMPILER_TIMEOUT_MS = 2500
 const PATCH_COMPILER_MAX_STDOUT_BYTES = 256 * 1024
@@ -160,7 +161,7 @@ const EDIT_CAPSULE_FULL_SCOPE_MAX_LINES = 80
 const EDIT_CAPSULE_WINDOW_RADIUS = 6
 
 const SEARCH_PROTOCOL = "search-v2.18.1-capability-hardening"
-const AGENT_PROTOCOL = "cpu-agent-v2.7.1-capability-hardening"
+const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -3770,9 +3771,12 @@ const PATCH_COMPILER_RETRY_REASONS = new Set([
   "rename_scope_too_large",
   "lowered_edit_budget_exceeded",
   "no_effect_plan",
-  "node_pattern_invalid",
-  "node_not_found",
-  "node_ambiguous",
+  "mutation_slice_not_exact",
+  "mutation_slice_ambiguous",
+  "mutation_slice_not_structural",
+  "mutation_slice_too_wide",
+  "mutation_fragment_invalid",
+  "mutation_replacement_invalid",
 ])
 
 const PATCH_COMPILER_RESCOUT_REASONS = new Set([
@@ -3830,6 +3834,11 @@ function proofObligationsForMutations(mutations) {
     { id: "top_level_conservation", check_kind: "top_level_conservation", disposition: "repair" },
     { id: "target_cardinality", check_kind: "target_cardinality", disposition: "repair" },
   ]
+  if ((mutations ?? []).some((mutation) => mutation?.kind === "replace_node")) {
+    obligations.push(
+      { id: "replace_node_confinement", check_kind: "replace_node_confinement", disposition: "repair" },
+    )
+  }
   if ((mutations ?? []).some((mutation) => mutation?.kind === "rename_symbol")) {
     obligations.push(
       { id: "rename_identifier_delta", check_kind: "rename_identifier_delta", disposition: "repair" },
@@ -4017,6 +4026,14 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
       state.localMutationCapability?.protocol ?? null,
     mutation_capability_target:
       state.localMutationCapability?.target ?? null,
+    mutation_confinement_protocol:
+      (compilerResponse?.edits ?? []).some((edit) => edit?.kind === "replace_slice")
+        ? MUTATION_CONFINEMENT_PROTOCOL
+        : null,
+    mutation_confinements:
+      (compilerResponse?.edits ?? [])
+        .filter((edit) => edit?.kind === "replace_slice" && edit?.confinement)
+        .map((edit) => edit.confinement),
     edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
     edit_capsule: state.editCapsulePath,
     edit_capsule_sha256: state.editCapsuleHash,
@@ -9480,9 +9497,9 @@ export default {
         description:
           "Submit exactly ONE semantic mutation inside the single mutation-authorized CAPSULE_SCOPE. " +
           "The target file and symbol are implicit capabilities and MUST NOT be supplied. " +
-          "Prefer replace_node: copy the smallest exact AST fragment from the authorized scope into before, and provide only its replacement. " +
-          "Do not reproduce the enclosing function. rename_symbol is reserved for a semantic rename. " +
-          "The deterministic compiler resolves the target, requires a unique AST node, expands the physical edit, and runs guarded checks. " +
+          "Prefer replace_node: before is a canonical exact source slice, never a pattern; only outer whitespace and line endings are normalized deterministically. Copy the smallest complete structural slice from the authorized scope and provide only its replacement. " +
+          "A slice may be one named AST node, a bounded contiguous sibling sequence, or the full authorized owner when copied exactly. " +
+          "The deterministic compiler NEVER expands the physical edit beyond before; it certifies exact byte offsets and the verifier re-derives them independently. " +
           "PATCH_RETRY means revise semantic intent once; PATCH_RESCOUT means new evidence is required.",
         input: {
           type: "object",
@@ -9499,13 +9516,13 @@ export default {
               minLength: 1,
               maxLength: 4096,
               description:
-                "Smallest exact source fragment identifying one named AST node inside the mutation-authorized scope.",
+                "Canonical exact source slice inside the authorized owner. Outer whitespace/EOL are normalized deterministically; no fuzzy AST matching is used. The slice must align to one named AST node, a bounded contiguous sibling sequence, or the exact full owner.",
             },
             replacement: {
               type: "string",
               maxLength: 4096,
               description:
-                "Replacement fragment only. Use indentation relative to the selected node; never reproduce the enclosing function.",
+                "Replacement for exactly the before slice. Use relative indentation. Reproduce the enclosing function only when before is the exact full authorized owner.",
             },
             new_name: {
               type: "string",
