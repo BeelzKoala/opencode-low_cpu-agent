@@ -9,7 +9,7 @@ EXPECTED_PLUGIN_SHA="5dc24be05ff469c7a401e8037d809996d94a93fd5ce310fce721a04e52e
 DJANGO="${DJANGO_REPO:-$HOME/projects/bench-repos/django}"
 TYPESCRIPT="${TYPESCRIPT_REPO:-$HOME/projects/bench-repos/typescript}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT="${OUT:-/tmp/user/Downloads/v2.22-r3-two-real-repos-$STAMP}"
+OUT="${OUT:-${TMPDIR:-/tmp}/v2.22-r3-two-real-repos-$STAMP}"
 RESULT="$OUT/summary.json"
 mkdir -p "$OUT"
 
