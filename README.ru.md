@@ -2,171 +2,162 @@
 
 [English version](README.md)
 
-Экспериментальный локальный background coding worker для **небольших, ограниченных задач в репозитории при жёстких лимитах CPU и RAM**.
+Экспериментальный проект по исследованию локального coding-agent для небольших задач в репозитории при жёстких ограничениях CPU, RAM и стоимости inference.
 
-Проект исследует пайплайн, в котором максимум работы выполняют дешёвые детерминированные инструменты, а языковая модель подключается только там, где действительно требуется рассуждение или генерация кода.
+Основная идея проекта:
 
 ```text
 task
 → localization
-→ dependency / impact analysis
+→ impact analysis
 → bounded patch
-→ verification
-→ at most one repair
+→ checks
+→ limited repair
 → VERIFIED | SAFE_FAIL
 ```
 
-> **Статус:** активный исследовательский прототип. Проект пока не является production-ready и намеренно предпочитает безопасный отказ неподтверждённому `VERIFIED`.
+На текущем этапе это **исследовательский прототип**, а не готовый автономный программист.
 
-## Зачем существует этот проект
+Проект проверяет, насколько далеко можно зайти, если использовать LLM только там, где действительно требуется генерация или рассуждение, а остальную работу отдавать более дешёвым детерминированным инструментам.
 
-Большинство coding-agent систем исходят из того, что inference, большой context, память и параллельные workers сравнительно дёшевы. Здесь исходная предпосылка обратная:
+## Основная гипотеза
 
 ```text
 LLM inference дорог.
-Deterministic computation дёшево.
+Search, parsers, graphs, lint и tests дешевле.
 ```
 
-Цель — не создать универсального автономного программиста. Цель — создать **надёжного фонового экономщика времени для небольших и ясных инженерных задач**, способного работать локально и не забирать себе всю машину.
+Поэтому вместо увеличения числа моделей, агентов и размера context проект исследует противоположный подход:
 
-Предполагаемый класс задач:
+```text
+deterministic narrowing
+→ small model-facing context
+→ bounded mutation
+→ deterministic verification
+```
 
-- небольшие bugfix;
-- изменения валидации;
-- правки конфигурации;
-- добавление локальных тестов;
-- изменение конкретного callsite;
-- ограниченные изменения в двух-трёх файлах;
-- небольшие UI/backend задачи, если область воздействия можно доказуемо ограничить.
+Пока неизвестно, насколько широкий класс реальных задач удастся таким образом закрыть.
 
-Неоднозначные, рискованные или плохо подтверждённые задачи должны завершаться `SAFE_FAIL`, а не уверенным угадыванием.
+Именно это проект и пытается измерить.
 
-## Основные принципы
+## Что мы хотим получить
 
-1. **Сначала детерминированные инструменты, потом model calls.**  
-   Search, parsing, graph, cache, diff analysis, lint и tests должны уменьшать и число обращений к LLM, и объём model-facing context.
+В перспективе система должна уметь принимать небольшую инженерную задачу:
 
-2. **Routing — не evidence.**  
-   Heuristics могут ранжировать кандидатов, но не должны становиться семантическим доказательством.
+```text
+"измени валидацию"
+"исправь локальный bug"
+"добавь тест"
+"измени один endpoint"
+"обнови несколько связанных callsites"
+```
 
-3. **Safe failure лучше false VERIFIED.**  
-   Патч не считается `VERIFIED`, пока не пройдены необходимые детерминированные гейты.
+затем самостоятельно:
 
-4. **Mutation должна быть bounded.**  
-   Executor не должен получать unrestricted shell или filesystem.
+1. найти релевантный код;
+2. определить ограниченную область воздействия;
+3. подготовить небольшой patch;
+4. проверить его;
+5. при конкретной ошибке выполнить максимум один repair;
+6. либо выдать подтверждённый результат, либо отказаться.
 
-5. **Изменения выполняются в isolated worktree.**  
-   Apply, verify и rollback должны быть транзакционными.
+Ключевое слово здесь — **в перспективе**.
 
-6. **Repair loop намеренно ограничен.**  
-   Один initial patch и максимум один bounded repair.
+Текущий репозиторий содержит постепенно развиваемые части этой архитектуры и экспериментальную инфраструктуру для их проверки.
 
-7. **Сложность должна заслужить своё место.**  
-   Embeddings, vector DB, PageRank, swarm, extra models, huge context и learned routers не добавляются без end-to-end evidence, что более простой deterministic метод недостаточен.
+## Текущий фокус
 
-## Архитектура
+Сейчас основная работа идёт вокруг:
 
-Проект развивается вокруг пяти основных ролей.
+* deterministic repository search;
+* task-local impact analysis;
+* structural parsing;
+* tool contracts;
+* bounded mutation;
+* runtime и benchmark harnesses;
+* локального inference под ограниченными ресурсами;
+* проверки поведения на разных репозиториях;
+* различения heuristic hypotheses и подтверждённого evidence.
+
+Не все перечисленные в roadmap механизмы уже реализованы.
+
+README намеренно не пытается создавать такое впечатление.
+
+## Архитектурное направление
+
+Проект постепенно разделяется на несколько ролей.
 
 ### Governor
 
-Отвечает за:
-
-- CPU/RAM и runtime budgets;
-- timeout;
-- cache;
-- no-progress detection;
-- task/evidence ledgers;
-- admission и failure policy.
+Отвечает за budgets, timeout, cache, ограничения выполнения и историю задачи.
 
 ### Scout
 
-Отвечает за детерминированное понимание репозитория:
+Ищет релевантный код, symbols, dependencies и потенциальную область воздействия.
 
-- lexical search и ranking;
-- structural parsing;
-- поиск symbols и scopes;
-- task-local dependency/impact expansion;
-- source validation;
-- обнаружение неоднозначности.
-
-Graph edge считается **гипотезой**, пока source-level validation не превратит его в evidence.
+Результаты эвристического поиска считаются кандидатами, а не доказательством.
 
 ### Executor
 
-Создаёт только bounded mutation через structured patch/diff.
+Должен иметь возможность делать только ограниченные изменения.
 
-Unrestricted mutation capabilities намеренно не выдаются.
+Целевая архитектура не предполагает unrestricted shell/filesystem access для модели.
 
 ### Verifier
 
-Независимо проверяет:
+Проверяет patch через deterministic tooling и project-native tests.
 
-```text
-TASK_PASS
-SCOPE_PASS
-STATIC_PASS
-INVARIANT_PASS
-IMPACT_PASS
-REGRESSION_PASS
-```
-
-Только прохождение необходимых гейтов может дать:
-
-```text
-VERIFIED
-```
+Идея состоит в том, чтобы не использовать мнение LLM как окончательное доказательство корректности.
 
 ### Orchestrator
 
-Управляет deterministic state machine, жизненным циклом isolated worktree, checkpoint/rollback и правилом одного repair.
+Связывает этапы в ограниченный state machine и управляет worktree, rollback и repair policy.
 
-Целевая state machine:
+Это архитектурное направление. Отдельные части находятся на разных стадиях готовности.
+
+## Почему SAFE_FAIL считается нормальным результатом
+
+Проект не ставит целью обязательно выполнить каждую задачу.
+
+Если система:
+
+* не смогла уверенно локализовать изменение;
+* столкнулась с неоднозначным symbol resolution;
+* вышла за budget;
+* не смогла доказать достаточность проверки;
+* получила environment failure;
+
+предпочтительным результатом должен быть отказ.
 
 ```text
-RECEIVED
-→ ELIGIBILITY
-→ LOCALIZE
-→ IMPACT
-→ PREPARE
-→ MUTATE
-→ VERIFY
-→ REPAIR?
-→ VERIFY
-→ VERIFIED | SAFE_FAIL | ENV_FAIL
+SAFE_FAIL > unsupported VERIFIED
 ```
 
-## Текущий фокус разработки
-
-Сейчас работа сосредоточена на нижних слоях, без которых надёжный автономный loop бессмыслен:
-
-- deterministic repository search;
-- task-local impact analysis;
-- bounded tool и mutation contracts;
-- воспроизводимые runtime/benchmark harnesses;
-- local inference под жёсткими CPU/RAM ограничениями;
-- cross-repository validation;
-- разделение localization hypotheses и evidence.
-
-README намеренно не выдаёт roadmap за уже реализованную функциональность.
+Насколько хорошо это правило соблюдается на реальных задачах — предмет текущего тестирования.
 
 ## Приоритет языков
 
-Проект не пытается одинаково хорошо поддерживать всё.
+Основной приоритет:
 
-| Приоритет | Языки | Цель |
-|---|---|---|
-| 1 | Python | first-class |
-| 2 | JavaScript / HTML / CSS | сильная практическая поддержка |
-| 3 | TypeScript | common cases |
-| 4 | XML / Docker / SQL | structural support |
-| 5 | Остальные | best effort |
+```text
+Python
+```
+
+Далее:
+
+```text
+JavaScript / HTML / CSS
+TypeScript
+XML / Docker / SQL
+```
+
+Остальные языки пока рассматриваются как best effort.
 
 ## Roadmap
 
-### Product 2.0 — надёжный bounded coding worker
+### 2.0 — bounded execution
 
-Цель:
+Цель — проверить, можно ли достаточно надёжно построить:
 
 ```text
 RETRIEVE
@@ -176,178 +167,132 @@ RETRIEVE
 → PROVE
 ```
 
-Запланированный фундамент:
+Исследуемые направления:
 
-- deterministic finite-state execution;
-- isolated worktree и transactional rollback;
-- exact search + BM25F + Reciprocal Rank Fusion;
-- Tree-sitter / Python AST / LibCST / ast-grep;
-- semantic source validation;
-- typed Impact Graph с bounded traversal;
-- evidence quorum и abstention;
-- invariant extraction и differential static checks;
-- regression test selection;
-- authoritative differential verification;
-- ровно один bounded repair;
-- content-addressed cache;
-- настоящий end-to-end benchmark corpus.
+* deterministic state machine;
+* isolated worktree;
+* transactional mutation;
+* exact/BM25-style retrieval;
+* structural parsing;
+* semantic source validation;
+* bounded Impact Graph;
+* invariants;
+* regression test selection;
+* differential verification;
+* one-repair policy;
+* content-addressed cache;
+* end-to-end benchmark corpus.
 
-### Product 3.0 — bounded investigation
+### 3.0 — bounded investigation
 
-Цель:
+Если 2.0 покажет приемлемые результаты, следующий вопрос:
 
-```text
-HYPOTHESIZE
-→ MEASURE
-→ SLICE
-→ ISOLATE
-→ PATCH
-→ PROVE
-```
+> может ли система самостоятельно локализовать не полностью определённую проблему?
 
-Worker должен научиться расследовать локально неоднозначные проблемы через ограниченные deterministic probes:
+Возможные инструменты:
 
-- budgeted best-first investigation;
-- deterministic query expansion;
-- coverage-based fault localization;
-- test-to-code coverage graph;
-- bounded backward slicing;
-- targeted runtime evidence;
-- delta debugging;
-- `git bisect`;
-- dependency-consistent multi-file batches;
-- property-based и metamorphic testing там, где это позволяет доказуемый contract.
+* iterative search;
+* coverage-based fault localization;
+* backward slicing;
+* runtime probes;
+* delta debugging;
+* `git bisect`;
+* test-to-code coverage graph.
 
-### Product 4.0 — автономный background worker
+### 4.0 — background operation
 
-Цель — безопасно обрабатывать поток задач почти без участия пользователя и оставаться фоновым workload для основной машины.
+Только после появления достаточной статистики можно будет исследовать:
 
-Планируемые механизмы:
+* task admission;
+* persistent task ledger;
+* resource-aware scheduling;
+* Linux PSI;
+* cgroups v2;
+* bounded queue;
+* automatic abstention;
+* долгоживущий background worker.
 
-- empirical task admission / abstention;
-- per-instance выбор execution strategy;
-- опциональный sequential model cascade;
-- persistent SQLite WAL task ledger;
-- persistent artifact store;
-- Linux PSI-based resource admission;
-- cgroups v2;
-- token/resource buckets;
-- Priority FIFO + Aging;
-- bounded concurrency;
-- Evidence Provenance DAG;
-- постоянный end-to-end product gate.
+Roadmap является направлением исследования, а не обещанием реализации.
 
-## Философия проверки
+## Что пока намеренно не добавляется
 
-Мнение LLM не считается доказательством.
+Без воспроизводимой проблемы и benchmark evidence проект старается не усложнять архитектуру через:
 
-Целевая модель verification — differential:
+* embeddings;
+* vector databases;
+* PageRank;
+* multi-agent swarm;
+* MCTS;
+* Tree-of-Thought;
+* отдельный Planner LLM;
+* LLM verifier как authority;
+* unlimited repair loops;
+* huge context;
+* learned routing;
+* RL scheduling.
 
-```text
-BEFORE ↔ AFTER
-```
+Это не утверждение, что такие методы бесполезны.
 
-Примеры:
+Просто при текущих ограничениях сначала проверяются более простые решения.
 
-```text
-new_static_errors == 0
-public_contract_breaks == 0
-scope_violations == 0
-```
+## Как оценивается прогресс
 
-Focused tests могут уменьшить latency, но сами по себе не дают права объявлять задачу `VERIFIED`.
+Главный вопрос проекта не:
 
-## Что проект намеренно не оптимизирует заранее
+> насколько умным выглядит агент?
 
-Пока benchmark не докажет необходимость, проект не должен зависеть от:
+а:
 
-- embeddings и vector DB;
-- PageRank или graph centrality как repository relevance;
-- Graph Neural Networks;
-- полного CodeQL indexing на default path;
-- MCTS и Tree-of-Thought;
-- multi-agent swarm;
-- Planner LLM;
-- LLM-as-judge verification;
-- large candidate sampling;
-- unlimited repair;
-- huge context;
-- learned router;
-- RL scheduling;
-- unrestricted Executor shell.
+> сколько реальных задач он способен корректно завершить при заданных ресурсах и насколько часто ошибочно объявляет результат проверенным?
 
-Правило допуска дополнительной сложности:
+Поэтому важны:
 
 ```text
-reproducible end-to-end failure
-+
-более простой deterministic метод недостаточен
-+
-benchmark evidence для предлагаемого решения
+false VERIFIED
+VERIFIED rate
+initial patch pass rate
+repair rate
+runtime
+model calls
+prompt tokens
+peak RSS
 ```
 
-## Benchmarking
+В идеале любое архитектурное улучшение должно быть видно на end-to-end задачах.
 
-Метрики компонентов полезны, но продукт оценивается end-to-end.
+## Об авторстве
 
-Ключевые метрики:
+Проект активно разрабатывается с использованием генеративных ИИ-моделей.
 
-- число false `VERIFIED`;
-- `VERIFIED` rate;
-- initial-patch PASS;
-- repair rate;
-- seconds / `VERIFIED`;
-- model calls / `VERIFIED`;
-- prompt tokens / `VERIFIED`;
-- peak RSS.
+Значительная часть:
 
-Улучшение отдельного компонента не считается улучшением продукта, если оно не повышает полезную end-to-end эффективность/безопасность и не открывает значимый новый класс задач.
+* кода;
+* тестов;
+* benchmark scripts;
+* документации;
+* refactoring;
+* отдельных архитектурных вариантов
 
-## Об авторстве и использовании ИИ
+была создана или переработана ИИ.
 
-Этот проект **нельзя честно описывать как код, вручную написанный человеком строка за строкой**.
+Человек при этом занимается исследованием задачи, постановкой ограничений, выбором архитектурных направлений, критикой решений, проектированием части системы, проведением экспериментов и оценкой результатов.
 
-Значительная часть кода, тестов, скриптов, патчей и документации была сгенерирована или переработана ИИ-моделями под человеческим управлением.
+Поэтому наиболее точное описание:
 
-На стороне человека находилась существенная часть работы, определяющей, каким вообще должен быть продукт:
+> **Human-directed, heavily AI-assisted experimental engineering project.**
 
-- исследование проблемы и существующих инженерных подходов;
-- формулирование продуктовых ограничений и safety model;
-- проектирование значительной части архитектуры;
-- выбор, критика, отбраковка и последовательность алгоритмов и инструментов;
-- разработка benchmark и PASS-критериев;
-- реальные запуски на репозиториях;
-- классификация failures и решение, какие изменения действительно оправданы.
+Этот репозиторий не претендует на изобретение используемых алгоритмов. Большая часть методов основана на известных подходах из software engineering, information retrieval и program analysis.
 
-ИИ активно использовался для:
+Интерес проекта — в проверке того, насколько полезно их сочетание в локальном coding-agent под жёсткими ресурсными ограничениями.
 
-- реализации;
-- рефакторинга;
-- генерации тестов и benchmark;
-- написания скриптов;
-- документации;
-- архитектурной критики и поиска альтернативных решений.
-
-Поэтому наиболее точное описание проекта:
-
-> **Human-directed, AI-implemented engineering research project.**
-
-Проект объединяет известные методы software engineering и program analysis в намеренно ограниченную архитектуру локального coding-agent. Он не заявляет, что используемые алгоритмы были изобретены в рамках этого проекта.
-
-## Главное правило проекта
-
-Архитектурный закон для всей дорожной карты:
+## Текущий статус
 
 ```text
-deterministic evidence
-        ↓
-bounded LLM reasoning
-        ↓
-bounded mutation
-        ↓
-deterministic proof
+experimental
+in active development
+not production-ready
+API and architecture may change
+results are still being validated
 ```
 
-Product 2.0 должен научиться надёжно выполнять.  
-Product 3.0 — надёжно расследовать.  
-Product 4.0 — самостоятельно решать, когда и как действовать.
+Если эксперимент окажется неудачным, это тоже будет полезным результатом: станет понятнее, какие ограничения не позволяют подобной архитектуре работать и где именно требуется более дорогой подход.

@@ -21,3 +21,4 @@ opencode-evidence-distiller
 
 # Local patch backups
 *.backup.*
+repomix-output.xml

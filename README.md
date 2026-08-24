@@ -2,171 +2,162 @@
 
 [Русская версия](README.ru.md)
 
-An experimental local background coding worker designed for **small, well-scoped repository tasks under strict CPU and RAM limits**.
+An experimental project exploring whether a useful local coding agent can be built for small repository tasks under strict CPU, RAM and inference-cost constraints.
 
-The project explores a pipeline in which deterministic tools do as much work as possible and the language model is used only where reasoning or code generation is actually needed.
+The general direction is:
 
 ```text
 task
 → localization
-→ dependency / impact analysis
+→ impact analysis
 → bounded patch
-→ verification
-→ at most one repair
+→ checks
+→ limited repair
 → VERIFIED | SAFE_FAIL
 ```
 
-> **Status:** active research prototype. The project is not production-ready and deliberately prefers a safe failure over an unsupported `VERIFIED` result.
+At the moment this is a **research prototype**, not a production-ready autonomous programmer.
 
-## Why this project exists
+The project investigates how much work can be moved away from the language model and into cheaper deterministic tools.
 
-Most coding agents assume that inference, context, memory and parallel workers are comparatively cheap. This project starts from the opposite constraint:
+## Core hypothesis
 
 ```text
 LLM inference is expensive.
-Deterministic computation is cheap.
+Search, parsers, graphs, lint and tests are cheaper.
 ```
 
-The goal is not to build a general autonomous software engineer. The goal is to build a **reliable time-saving worker for small, clear engineering tasks** that can run locally in the background without consuming the whole machine.
+Instead of increasing model count, agent count and context size, the project explores:
 
-Examples of the intended task class:
+```text
+deterministic narrowing
+→ small model-facing context
+→ bounded mutation
+→ deterministic verification
+```
 
-- small bug fixes;
-- validation changes;
-- configuration edits;
-- focused test additions;
-- local call-site changes;
-- bounded two- or three-file changes;
-- small UI/backend changes when the affected scope can be proven.
+It is not yet known how broad a class of real engineering tasks this approach can solve reliably.
 
-Ambiguous, high-risk or insufficiently evidenced tasks should end in `SAFE_FAIL`, not in a confident guess.
+Measuring that is one of the main purposes of the project.
 
-## Core design principles
+## Intended direction
 
-1. **Deterministic tools before model calls.**  
-   Search, parsing, graphs, caches, diff analysis, linting and tests should reduce both the number of LLM calls and the amount of model-facing context.
+Eventually, the system should be able to receive a small engineering task such as:
 
-2. **Evidence is not the same as routing.**  
-   Heuristics may rank candidates, but they must not be treated as semantic proof.
+```text
+"change validation"
+"fix a local bug"
+"add a test"
+"modify one endpoint"
+"update several related call sites"
+```
 
-3. **Safe failure is better than false verification.**  
-   A patch is not `VERIFIED` unless the required deterministic gates pass.
+and then:
 
-4. **Mutation must be bounded.**  
-   The executor should not receive unrestricted shell or filesystem access.
+1. locate the relevant code;
+2. determine a bounded impact scope;
+3. produce a small patch;
+4. verify it;
+5. perform at most one repair when given a concrete failure;
+6. return either a supported result or a safe failure.
 
-5. **Repository changes belong in an isolated worktree.**  
-   Apply, verify and rollback should be transactional.
+The important word here is **eventually**.
 
-6. **Repair loops are intentionally limited.**  
-   One initial patch and at most one bounded repair.
+The repository currently contains evolving pieces of this architecture together with experimental infrastructure used to evaluate them.
 
-7. **Complexity must justify itself.**  
-   Embeddings, vector databases, PageRank, swarms, extra models, large-context strategies and learned routers are rejected until an end-to-end benchmark shows that a simpler deterministic method is insufficient.
+## Current focus
 
-## Architecture
+Current work is mainly around:
 
-The project is converging on five main responsibilities:
+* deterministic repository search;
+* task-local impact analysis;
+* structural parsing;
+* tool contracts;
+* bounded mutation;
+* runtime and benchmark harnesses;
+* local inference under resource constraints;
+* validation across different repositories;
+* separating heuristic hypotheses from stronger evidence.
+
+Not every mechanism listed in the roadmap is implemented.
+
+This README intentionally does not present planned functionality as completed functionality.
+
+## Architectural direction
+
+The project is gradually separating several responsibilities.
 
 ### Governor
 
-Controls:
-
-- CPU/RAM and runtime budgets;
-- timeouts;
-- cache use;
-- no-progress detection;
-- task and evidence ledgers;
-- admission and failure policy.
+Budgets, timeout, cache, execution limits and task history.
 
 ### Scout
 
-Responsible for deterministic repository understanding:
+Searches for relevant code, symbols, dependencies and possible impact scope.
 
-- lexical search and ranking;
-- structural parsing;
-- symbol and scope discovery;
-- task-local dependency/impact expansion;
-- source validation;
-- ambiguity detection.
-
-A graph edge is treated as a **hypothesis** until source-level validation supports it.
+Heuristic search results are treated as candidates rather than semantic proof.
 
 ### Executor
 
-Produces only bounded mutations through structured patches/diffs.
+The target design allows only bounded mutations.
 
-The executor is intentionally denied unrestricted mutation capabilities.
+The model is not intended to receive unrestricted shell or filesystem mutation access.
 
 ### Verifier
 
-Independently evaluates:
+Checks patches using deterministic tooling and project-native tests.
 
-```text
-TASK_PASS
-SCOPE_PASS
-STATIC_PASS
-INVARIANT_PASS
-IMPACT_PASS
-REGRESSION_PASS
-```
-
-Only the required gates passing can produce:
-
-```text
-VERIFIED
-```
+The intended design does not treat an LLM opinion as final proof of correctness.
 
 ### Orchestrator
 
-Runs the deterministic state machine, isolated worktree lifecycle, checkpoints, rollback and the single-repair policy.
+Connects the stages through a bounded state machine and manages worktrees, rollback and repair policy.
 
-A target state machine is:
+These are architectural directions. Individual components are at different levels of maturity.
+
+## Why SAFE_FAIL is acceptable
+
+The project does not attempt to complete every task.
+
+If the system cannot:
+
+* localize the change with enough evidence;
+* resolve an ambiguous symbol;
+* remain inside its budget;
+* establish sufficient verification;
+* execute because of the environment;
+
+the preferred result should be refusal rather than an unsupported success.
 
 ```text
-RECEIVED
-→ ELIGIBILITY
-→ LOCALIZE
-→ IMPACT
-→ PREPARE
-→ MUTATE
-→ VERIFY
-→ REPAIR?
-→ VERIFY
-→ VERIFIED | SAFE_FAIL | ENV_FAIL
+SAFE_FAIL > unsupported VERIFIED
 ```
 
-## Current development focus
-
-The current work is centered on the lower layers required before a trustworthy autonomous loop is possible:
-
-- deterministic repository search;
-- task-local impact analysis;
-- bounded tool and mutation contracts;
-- reproducible runtime/benchmark harnesses;
-- local inference integration under CPU/RAM constraints;
-- cross-repository validation;
-- separating localization hypotheses from evidence.
-
-This README intentionally avoids presenting roadmap items as completed functionality.
+How consistently the implementation achieves this is still being tested.
 
 ## Language priorities
 
-The project is intentionally not equally ambitious for every language.
+Primary target:
 
-| Priority | Languages | Target |
-|---|---|---|
-| 1 | Python | first-class |
-| 2 | JavaScript / HTML / CSS | strong practical support |
-| 3 | TypeScript | common cases |
-| 4 | XML / Docker / SQL | structural support |
-| 5 | Other languages | best effort |
+```text
+Python
+```
+
+Then:
+
+```text
+JavaScript / HTML / CSS
+TypeScript
+XML / Docker / SQL
+```
+
+Other languages are currently best effort.
 
 ## Roadmap
 
-### Product 2.0 — reliable bounded coding worker
+### 2.0 — bounded execution
 
-Goal:
+The first major goal is to test whether this pipeline can become sufficiently reliable:
 
 ```text
 RETRIEVE
@@ -176,178 +167,130 @@ RETRIEVE
 → PROVE
 ```
 
-Planned foundations include:
+Areas being explored include:
 
-- deterministic finite-state execution;
-- isolated worktrees and transactional rollback;
-- exact search + BM25F + Reciprocal Rank Fusion;
-- Tree-sitter / Python AST / LibCST / ast-grep;
-- semantic source validation;
-- typed Impact Graph with bounded traversal;
-- evidence quorum and abstention;
-- invariant extraction and differential static checks;
-- regression test selection;
-- authoritative differential verification;
-- exactly one bounded repair;
-- content-addressed caching;
-- real end-to-end benchmark corpus.
+* deterministic state machines;
+* isolated worktrees;
+* transactional mutation;
+* exact/BM25-style retrieval;
+* structural parsing;
+* semantic source validation;
+* bounded impact graphs;
+* invariants;
+* regression test selection;
+* differential verification;
+* one-repair policy;
+* content-addressed caching;
+* end-to-end benchmark corpus.
 
-### Product 3.0 — bounded investigation
+### 3.0 — bounded investigation
 
-Goal:
+If the 2.0 approach performs well enough, the next question is whether the system can investigate problems that are not fully localized by the user.
 
-```text
-HYPOTHESIZE
-→ MEASURE
-→ SLICE
-→ ISOLATE
-→ PATCH
-→ PROVE
-```
+Possible tools include:
 
-The worker should become able to investigate locally ambiguous problems through bounded deterministic probes, including:
+* iterative search;
+* coverage-based fault localization;
+* backward slicing;
+* targeted runtime probes;
+* delta debugging;
+* `git bisect`;
+* test-to-code coverage graphs.
 
-- budgeted best-first investigation;
-- deterministic query expansion;
-- coverage-based fault localization;
-- test-to-code coverage graphs;
-- bounded backward slicing;
-- targeted runtime evidence;
-- delta debugging;
-- `git bisect`;
-- dependency-consistent multi-file batches;
-- property-based and metamorphic testing where contracts justify them.
+### 4.0 — background operation
 
-### Product 4.0 — autonomous background worker
+Only after enough empirical evidence exists would the project move toward:
 
-Goal: safely process a stream of tasks with minimal user involvement while remaining a polite background workload.
+* task admission;
+* persistent task ledgers;
+* resource-aware scheduling;
+* Linux PSI;
+* cgroups v2;
+* bounded queues;
+* automatic abstention;
+* a long-running background worker.
 
-Planned mechanisms include:
+The roadmap is a research direction, not a delivery promise.
 
-- empirical task admission / abstention;
-- per-instance execution strategy selection;
-- optional sequential model cascade;
-- persistent SQLite WAL task ledger;
-- persistent artifact store;
-- Linux PSI-based resource admission;
-- cgroups v2;
-- token/resource buckets;
-- priority FIFO + aging;
-- bounded concurrency;
-- evidence provenance DAG;
-- continuous end-to-end product gates.
+## Deliberately postponed complexity
 
-## Verification philosophy
+Without a reproducible failure and benchmark evidence, the project currently avoids adding:
 
-The project does not treat an LLM opinion as proof.
+* embeddings;
+* vector databases;
+* PageRank;
+* multi-agent swarms;
+* MCTS;
+* Tree-of-Thought;
+* dedicated planner LLMs;
+* LLM verification as authority;
+* unlimited repair loops;
+* huge context;
+* learned routing;
+* RL scheduling.
 
-The intended verification model is differential:
+This does not mean those methods are inherently useless.
 
-```text
-BEFORE ↔ AFTER
-```
+The project simply tests simpler approaches first.
 
-Examples:
+## Evaluation
 
-```text
-new_static_errors == 0
-public_contract_breaks == 0
-scope_violations == 0
-```
+The main question is not:
 
-Focused tests may reduce latency, but a focused test pass alone is not enough to claim `VERIFIED`.
+> how intelligent does the agent look?
 
-## What this project deliberately does not optimize for
+but:
 
-Unless benchmark evidence proves otherwise, this project does not plan to depend on:
-
-- embeddings or a vector database;
-- PageRank or graph centrality as repository relevance;
-- graph neural networks;
-- full CodeQL indexing on the default path;
-- MCTS or Tree-of-Thought;
-- multi-agent swarms;
-- planner LLMs;
-- LLM-as-judge verification;
-- large candidate sampling;
-- unlimited repair loops;
-- huge context windows;
-- learned routers;
-- RL scheduling;
-- unrestricted executor shell access.
-
-The acceptance rule for additional complexity is simple:
-
-```text
-reproducible end-to-end failure
-+
-simpler deterministic method is insufficient
-+
-benchmark evidence for the proposed solution
-```
-
-## Benchmarking
-
-Component metrics are useful, but the product is judged end to end.
+> how many real tasks can it complete correctly within the resource budget, and how often does it incorrectly claim success?
 
 Important metrics include:
 
-- false `VERIFIED` count;
-- `VERIFIED` rate;
-- initial-patch pass rate;
-- repair rate;
-- seconds per `VERIFIED`;
-- model calls per `VERIFIED`;
-- prompt tokens per `VERIFIED`;
-- peak RSS.
-
-A component improvement is not considered a product improvement unless it either improves useful end-to-end throughput/safety or unlocks a meaningful new task class.
-
-## Authorship and use of AI
-
-This project should **not** be represented as code written manually by a human line by line.
-
-A substantial part of the code, tests, scripts, patches and documentation has been generated or rewritten by AI models under human direction.
-
-The human contributor has been responsible for much of the work that determines what the system should actually be:
-
-- researching the problem and existing engineering approaches;
-- defining the product constraints and safety model;
-- designing significant parts of the architecture;
-- selecting, rejecting and sequencing algorithms and tools;
-- designing benchmarks and pass criteria;
-- running the system on real repositories;
-- classifying failures and deciding which changes are justified.
-
-AI systems have been used heavily for:
-
-- implementation;
-- refactoring;
-- test and benchmark generation;
-- scripting;
-- documentation;
-- architectural critique and alternative designs.
-
-The most accurate description is therefore:
-
-> **A human-directed, AI-implemented engineering research project.**
-
-The project combines established software-engineering and program-analysis techniques into a deliberately constrained local coding-agent pipeline. It does not claim that the underlying algorithms were invented here.
-
-## Project rule
-
-The architectural rule that ties the roadmap together is:
-
 ```text
-deterministic evidence
-        ↓
-bounded LLM reasoning
-        ↓
-bounded mutation
-        ↓
-deterministic proof
+false VERIFIED
+VERIFIED rate
+initial patch pass rate
+repair rate
+runtime
+model calls
+prompt tokens
+peak RSS
 ```
 
-Product 2.0 should learn to execute reliably.  
-Product 3.0 should learn to investigate reliably.  
-Product 4.0 should learn when and how to act autonomously.
+Ideally, architectural improvements should be visible in end-to-end results.
+
+## Authorship
+
+This project is developed with extensive use of generative AI systems.
+
+A significant portion of:
+
+* implementation;
+* tests;
+* benchmark scripts;
+* documentation;
+* refactoring;
+* architectural alternatives
+
+has been generated or rewritten by AI models.
+
+The human contributor has been responsible for researching the problem, defining constraints, selecting and criticizing architectural directions, designing parts of the system, running experiments and evaluating results.
+
+A reasonably accurate description is:
+
+> **Human-directed, heavily AI-assisted experimental engineering project.**
+
+The project does not claim to have invented the underlying algorithms. Most techniques come from established software engineering, information retrieval and program analysis work.
+
+The experiment is in how they can be combined into a resource-constrained local coding-agent pipeline.
+
+## Current status
+
+```text
+experimental
+in active development
+not production-ready
+API and architecture may change
+results are still being validated
+```
+
+A negative result would also be useful: it would help identify which constraints make this architecture impractical and where more expensive approaches are actually necessary.
