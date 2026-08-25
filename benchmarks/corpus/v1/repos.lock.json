@@ -1,0 +1,15 @@
+{
+  "protocol": "corpus-repo-lock-v1",
+  "repos": {
+    "django": {
+      "git_head": "03988c5a5ba248c3b9b11ea96fd4fda5e98849aa",
+      "target_file": "django/apps/config.py",
+      "target_sha256": "d59871b783abc119ce9ac4ff07f06eac89b3de88bcdf7d13246d2b451279f1b4"
+    },
+    "typescript": {
+      "git_head": "d6c4afddb2c55f4a9dea7b59293a99a8fdea1799",
+      "target_file": "packages/typescript/src/api/fs.ts",
+      "target_sha256": "ceefa8911dc47d24ca8cb4507e5fa117f7303a3d56d2f6d003ace700e78f9900"
+    }
+  }
+}

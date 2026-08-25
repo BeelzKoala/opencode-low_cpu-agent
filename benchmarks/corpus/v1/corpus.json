@@ -1,0 +1,94 @@
+{
+  "metrics": [
+    "false_verified",
+    "verified_tasks",
+    "cpu_seconds",
+    "solved_tasks_per_cpu",
+    "model_calls",
+    "wall_seconds"
+  ],
+  "policy": "never_edit_this_version_create_v2_instead",
+  "protocol": "immutable-corpus-v1",
+  "tasks": [
+    {
+      "expected": "VERIFIED",
+      "id": "py-threshold-replace",
+      "kind": "bounded_replace",
+      "language": "python"
+    },
+    {
+      "expected": "VERIFIED",
+      "id": "py-normalization-replace",
+      "kind": "bounded_replace",
+      "language": "python"
+    },
+    {
+      "expected": "VERIFIED",
+      "id": "py-transitive-risk-replace",
+      "kind": "bounded_replace",
+      "language": "python"
+    },
+    {
+      "expected": "VERIFIED",
+      "expected_identifier_count": 2,
+      "file": "django/apps/config.py",
+      "id": "django-private-helper-rename",
+      "kind": "rename",
+      "language": "python",
+      "repo_key": "django",
+      "symbol": "_path_from_module"
+    },
+    {
+      "expected": "VERIFIED",
+      "expected_identifier_count": 4,
+      "file": "packages/typescript/src/api/fs.ts",
+      "id": "typescript-private-helper-rename",
+      "kind": "rename",
+      "language": "typescript",
+      "repo_key": "typescript",
+      "symbol": "getNodeFromPath"
+    },
+    {
+      "expected": "SAFE_FAIL",
+      "id": "duplicate-definition-rename",
+      "kind": "adversarial_rename",
+      "language": "python"
+    },
+    {
+      "expected": "SAFE_FAIL",
+      "id": "stale-capability",
+      "kind": "adversarial_authority",
+      "language": "python"
+    },
+    {
+      "expected": "SAFE_FAIL",
+      "id": "invalid-python-candidate",
+      "kind": "adversarial_validity",
+      "language": "python"
+    },
+    {
+      "expected": "SAFE_FAIL",
+      "id": "ambiguous-owner",
+      "kind": "adversarial_scope",
+      "language": "typescript"
+    },
+    {
+      "expected": "PASS",
+      "id": "mutation-action-cardinality",
+      "kind": "orchestrator_contract",
+      "language": "mixed"
+    },
+    {
+      "expected": "PASS",
+      "id": "terminal-outcome-transport-mismatch",
+      "kind": "host_contract",
+      "language": "mixed"
+    },
+    {
+      "expected": "PASS",
+      "id": "interface-freeze",
+      "kind": "abi_contract",
+      "language": "mixed"
+    }
+  ]
+}

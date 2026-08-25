@@ -1,0 +1,49 @@
+{
+  "entrypoint": "opencode/plugins/cpu-search.ts",
+  "entrypoint_bytes": 452266,
+  "entrypoint_sha256": "7bfc87ebbec23a0478f3db3df8fdda9dff56daa4d43c0f57b9f1dd5caa4e559d",
+  "parts": [
+    {
+      "bytes": 70171,
+      "path": "opencode/plugins/cpu-search.fragments/00.part.ts",
+      "sha256": "6cd8e287e39795908b6f9047d85cf0eacc4cf62a0d7287b996b52bbace1b7c27"
+    },
+    {
+      "bytes": 66388,
+      "path": "opencode/plugins/cpu-search.fragments/01.part.ts",
+      "sha256": "e3ba9cb576d19a190ed9b630d7e9a37e34cf2bb938638dbc31139b1ddec2bdc0"
+    },
+    {
+      "bytes": 65560,
+      "path": "opencode/plugins/cpu-search.fragments/02.part.ts",
+      "sha256": "11c79ea62bf62b116ad01e1cfd1af357e62f6b59694912138df284ded2b4a772"
+    },
+    {
+      "bytes": 71252,
+      "path": "opencode/plugins/cpu-search.fragments/03.part.ts",
+      "sha256": "bb8cfa14109e516891c4f479bb79dac038b62146204ed5904b1cee4264db4d50"
+    },
+    {
+      "bytes": 30832,
+      "path": "opencode/plugins/cpu-search.fragments/04.part.ts",
+      "sha256": "bffaf1c696a03831f39f0ddf110963603219e3bedc6a35ddc3929158767d0b97"
+    },
+    {
+      "bytes": 65570,
+      "path": "opencode/plugins/cpu-search.fragments/05.part.ts",
+      "sha256": "af31ebd141db04aa5cd48dfd914bf3c220999066379cfdb39c64a3ce894a0657"
+    },
+    {
+      "bytes": 65577,
+      "path": "opencode/plugins/cpu-search.fragments/06.part.ts",
+      "sha256": "982673379e326ff4c618e488f0763381254d7f62c2b35ee31ca721d7debbd181"
+    },
+    {
+      "bytes": 16916,
+      "path": "opencode/plugins/cpu-search.fragments/07.part.ts",
+      "sha256": "72394f85490033dbbfcb43a2d616a0df89e5b6c69dcb4a3e4a4349e9efecd8a6"
+    }
+  ],
+  "protocol": "cpu-search-fragments-v1",
+  "target_fragment_bytes": 65536
+}

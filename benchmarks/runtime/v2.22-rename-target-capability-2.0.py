@@ -163,15 +163,24 @@ def main() -> None:
     assert 'renameSymbolReady: false' in local
     assert 'renameSymbolReady: globalReady' not in local
 
-    frontier = section(
+    # v2.25 task-context-v1 split routing into:
+    #   resolveMutationActionForState(state) -> capability/intention proof
+    #   mutationToolsForState(state)        -> one-tool wrapper
+    #
+    # v2.22 owns the authority invariant, not the historical placement of the
+    # capability checks inside the wrapper. Inspect the whole routing block.
+    routing = section(
         plugin,
-        "function mutationToolsForState(state)",
+        "function resolveMutationActionForState(state)",
         "\nfunction allowedToolsForState(state)",
     )
-    assert 'const renameCapability = state?.renameMutationCapability ?? null' in frontier
-    assert 'renameCapability?.protocol === SCOUT_RENAME_TARGET_PROTOCOL' in frontier
-    assert 'renameCapability?.sourceHandoffPath === state?.scoutHandoffPath' in frontier
-    assert 'capability?.renameSymbolReady === true' not in frontier
+    assert 'const renameCapability = state?.renameMutationCapability ?? null' in routing
+    assert 'renameCapability?.protocol === SCOUT_RENAME_TARGET_PROTOCOL' in routing
+    assert 'renameCapability?.sourceHandoffPath === state?.scoutHandoffPath' in routing
+    assert 'capability?.renameSymbolReady === true' not in routing
+    assert 'function mutationToolsForState(state)' in routing
+    assert 'const resolution = resolveMutationActionForState(state)' in routing
+    assert 'return resolution.tool ? [resolution.tool] : []' in routing
 
     materializer = section(
         plugin,

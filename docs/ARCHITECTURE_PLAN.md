@@ -1,297 +1,250 @@
 # Low-CPU agent architecture plan
 
-The governing constraint is: local CPU inference is expensive; deterministic search,
-indexing and verification are cheap. New runtime layers are accepted only when they
-reduce model turns, reduce model-facing context, or improve localization recall without
-weakening evidence safety.
-
-## Long-horizon agent pipeline
-
-1. **Scout** — bounded reconnaissance, no editing.
-2. **Governor** — per-turn budgets, loop suppression, model-call and wall limits.
-3. **Evidence router / reader** — broad lexical intent -> trustworthy source regions in
-   the same tool call. Discovery is frozen after v2.13-C3.
-4. **Execution / patch stage** — consume the Scout handoff, revalidate file fingerprints,
-   and make the smallest practical change. This is the next work.
-5. **Review / verification stage** — deterministic checks first, then bounded review of
-   the patch and affected behavior.
-
-Scout and Governor are not superseded by the router. The router is the reading layer
-between bounded reconnaissance and execution.
-
-## Search/evidence roadmap
-
-### v2.11 — Ranked file routing — DONE
-
-File-level `rg --files-with-matches`, direct lexical candidate retention, query-fair
-same-call refinement, separate discovery/line completeness and separate route/evidence
-novelty ledgers.
-
-### v2.12-A — Budgeted region router — DONE
-
-- fairness is separate from relevance;
-- route scores stay in telemetry, not model-facing text;
-- focused context has a bounded cost premium;
-- dense evidence auto-routes to sampled AST scopes before INDEX;
-- route-only novelty does not bypass evidence no-progress.
-
-### v2.12-B — Probe-more / emit-less — DONE
-
-- probe 6–8 lexical files inside the tool;
-- emit only the best evidence regions under the evidence budget;
-- preserve at least one direct candidate per non-empty query;
-- rank regions by query coverage, structural role, task/path anchors and marginal
-  evidence-per-byte.
-
-### v2.13 — Incremental RepoIndex / Impact Index — DONE AND FROZEN
-
-v2.13-A shadowed exact local edges. v2.13-B activated at most two graph probes and one
-graph emit behind source validation. v2.13-C conditioned graph expansion on lexical
-scope evidence; C2.2 added task-local pre-cap filtering, alias pairs, multiline imports,
-fingerprint freshness and one refresh-on-miss retry.
-
-#### v2.13-C3 — Scout handoff/freeze — DONE
-
-- do not widen discovery or add new graph algorithms;
-- persist an atomic `scout-handoff-v1` snapshot under `.opencode/scout-handoffs/`;
-- record relative localized files, evidence line hints and validated Impact provenance;
-- fingerprint ordinary selected source files with SHA-256 and recheck emitted witness lines against the hashed bytes;
-- classify the handoff as `ready`, `partial` or `blocked` without hiding incompleteness;
-- expose the handoff path in search metadata/trace;
-- after these gates pass, discovery changes require a reproduced benchmark miss.
-
-PageRank, embeddings, full-repository semantic maps and a second explorer model remain
-out of scope until a post-freeze benchmark proves they are needed.
-
-### v2.14 — Patch Executor — CURRENT
-
-The executor is a separate action plane, not an extension of `search`.
-
-#### v2.14-A — shadow executor core — DONE
-
-The first executor stage deliberately does not write the repository. It consumes
-`scout-handoff-v1` and a bounded `EditScript` request, then constructs the candidate
-source and unified patch in memory/temporary storage only. Admission requires:
-
-1. handoff protocol `scout-handoff-v1` with status `ready`;
-2. a fresh strong SHA-256 fingerprint for every file carried by the handoff;
-3. every edited file to be inside the handoff file allowlist;
-4. an exact precondition matching once and within 96 lines of carried evidence;
-5. candidate syntax to parse without ERROR/missing nodes through the existing
-   ast-grep/tree-sitter backend;
-6. `git apply --check --whitespace=error-all` to accept the generated patch;
-7. byte identity of the source repository before/after shadow execution.
-
-The initial `EditScript` intentionally exposes only `replace_exact`. This is a safety
-baseline, not the final mutation language. Structural rewrites should reuse the existing
-ast-grep stack before adding another parser/codemod runtime. GritQL remains a benchmark
-candidate for migrations, not a dependency. Difftastic belongs primarily to the later
-review plane.
-
-#### v2.14-B — guarded transactional mutation — CURRENT
-
-The guarded executor performs real writes only inside a disposable detached Git worktree.
-The Scout fingerprint is revalidated in the main tree and again against the detached HEAD
-baseline before any candidate bytes are written. The first mutation language is deliberately
-small:
-
-- `replace_exact` retains the v2.14-A unique textual precondition;
-- `replace_ast` uses the existing pinned ast-grep/tree-sitter stack to match one structural
-  node within the 96-line Scout evidence radius, then replaces that exact node range;
-- ast-grep metavariables remain disabled until a later benchmark proves template expansion
-  can be constrained safely.
-
-Mutation budgets start at two changed files and 120 changed lines. Candidate files must
-parse after the worktree write, deterministic `contains_exact` / `not_contains_exact`
-postconditions may be required, `git diff --check` must pass, and the exported patch must
-still pass `git apply --check` against the main tree. Any failure removes the disposable
-worktree and exports no patch.
-
-This first guarded version requires touched files to exist at the detached `HEAD` baseline.
-A locally modified tracked file may be read by Scout, but B refuses to replay it into the
-detached worktree when its HEAD bytes differ from the Scout fingerprint. Supporting dirty
-baselines is deferred until a benchmark demonstrates that the extra merge/snapshot logic is
-worth the safety surface.
-
-The executor may reread localized files, but it may not silently restart repository-wide
-discovery. If localization is insufficient it returns control to Scout with a concrete
-benchmarkable miss reason.
-
-#### v2.14-A — shadow execution — DONE
-
-- consume only `ready` Scout handoffs;
-- revalidate strong SHA-256 fingerprints;
-- construct candidate edits in memory;
-- reject ambiguity, syntax breakage and evidence-distant edits;
-- prove patch applicability without mutating the repository.
-
-#### v2.14-B — guarded transactional mutation — DONE
-
-- mutate only a disposable detached Git worktree;
-- keep the main checkout byte-identical;
-- support bounded `replace_exact` and AST-backed `replace_ast`;
-- enforce <=2 changed files and <=120 changed lines;
-- rollback on syntax/postcondition/diff/apply failures.
-
-#### v2.14-C — real-task execution loop — CURRENT
-
-- expose a model-facing `execute_patch` action while keeping Scout search semantics unchanged;
-- automatically consume the latest per-turn `scout-handoff-v1`;
-- allow at most two distinct patch attempts per user turn;
-- classify executor failures into `retry`, `rescout`, and terminal `stop`;
-- suppress duplicate patch plans instead of spending another executor run;
-- on success persist the diff plus `patch-receipt-v1` with source/patch hashes,
-  changed-file/line budgets and executor checks;
-- benchmark real one-file, structural and coordinated two-file tasks with the actual
-  local model and measure model calls, search calls, patch attempts and task success.
-
-#### v2.14-C3 — semantic Mutation Compiler — CURRENT
-
-C-R2 proved the end-to-end Scout -> model -> Executor path but exposed an interface mismatch:
-the local model often understood the intended code change while wasting attempts on low-level
-EditScript mechanics such as identity edits and manually coordinated rename sites. C3 does not
-add another agent or another model-facing tool. The action surface remains exactly `search` plus
-`execute_patch`; `execute_patch` now accepts `mutation-plan-v1`, and a deterministic Rust
-`patch-compiler-v1` lowers semantic mutations into the frozen `edit-script-v2` contract.
-
-The initial compiler intentionally exposes only three operations:
-
-- `replace_body(file, symbol, body)` resolves a unique evidence-local function/method and lowers
-  the body change to one exact guarded edit;
-- `replace_expr(file, symbol, before, after)` uses ast-grep structurally inside that symbol, then
-  lowers the proven target to one exact edit;
-- `rename_symbol(file, symbol, new_name, scope=handoff)` rewrites only AST identifier leaves inside
-  Scout-authorized files and within the carried evidence radius. Ambiguous/incomplete rename scope
-  fails closed instead of pretending to provide full LSP semantics.
-
-Compiler passes are deterministic: duplicate semantic mutations are canonicalized away, identity
-mutations are dropped without a model retry, checks are generated by the compiler rather than the
-model, and the resulting edit/check list remains subject to every frozen v2.14-B worktree, SHA,
-syntax, diff and patch budget. The primary acceptance target is fewer model attempts, not a richer
-mutation language.
-
-`patch-receipt-v1` is the Executor -> Verifier trust boundary for v2.15. It is not an
-approval to merge: the main checkout remains unchanged until a later verification gate
-accepts the candidate.
-
-## Scout -> Executor handoff contract
-
-`scout-handoff-v1` is the trust boundary between read-only reconnaissance and writes.
-The handoff is advisory about task relevance but authoritative about provenance: every
-localized file has its origin (`lexical`/`impact`), query membership, bounded evidence
-line hints and a freshness fingerprint. Validated graph relations retain seed, direction,
-bindings and validation kind.
-
-`ready` means the latest Scout result has localized at least one strongly fingerprinted
-file, its carried witnesses still match the hashed bytes, and the result does not require refinement. `partial` keeps usable localization but explicitly
-records incomplete discovery/evidence. `blocked` means the executor must not write (for
-example stale/changed files, weak fingerprint, no localized file, or required refinement).
-
-## Permanent invariants
-
-1. Routing may be heuristic; evidence must not overclaim completeness.
-2. Direct lexical matches may be reordered, never removed from the candidate universe.
-3. Sampled region evidence is explicitly sampled and `complete=false`.
-4. Unsupported/broken syntax degrades safely to raw/index.
-5. Model-visible route metadata is minimal; score math belongs in trace telemetry.
-6. A 20–100 ms tool-side increase is acceptable if it reliably removes a model turn or
-   materially reduces model-facing context.
-
-## Benchmark gates
-
-Primary KPI: model calls per task.
-
-Secondary: touched/gold file recall, first useful region rank, useful coverage at fixed
-2 KiB/4 KiB budgets, output bytes/search, dense searches resolved without
-`refinement_required=true`, no-progress loops, tool wall time, lexical retention and
-parse/unsupported fallbacks.
-
-### v2.13 — Impact Index
-
-#### v2.13-A — shadow gate
-- precision-first local dependency edges only; no PageRank/embeddings/full repo map;
-- persistent cache: `refresh` walks/stats the repo, `neighbors` reads adjacency only;
-- forward + reverse edges carry import binding, witness line and confidence;
-- graph candidates are telemetry-only and cannot change v2.12 probe/emit routing;
-- helper is fail-open; stale/missing/timed-out index cannot break lexical search.
-
-#### v2.13-B — guarded activation (after A passes)
-- preserve all 8 lexical probe slots;
-- add at most 2 graph hypotheses outside those slots;
-- graph edge is never evidence: bindings must be validated in source before ranking/emission;
-- emit budget remains <= 4 files/regions.
-
-#### v2.13-C — real-task freeze
-- accept only if non-lexical recovery improves without material model-context/model-call regression;
-- after freeze, discovery plane stops growing and work moves to v2.14 Patch Executor.
-
-### v2.14-A — Shadow Executor gates
-
-- ready handoff -> candidate patch without source mutation;
-- partial/blocked handoff -> no patch authority;
-- stale fingerprint -> reject;
-- out-of-scope file -> reject;
-- ambiguous exact precondition -> reject;
-- syntax-breaking candidate -> reject;
-- edit outside the bounded evidence radius -> reject;
-- applicable patch -> `git apply --check` must pass.
-
-### v2.14-B — Guarded Executor gates
-
-- real mutation occurs only inside a detached disposable Git worktree;
-- main source bytes remain unchanged on success and failure;
-- detached HEAD bytes for every touched/check file must equal the Scout SHA-256;
-- `replace_ast` must prove a unique evidence-local structural match;
-- syntax failure after mutation -> no patch + worktree cleanup;
-- deterministic postcondition failure -> no patch + worktree cleanup;
-- more than two changed files or 120 changed lines -> reject;
-- `git diff --check` and main-tree `git apply --check` are mandatory before patch export.
-
-### v2.15-A — Independent invariant verification
-
-`invariant-verifier-v1` is a separate deterministic proof stage between the frozen
-Executor and `PATCH_READY`. It receives the Scout handoff, semantic mutation intent,
-compiler-lowered edits and the Executor patch, then independently reapplies the patch
-in a detached worktree. The verifier rejects any patch whose bytes are not exactly
-reproducible from the lowered edits, whose changed-file set escapes the compiler/Scout
-scope, whose changed files stop parsing, or whose untouched top-level AST siblings
-drift.
-
-For symbol-preserving mutations the target definition cardinality must remain one.
-For rename, the old/new identifier delta must balance and `git grep` prefilter plus ast-grep identifier validation over tracked source files
-must prove closure: every pre-patch old-symbol occurrence must be inside the actual
-changed-file set and no tracked old-symbol occurrence may remain after the patch. This
-is deliberately independent of Scout completeness claims.
-
-A successful proof emits `verification-receipt-v1`; `patch-receipt-v1` points to it.
-The model-facing action surface remains `search + execute_patch`; verification adds no
-new model tool and no model call.
-
-
-### v2.15-B — Causal execution FSM and evidence capsules
-
-Three real-repository v2.15-A probes exposed an orchestration bug rather than an Executor or
-Verifier bug: Scout returned a ready handoff, but the local model kept reissuing search until the
-model-call budget expired. B moves that choice out of inference. `causal-execution-fsm-v1` is a
-single deterministic transition policy with states `LOCATE`, `MUTATE`, `REPAIR`, `DONE`, and
-`SAFE_FAIL`. The model-visible frontier is derived from state and contains at most one tool:
-`search`, `execute_patch`, or none.
-
-A ready Scout handoff does not by itself authorize the transition to mutation. Search also builds
-`edit-capsule-v1` from existing ast-grep structural witnesses (falling back to bounded evidence
-windows), fingerprints every carried file, and persists compact scope context. `MUTATE` is entered
-only when every handoff file is contextualized and strongly fingerprinted. The capsule is linked
-from the final patch receipt so the later review plane can reconstruct what semantic context was
-actually supplied to the model.
-
-Verifier output is interpreted through `proof-obligation-v1`. Replay/file-set/parse/cleanup
-failures are fatal; target-cardinality and top-level-conservation failures are repairable within the
-one-repair budget; rename syntactic-closure failure requests a new localization step. This keeps
-the invariant engine independent while preventing the orchestrator from collapsing every failed
-proof into a terminal stop. `rename_global_closure` remains a syntactic AST-level invariant, not a
-claim of language-semantic name resolution.
-
-Acceptance requires the two adversarial verifier gates plus real detached-worktree probes on
-`private_repo`, Django, and TypeScript. Each real probe must show the causal trajectory
-`LOCATE/search -> MUTATE/execute_patch -> DONE/no tools`, exactly three model calls, one search,
-one patch attempt, verified proof obligations, and an unchanged source checkout.
+## Current product objective
+
+```text
+task
+→ bounded deterministic search
+→ Query Formulation 2.0 when needed
+→ lexical / structural routing
+→ Impact hypotheses + source validation
+→ semantic shadow validation
+→ structural owner recovery
+→ bounded preauthorized capabilities
+→ deterministic mutation-action routing
+→ sealed edit capsule
+→ action-specific semantic mutation
+→ deterministic late binding + Mutation Confinement 2.0
+→ candidate reconstruction + native validity
+→ isolated Executor
+→ independent Verifier
+→ VERIFIED | SAFE_FAIL
+```
+
+The governing constraint remains:
+
+```text
+LLM inference is expensive.
+Deterministic tools are cheap.
+```
+
+Routing may be heuristic. Evidence and authority may not be fabricated.
+A graph edge is a hypothesis until source validation.
+SAFE_FAIL is preferable to unsupported VERIFIED.
+
+## Architecture moratorium — CURRENT
+
+For the next stabilization versions the project deliberately stops adding architectural
+layers unless an immutable end-to-end corpus demonstrates a concrete product failure.
+
+The critical review behind this decision is:
+
+> Stop adding architecture for several versions. Fix the Git-hook escape, split the
+> 438 KB plugin, freeze interfaces, provide one `./ci` / `make check`, pin the
+> environment, and run a large immutable corpus. Only if the pipeline beats simpler
+> baselines on false-VERIFIED and solved-tasks-per-CPU is it an empirical result rather
+> than only an interesting engineering construction.
+
+This is project policy.
+
+### Moratorium rules
+
+1. No new model, agent, planner, vector DB, embeddings, PageRank, learned routing,
+   backend rewrite or semantic authority source without corpus evidence.
+2. Scout ranking, Impact and semantic-shadow behavior are frozen except for reproduced
+   correctness bugs.
+3. Compiler / Executor / Verifier authority contracts are frozen except for reproduced
+   correctness bugs.
+4. Model-facing interfaces are frozen after the current action-routing correction.
+5. No model/search/mutation budget increase without benchmark evidence.
+6. Every FAIL is classified first:
+   architecture / implementation / benchmark / telemetry / environment.
+7. Existing immutable corpus versions are never edited; create a new version.
+8. Git hooks are convenience only. `./ci` is the authority.
+9. Component improvements are rejected if they do not improve the product.
+
+## Trust boundaries
+
+### Governor
+Owns model-call, search, wall-clock, no-progress and mutation-attempt budgets.
+Initial patch + at most one semantic repair remains the limit.
+
+### Scout
+Read-only. It localizes, ranks, builds Impact hypotheses, validates source evidence and
+persists strong fingerprints. It does not mutate.
+
+### Mutation capabilities
+Replace and rename are independent authorities.
+
+- bounded replace authority: local preauthorized candidate capability;
+- rename authority: `scout-rename-target-v2`, requiring complete exact identifier evidence,
+  a unique structural definition and fresh source fingerprint.
+
+File, old symbol, mutation kind and scope remain capability-derived.
+
+### Deterministic mutation-action router
+
+Evidence from the Django and TypeScript real-repository probes showed a correct sealed
+rename target while the model was still offered both `execute_replace_node` and
+`execute_rename_symbol`. The model then chose replace and safely failed downstream.
+
+This is an Orchestrator bug.
+
+Permanent invariant:
+
+```text
+model-visible mutation actions <= 1
+```
+
+Task text may select between already-issued capabilities, but it cannot create authority.
+`task-context-v1` is the correctness boundary: one synchronous user-turn snapshot provides
+turn identity, bounded canonical task text, SHA-256 provenance and tri-state routing intent
+(`rename_symbol | generic_edit | unknown`). The snapshot is latched once per turn. Missing
+later host context cannot rewrite it; same-turn text-hash drift fails closed.
+
+The host adapter accepts only explicitly tested text shapes and never recursively scrapes
+unknown objects. Unsupported shapes, oversized task payloads and incomplete rename commands
+become `unknown`, which exposes no mutation tool. Adding a host shape requires a sanitized
+fixture and an adapter protocol bump.
+
+`rename_symbol` plus sealed rename authority exposes only `execute_rename_symbol`.
+`generic_edit` plus bounded replace authority exposes only `execute_replace_node`.
+Repair remains action-sticky. The frontier resolver is pure: it computes intent ∩ capability.
+
+### Compiler
+Deterministically lowers semantic mutation intent into bounded physical edits.
+
+### Executor
+Mutates only an isolated worktree. Main checkout must remain unchanged.
+
+### Verifier
+Independently replays and re-derives proof obligations. Compiler authority is not verifier
+authority.
+
+### Terminal outcome adapter
+
+Host process exit status is transport telemetry, not semantic proof.
+
+Canonical states:
+
+```text
+VERIFIED
+SAFE_FAIL
+ENV_FAIL
+TRANSPORT_FAIL
+```
+
+`VERIFIED` requires a valid patch receipt and passing verification receipt.
+
+## Stabilization packages
+
+### S1 — deterministic mutation routing
+PASS:
+- both capabilities + explicit rename → rename only;
+- ordinary bounded edit → replace only;
+- repair cannot switch action;
+- frontier cardinality never exceeds one.
+
+### S2 — split the 438 KB plugin without behavior rewrite
+`cpu-search.ts` remains the runtime entrypoint. Its source is partitioned mechanically at
+top-level function boundaries into content-addressed fragments. `build-plugin.py --check`
+must prove byte-for-byte reconstruction.
+
+The split is not permission for semantic refactoring.
+
+### S3 — freeze interfaces
+`contracts/interfaces-v1.json` freezes model-facing tool names, required fields, protocol
+names and budgets. CI fails on silent ABI drift.
+
+### S4 — one check entrypoint
+
+```text
+./ci quick
+./ci full
+./ci env
+./ci corpus
+make check
+```
+
+Tracked Git hooks call `./ci quick`; hosted CI calls the same entrypoint. `--no-verify`
+can bypass a hook, therefore hooks are never treated as the release authority.
+
+### S5 — pin benchmark environment
+The benchmark lock records the exact Python, Node, Git, ripgrep, Rust/Cargo and OpenCode
+versions used for corpus results. Environment mismatch is `ENV_FAIL`, not product FAIL.
+
+### S6 — immutable corpus and baseline scoring
+Corpus versions are content-addressed. Primary metrics:
+
+```text
+false_verified
+verified_tasks
+cpu_seconds
+solved_tasks_per_cpu
+model_calls
+wall_seconds
+```
+
+The architecture exits the moratorium only if it beats simpler baselines on the fixed
+corpus without increasing false VERIFIED.
+
+## Evidence-backed gaps
+
+1. Action selection was still delegated to the model when both mutation capabilities existed.
+2. CLI exit status and proof receipts can disagree.
+3. `cpu-search.ts` reached about 438 KB.
+4. Historical benchmarks encode stale interface assumptions.
+5. Local hook checks are bypassable.
+6. Corpus and benchmark environment were not one immutable identity.
+7. End-to-end latency is dominated by model/host time, not deterministic search.
+
+## Frozen / postponed
+
+Until corpus evidence says otherwise:
+
+- no new Scout ranking method;
+- no semantic resolver promotion from shadow authority;
+- no Compiler / Executor / Verifier rewrite;
+- no extra models or agents;
+- no embeddings/vector DB/PageRank;
+- no unlimited repair;
+- no budget increases.
+
+## Benchmark policy
+
+Synthetic gates prove invariants.
+Real-repository gates prove usefulness.
+Adversarial gates prove safe failure.
+
+Required stabilization matrix:
+
+| Gate | PASS |
+| --- | --- |
+| action frontier | <= 1 mutation tool |
+| explicit rename | rename only |
+| normal bounded edit | replace only |
+| repair stickiness | action unchanged |
+| ambiguous rename | SAFE_FAIL |
+| stale capability | SAFE_FAIL |
+| invalid candidate | SAFE_FAIL |
+| bounded replace corpus | VERIFIED where supported |
+| Django rename | VERIFIED |
+| TypeScript rename | VERIFIED |
+| terminal outcome | receipt authority separated from CLI transport |
+| interface freeze | no silent ABI drift |
+| plugin reconstruction | byte-identical |
+| corpus lock | exact content hashes |
+
+## Promotion criterion
+
+```text
+low false-VERIFIED
++
+higher solved-tasks-per-CPU than simpler baselines
++
+bounded model calls/context
++
+safe failure under ambiguity
+```
+
+If the system does not satisfy this, simplify it. Do not add another layer.

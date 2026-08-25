@@ -189,7 +189,14 @@ let runtimeStackManifestCache = null
 // v2.15-B: explicit causal controller. The model never chooses between tools
 // when deterministic preconditions already identify the only valid next action.
 const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
-const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.4-permission-scoped"
+const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
+const TASK_CONTEXT_PROTOCOL = "task-context-v1"
+const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
+const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
+const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
+const TASK_CONTEXT_MAX_PARTS = 64
+const TASK_CONTEXT_MAX_REPORTED_PART_TYPES = 16
+const TASK_CONTEXT_MAX_REPORTED_SOURCES = 8
 const EDIT_CAPSULE_PROTOCOL = "edit-capsule-v1"
 const EDIT_CAPSULE_RENDER_CONTRACT = "transactional-scope-v1"
 const PROOF_OBLIGATION_PROTOCOL = "proof-obligation-v1"
@@ -2529,6 +2536,18 @@ function getSessionState(sessionID) {
       contractFailureSignatures: new Set(),
       contractFailures: 0,
       activeMutationTool: null,
+      taskContextProtocol: TASK_CONTEXT_PROTOCOL,
+      taskContextAdapterProtocol: TASK_CONTEXT_ADAPTER_PROTOCOL,
+      taskContextLatched: false,
+      taskTurnID: null,
+      taskTextSha256: null,
+      taskTextBytes: 0,
+      taskTextSources: [],
+      taskContextShape: null,
+      taskContextReason: "unresolved",
+      taskContextDrift: false,
+      mutationIntent: "unknown",
+      mutationIntentReason: "unresolved",
       visibleToolSchemaSha256: null,
       patchAccepted: false,
       patchReceiptPath: null,
@@ -2585,6 +2604,18 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.contractFailureSignatures.clear()
   state.contractFailures = 0
   state.activeMutationTool = null
+  state.taskContextProtocol = TASK_CONTEXT_PROTOCOL
+  state.taskContextAdapterProtocol = TASK_CONTEXT_ADAPTER_PROTOCOL
+  state.taskContextLatched = false
+  state.taskTurnID = null
+  state.taskTextSha256 = null
+  state.taskTextBytes = 0
+  state.taskTextSources = []
+  state.taskContextShape = null
+  state.taskContextReason = "unresolved"
+  state.taskContextDrift = false
+  state.mutationIntent = "unknown"
+  state.mutationIntentReason = "unresolved"
   state.visibleToolSchemaSha256 = null
   state.patchAccepted = false
   state.patchReceiptPath = null
@@ -2619,27 +2650,22 @@ function allowedToolsForExecutionState(executionState) {
   return []
 }
 
-function mutationToolsForState(state) {
+function resolveMutationActionForState(state) {
   if (
     state?.executionState !== EXEC_STATE_MUTATE &&
     state?.executionState !== EXEC_STATE_REPAIR
   ) {
-    return []
+    return { tool: null, reason: "not_mutation_state" }
   }
 
-  const tools = []
   const capability = state?.localMutationCapability ?? null
-
-  if (
+  const replaceReady =
     capability?.replaceNodeReady === true &&
     Array.isArray(state?.localMutationCandidates) &&
     state.localMutationCandidates.length > 0
-  ) {
-    tools.push(EXECUTE_REPLACE_NODE_TOOL)
-  }
 
   const renameCapability = state?.renameMutationCapability ?? null
-  if (
+  const renameReady =
     renameCapability?.protocol === SCOUT_RENAME_TARGET_PROTOCOL &&
     renameCapability?.ready === true &&
     renameCapability?.globalReady === true &&
@@ -2647,11 +2673,38 @@ function mutationToolsForState(state) {
     renameCapability?.sourceHandoffPath === state?.scoutHandoffPath &&
     typeof state?.scoutHandoffPath === "string" &&
     state.scoutHandoffPath.length > 0
+
+  if (
+    state.executionState === EXEC_STATE_REPAIR &&
+    typeof state.activeMutationTool === "string"
   ) {
-    tools.push(EXECUTE_RENAME_SYMBOL_TOOL)
+    if (state.activeMutationTool === EXECUTE_RENAME_SYMBOL_TOOL && renameReady) {
+      return { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "repair_sticky_rename" }
+    }
+    if (state.activeMutationTool === EXECUTE_REPLACE_NODE_TOOL && replaceReady) {
+      return { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "repair_sticky_replace" }
+    }
+    return { tool: null, reason: "repair_capability_unavailable" }
   }
 
-  return tools
+  if (state?.mutationIntent === "rename_symbol") {
+    return renameReady
+      ? { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "rename_intent_authorized" }
+      : { tool: null, reason: "rename_capability_unavailable" }
+  }
+
+  if (state?.mutationIntent === "generic_edit") {
+    return replaceReady
+      ? { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "generic_edit_authorized" }
+      : { tool: null, reason: "replace_capability_unavailable" }
+  }
+
+  return { tool: null, reason: "mutation_intent_unknown" }
+}
+
+function mutationToolsForState(state) {
+  const resolution = resolveMutationActionForState(state)
+  return resolution.tool ? [resolution.tool] : []
 }
 
 function allowedToolsForState(state) {
@@ -10188,27 +10241,362 @@ function normalizePublicEvent(raw) {
   return raw
 }
 
-function turnIDFromContext(event) {
+function taskContextValueKind(value) {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+function taskContextPartTypes(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  const seen = new Set()
+  for (const part of value) {
+    const type = typeof part?.type === "string" ? part.type : taskContextValueKind(part)
+    if (seen.has(type)) continue
+    seen.add(type)
+    out.push(type)
+    if (out.length >= TASK_CONTEXT_MAX_REPORTED_PART_TYPES) break
+  }
+  return out
+}
+
+function normalizeTaskTextChunk(value, source) {
+  if (typeof value !== "string") {
+    return {
+      ok: false,
+      reason: "task_text_chunk_not_string",
+      text: "",
+      source,
+    }
+  }
+
+  const raw = value.trim()
+  if (!raw) {
+    return {
+      ok: false,
+      reason: "task_text_chunk_empty",
+      text: "",
+      source,
+    }
+  }
+
+  // Real OpenCode context evidence shows content text parts may carry one
+  // JSON-string serialization layer. Decode exactly one layer only for this
+  // versioned host representation. Never recursively parse arbitrary values.
+  if (
+    source === "content_text_part_text" &&
+    raw.startsWith('"')
+  ) {
+    let decoded = null
+
+    try {
+      decoded = JSON.parse(raw)
+    } catch {
+      return {
+        ok: false,
+        reason: "task_text_representation_invalid",
+        text: "",
+        source,
+      }
+    }
+
+    if (typeof decoded !== "string") {
+      return {
+        ok: false,
+        reason: "task_text_representation_not_string",
+        text: "",
+        source,
+      }
+    }
+
+    const text = decoded.trim()
+    if (!text) {
+      return {
+        ok: false,
+        reason: "task_text_chunk_empty",
+        text: "",
+        source: "content_text_part_text_json_string",
+      }
+    }
+
+    return {
+      ok: true,
+      reason: "task_text_json_string_decoded",
+      text,
+      source: "content_text_part_text_json_string",
+    }
+  }
+
+  return {
+    ok: true,
+    reason: "task_text_plain",
+    text: raw,
+    source,
+  }
+}
+
+function extractUserMessageText(message) {
+  if (!message || message.role !== "user") {
+    return {
+      ok: false,
+      reason: "not_user_message",
+      text: "",
+      textBytes: 0,
+      sources: [],
+      shape: null,
+    }
+  }
+
+  const chunks = []
+  const sources = []
+  const seenChunks = new Set()
+  let partBudgetExceeded = false
+  let representationFailure = null
+
+  const add = (value, source) => {
+    if (typeof value !== "string") return
+
+    const normalized = normalizeTaskTextChunk(value, source)
+
+    if (!normalized.ok) {
+      if (
+        normalized.reason === "task_text_representation_invalid" ||
+        normalized.reason === "task_text_representation_not_string"
+      ) {
+        representationFailure ??= normalized.reason
+      }
+      return
+    }
+
+    const text = normalized.text
+    if (!text || seenChunks.has(text)) return
+
+    seenChunks.add(text)
+    chunks.push(text)
+
+    if (
+      sources.length < TASK_CONTEXT_MAX_REPORTED_SOURCES &&
+      !sources.includes(normalized.source)
+    ) {
+      sources.push(normalized.source)
+    }
+  }
+
+  const readTextParts = (value, family) => {
+    if (!Array.isArray(value)) return
+
+    if (value.length > TASK_CONTEXT_MAX_PARTS) {
+      partBudgetExceeded = true
+      return
+    }
+
+    for (const part of value) {
+      if (part?.type !== "text") continue
+
+      if (family === "content") {
+        add(part?.text, "content_text_part_text")
+        add(part?.content, "content_text_part_content")
+      } else {
+        add(part?.text, "parts_text")
+        add(part?.content, "parts_content")
+      }
+    }
+  }
+
+  if (typeof message.content === "string") {
+    add(message.content, "content_string")
+  } else {
+    readTextParts(message.content, "content")
+  }
+
+  readTextParts(message.parts, "parts")
+  add(message.text, "message_text")
+
+  const shape = {
+    content_kind: taskContextValueKind(message.content),
+    content_part_types: taskContextPartTypes(message.content),
+    parts_kind: taskContextValueKind(message.parts),
+    parts_part_types: taskContextPartTypes(message.parts),
+    has_message_text: typeof message.text === "string",
+  }
+
+  if (partBudgetExceeded) {
+    return {
+      ok: false,
+      reason: "task_part_budget_exceeded",
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  if (representationFailure) {
+    return {
+      ok: false,
+      reason: representationFailure,
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  if (chunks.length < 1) {
+    return {
+      ok: false,
+      reason: "user_task_text_unavailable",
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  const text = chunks.join("\n")
+  const textBytes = Buffer.byteLength(text, "utf8")
+
+  if (textBytes > TASK_CONTEXT_MAX_TEXT_BYTES) {
+    return {
+      ok: false,
+      reason: "task_text_budget_exceeded",
+      text: "",
+      textBytes,
+      sources,
+      shape,
+    }
+  }
+
+  return {
+    ok: true,
+    reason: "task_text_observed",
+    text,
+    textBytes,
+    sources,
+    shape,
+  }
+}
+
+function classifyMutationIntent(text) {
+  const value = String(text ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
+  if (!value) return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"empty_task" }
+
+  const explicitEnglishRename = /(?:^|[.!?]\s*)(?:please\s+)?rename\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
+  const explicitEnglishChangeName = /\bchange\s+(?:the\s+)?(?:name|identifier)\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
+  const explicitRussianRename = /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?]).{1,180}?(?:\sв\s|\sна\s|->|→)/iu
+
+  if (explicitEnglishRename.test(value) || explicitEnglishChangeName.test(value) || explicitRussianRename.test(value)) {
+    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"rename_symbol", reason:"explicit_rename_with_destination" }
+  }
+
+  const lower = value.toLowerCase()
+  const negativeRename =
+    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
+    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
+    /(?:^|\s)(?:не|без)\s+переимен/iu.test(lower)
+  const incompleteImperativeRename =
+    /(?:^|[.!?]\s*)(?:please\s+)?rename\b/iu.test(value) ||
+    /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?])/iu.test(value) ||
+    /\bchange\s+(?:the\s+)?(?:name|identifier)\b/iu.test(value)
+
+  if (incompleteImperativeRename && !negativeRename) {
+    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"rename_intent_incomplete" }
+  }
+  return {
+    protocol:MUTATION_INTENT_PROTOCOL,
+    kind:"generic_edit",
+    reason: negativeRename ? "non_rename_task_with_negative_rename_constraint" : "generic_edit_task",
+  }
+}
+
+function userTurnSnapshotFromContext(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : []
   let userOrdinal = 0
   let lastUser = null
-
   for (const message of messages) {
     if (message?.role !== "user") continue
     userOrdinal += 1
     lastUser = message
   }
-
-  if (!lastUser) return null
-
+  if (!lastUser) {
+    return { protocol:TASK_CONTEXT_PROTOCOL, adapter_protocol:TASK_CONTEXT_ADAPTER_PROTOCOL, ok:false, turnID:null, reason:"user_message_missing", text:"", textSha256:null, textBytes:0, sources:[], shape:null }
+  }
   const id =
     (typeof lastUser.id === "string" && lastUser.id) ||
     (typeof lastUser.messageID === "string" && lastUser.messageID) ||
     (typeof lastUser.metadata?.messageID === "string" && lastUser.metadata.messageID) ||
     null
+  const turnID = id ? `user:${id}` : `user-ordinal:${userOrdinal}`
+  const extracted = extractUserMessageText(lastUser)
+  return {
+    protocol:TASK_CONTEXT_PROTOCOL,
+    adapter_protocol:TASK_CONTEXT_ADAPTER_PROTOCOL,
+    ok: extracted.ok === true,
+    turnID,
+    reason: extracted.reason,
+    text: extracted.ok === true ? extracted.text : "",
+    textSha256: extracted.ok === true ? createHash("sha256").update(extracted.text).digest("hex") : null,
+    textBytes: extracted.textBytes,
+    sources: extracted.sources,
+    shape: extracted.shape,
+  }
+}
 
-  if (id) return `user:${id}`
-  return `user-ordinal:${userOrdinal}`
+function latchTaskContextForTurn(state, snapshot) {
+  if (!state) return { ok:false, reason:"state_unavailable" }
+
+  if (state.taskContextLatched === true && state.taskTurnID === state.turnID) {
+    if (
+      snapshot?.turnID === state.taskTurnID &&
+      snapshot?.ok === true &&
+      typeof state.taskTextSha256 === "string" &&
+      snapshot.textSha256 !== state.taskTextSha256
+    ) {
+      state.taskContextDrift = true
+      state.taskContextReason = "task_text_drift_same_turn"
+      state.mutationIntent = "unknown"
+      state.mutationIntentReason = "task_text_drift_same_turn"
+      return { ok:false, reason:"task_text_drift_same_turn", drift:true }
+    }
+    return { ok:true, reason:"task_context_already_latched", drift:state.taskContextDrift === true }
+  }
+
+  state.taskContextProtocol = TASK_CONTEXT_PROTOCOL
+  state.taskContextAdapterProtocol = TASK_CONTEXT_ADAPTER_PROTOCOL
+  state.taskContextLatched = true
+  state.taskTurnID = state.turnID
+  state.taskTextSha256 = null
+  state.taskTextBytes = snapshot?.textBytes ?? 0
+  state.taskTextSources = Array.isArray(snapshot?.sources) ? snapshot.sources.slice(0, TASK_CONTEXT_MAX_REPORTED_SOURCES) : []
+  state.taskContextShape = snapshot?.shape ?? null
+  state.taskContextDrift = false
+
+  if (snapshot?.turnID && state.turnID && snapshot.turnID !== state.turnID) {
+    state.taskContextReason = "task_turn_mismatch"
+    state.mutationIntent = "unknown"
+    state.mutationIntentReason = "task_turn_mismatch"
+    return { ok:false, reason:"task_turn_mismatch" }
+  }
+
+  if (snapshot?.ok !== true) {
+    state.taskContextReason = snapshot?.reason ?? "user_task_text_unavailable"
+    state.mutationIntent = "unknown"
+    state.mutationIntentReason = state.taskContextReason
+    return { ok:false, reason:state.taskContextReason }
+  }
+
+  const intent = classifyMutationIntent(snapshot.text)
+  state.taskTextSha256 = snapshot.textSha256
+  state.taskTextBytes = snapshot.textBytes
+  state.taskContextReason = snapshot.reason
+  state.mutationIntent = intent.kind
+  state.mutationIntentReason = intent.reason
+  return { ok:intent.kind !== "unknown", reason:intent.reason, intent:intent.kind }
+}
+
+function turnIDFromContext(event) {
+  return userTurnSnapshotFromContext(event).turnID
 }
 
 function usageFromTokens(tokens) {
@@ -12720,6 +13108,20 @@ export default {
               execution_state: state?.executionState ?? null,
               execution_reason: state?.executionReason ?? null,
               execution_event: state?.executionEvent ?? null,
+              task_context_protocol: state?.taskContextProtocol ?? TASK_CONTEXT_PROTOCOL,
+              task_context_adapter_protocol: state?.taskContextAdapterProtocol ?? TASK_CONTEXT_ADAPTER_PROTOCOL,
+              task_turn_id: state?.taskTurnID ?? null,
+              task_text_sha256: state?.taskTextSha256 ?? null,
+              task_text_bytes: state?.taskTextBytes ?? null,
+              task_text_sources: state?.taskTextSources ?? [],
+              task_context_reason: state?.taskContextReason ?? null,
+              task_context_drift: state?.taskContextDrift === true,
+              mutation_intent_protocol: MUTATION_INTENT_PROTOCOL,
+              mutation_intent_router_protocol: "mutation-intent-router-v1.1-task-context",
+              mutation_intent: state?.mutationIntent ?? "unknown",
+              mutation_intent_reason: state?.mutationIntentReason ?? null,
+              mutation_action_frontier: mutationFrontier,
+              mutation_action_reason: resolveMutationActionForState(state).reason,
               next_action: nextActionForExecutionState(state),
               candidate_files: rankedFiles.length,
               lexical_candidate_files: lexicalRankedFiles.length,
@@ -13538,15 +13940,18 @@ export default {
 
       const root = await rootFromSession(ctx, sessionID, state)
 
-      // Derive the user-turn boundary synchronously from the exact model
-      // context. The async public event stream is telemetry, not a correctness
-      // dependency, so a slow/dropped SSE event cannot reset budgets mid-turn.
-      const contextTurnID = turnIDFromContext(event)
+      // Derive turn identity and routing semantics from one synchronous,
+      // versioned snapshot. Async public events remain telemetry only.
+      const taskContextSnapshot = userTurnSnapshotFromContext(event)
+      const contextTurnID = taskContextSnapshot.turnID
+
       if (contextTurnID && state.turnID !== contextTurnID) {
         resetTurnState(state, contextTurnID, nowMs())
       } else if (!state.turnID) {
         resetTurnState(state, `implicit:${sessionID}:${nowMs()}`, nowMs())
       }
+
+      latchTaskContextForTurn(state, taskContextSnapshot)
 
       const materializedToolNames = Object.keys(event.tools).sort()
       const requiredSurface = ["search", ...MUTATION_TOOL_NAMES]
@@ -13660,6 +14065,10 @@ export default {
                 Array.isArray(message?.parts)
                   ? message.parts.length
                   : null,
+              content_kind: taskContextValueKind(message?.content),
+              content_part_types: taskContextPartTypes(message?.content),
+              parts_part_types: taskContextPartTypes(message?.parts),
+              has_message_text: typeof message?.text === "string",
             }))
           : []
       } catch {
@@ -13672,6 +14081,17 @@ export default {
         kind: "model_dispatch",
         sessionID,
         turnID: state.turnID,
+        task_context_protocol: state.taskContextProtocol ?? TASK_CONTEXT_PROTOCOL,
+        task_context_adapter_protocol: state.taskContextAdapterProtocol ?? TASK_CONTEXT_ADAPTER_PROTOCOL,
+        task_turn_id: state.taskTurnID,
+        task_text_sha256: state.taskTextSha256,
+        task_text_bytes: state.taskTextBytes,
+        task_text_sources: state.taskTextSources,
+        task_context_reason: state.taskContextReason,
+        task_context_drift: state.taskContextDrift === true,
+        mutation_intent_protocol: MUTATION_INTENT_PROTOCOL,
+        mutation_intent: state.mutationIntent,
+        mutation_intent_reason: state.mutationIntentReason,
         project_root: root,
         agent: event.agent ?? null,
         providerID: event.model?.providerID ?? null,

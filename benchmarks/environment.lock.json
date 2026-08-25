@@ -1,0 +1,11 @@
+{
+  "cargo": "cargo 1.88.0 (873a06493 2025-05-10)",
+  "git": "git version 2.53.0",
+  "node": "v24.19.0",
+  "opencode2": "opencode2 v0.0.0-beta-18155",
+  "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+  "protocol": "benchmark-environment-lock-v1",
+  "python": "Python 3.14.4",
+  "ripgrep": "ripgrep 15.1.0",
+  "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)"
+}

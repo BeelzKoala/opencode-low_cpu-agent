@@ -1,0 +1,51 @@
+{
+  "budgets": {
+    "executed_searches_per_turn": 4,
+    "model_calls_per_turn": 4,
+    "mutation_attempts_per_turn": 2
+  },
+  "model_tools": {
+    "execute_rename_symbol": {
+      "forbidden": [
+        "kind",
+        "file",
+        "symbol",
+        "scope"
+      ],
+      "required": [
+        "new_name"
+      ]
+    },
+    "execute_replace_node": {
+      "forbidden": [
+        "kind",
+        "file",
+        "symbol",
+        "scope"
+      ],
+      "required": [
+        "before",
+        "replacement"
+      ]
+    },
+    "search": {
+      "required": [
+        "queries"
+      ]
+    }
+  },
+  "protocol": "interface-freeze-v1",
+  "protocols": {
+    "candidate_validity": "candidate-validity-v1",
+    "invariant_verifier": "invariant-verifier-v2",
+    "local_capability": "scout-local-capability-v1",
+    "mutation_confinement": "mutation-slice-v1",
+    "mutation_tool_abi": "capability-mutation-tools-v2",
+    "patch_compiler": "patch-compiler-v2",
+    "patch_executor": "patch-executor-v3",
+    "rename_target": "scout-rename-target-v2",
+    "scout_handoff": "scout-handoff-v1",
+    "tool_frontier": "causal-tool-frontier-v2.5-deterministic-action"
+  },
+  "status": "frozen_after_stabilization"
+}

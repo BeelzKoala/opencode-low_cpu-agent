@@ -1,0 +1,41 @@
+{
+  "adapter_protocol": "task-context-adapter-v1.1-json-string",
+  "authority": "routing_only",
+  "extension_policy": {
+    "grammar_change_requires_intent_protocol_bump": true,
+    "new_host_shape_requires_adapter_protocol_bump": true,
+    "new_host_shape_requires_fixture": true,
+    "representation_change_requires_adapter_protocol_bump": true
+  },
+  "intent_protocol": "mutation-intent-grammar-v1",
+  "intent_values": [
+    "rename_symbol",
+    "generic_edit",
+    "unknown"
+  ],
+  "limits": {
+    "max_parts_per_container": 64,
+    "max_reported_part_types": 16,
+    "max_reported_sources": 8,
+    "max_text_bytes": 16384
+  },
+  "protocol": "task-context-v1",
+  "recognized_text_sources": [
+    "content_string",
+    "content_text_part_text",
+    "content_text_part_content",
+    "parts_text",
+    "parts_content",
+    "message_text",
+    "content_text_part_text_json_string"
+  ],
+  "rules": {
+    "intent_latched_once_per_turn": true,
+    "raw_task_text_logged": false,
+    "repair_action_sticky": true,
+    "same_turn_text_hash_drift_forces_unknown": true,
+    "task_text_creates_authority": false,
+    "unknown_is_fail_closed": true,
+    "unsupported_shapes_recursively_scraped": false
+  }
+}

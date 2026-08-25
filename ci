@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+MODE="${1:-quick}"
+
+quick() {
+  git diff --check
+  git diff --cached --check
+  python3 scripts/build-plugin.py --check
+  python3 scripts/check-interface-freeze.py
+  python3 benchmarks/runtime/v2.25-stabilization-action-routing.py
+  python3 benchmarks/runtime/v2.25-task-context-v1.py
+  python3 benchmarks/corpus/v1/check.py
+  node --check opencode/plugins/cpu-search.ts
+  echo "PASS ci quick"
+}
+
+full() {
+  quick
+  cargo test --manifest-path rust/evidence-distiller/Cargo.toml --all-targets
+  bash scripts/release-hygiene.sh
+  echo "PASS ci full"
+}
+
+envcheck() {
+  python3 - <<'PY'
+from pathlib import Path
+import json
+import platform
+import subprocess
+
+lock = json.loads(Path("benchmarks/environment.lock.json").read_text())
+
+def command(argv):
+    try:
+        p = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        return p.stdout.splitlines()[0].strip() if p.stdout else f"rc={p.returncode}"
+    except FileNotFoundError:
+        return "unavailable"
+
+current = {
+    "platform": platform.platform(),
+    "python": command(["python3", "--version"]),
+    "node": command(["node", "--version"]),
+    "git": command(["git", "--version"]),
+    "ripgrep": command(["rg", "--version"]),
+    "rustc": command(["rustc", "--version"]),
+    "cargo": command(["cargo", "--version"]),
+    "opencode2": command([str(Path.home()/".opencode/bin/opencode2"), "--version"]),
+}
+mismatch = {
+    key: (lock.get(key), value)
+    for key, value in current.items()
+    if lock.get(key) != value
+}
+if mismatch:
+    print(json.dumps({
+        "protocol": "benchmark-environment-lock-v1",
+        "status": "ENV_FAIL",
+        "mismatch": mismatch,
+    }, indent=2))
+    raise SystemExit(1)
+print("PASS benchmark environment exact")
+PY
+}
+
+corpus() {
+  quick
+  python3 - <<'PY'
+from pathlib import Path
+import hashlib
+import json
+
+root = Path("benchmarks/corpus/v1")
+lock = json.loads((root / "corpus.lock.json").read_text())
+for name, record in lock["files"].items():
+    body = (root / name).read_bytes()
+    assert len(body) == record["bytes"], name
+    assert hashlib.sha256(body).hexdigest() == record["sha256"], name
+print("PASS immutable corpus content lock")
+PY
+}
+
+case "$MODE" in
+  quick) quick ;;
+  full) full ;;
+  env) envcheck ;;
+  corpus) corpus ;;
+  *) echo "usage: ./ci {quick|full|env|corpus}" >&2; exit 2 ;;
+esac

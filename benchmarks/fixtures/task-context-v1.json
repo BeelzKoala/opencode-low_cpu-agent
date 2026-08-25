@@ -1,0 +1,225 @@
+{
+  "cases": [
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Rename helper foo to bar.",
+            "id": "u1",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "content-string-rename",
+      "intent": "rename_symbol",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Please rename helper foo as bar.",
+                "type": "text"
+              }
+            ],
+            "messageID": "u2",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "content-array-rename",
+      "intent": "rename_symbol",
+      "source": "content_text_part_text"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "metadata": {
+              "messageID": "u3"
+            },
+            "parts": [
+              {
+                "text": "Переименуй helper foo в bar.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ]
+      },
+      "id": "parts-russian-rename",
+      "intent": "rename_symbol",
+      "source": "parts_text"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Переименуйте helper foo: в bar.",
+            "id": "u3b",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "content-russian-rename-punct",
+      "intent": "rename_symbol",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Переименуй helper foo.",
+            "id": "u3c",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "content-russian-incomplete-rename",
+      "intent": "unknown",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Измени порог с 50 до 75 без переименования API.",
+            "id": "u3d",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "content-russian-negative-rename",
+      "intent": "generic_edit",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "id": "u4",
+            "role": "user",
+            "text": "Change the name of foo to bar."
+          }
+        ]
+      },
+      "id": "message-text-rename",
+      "intent": "rename_symbol",
+      "source": "message_text"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Change threshold from 50 to 75.",
+            "id": "u5",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "ordinary-edit",
+      "intent": "generic_edit",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Change threshold from 50 to 75 without renaming public APIs.",
+            "id": "u6",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "negative-rename",
+      "intent": "generic_edit",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Fix the rename handling bug in this helper.",
+            "id": "u7",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "rename-noun",
+      "intent": "generic_edit",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": "Rename helper foo.",
+            "id": "u8",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "incomplete-rename",
+      "intent": "unknown",
+      "source": "content_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": {
+              "prompt": "Rename foo to bar"
+            },
+            "id": "u9",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "unknown-object",
+      "intent": "unknown",
+      "source": null
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "\"Rename helper foo to bar.\"",
+                "type": "text"
+              }
+            ],
+            "id": "json-r1",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "observed-content-array-json-string-rename",
+      "intent": "rename_symbol",
+      "source": "content_text_part_text_json_string"
+    },
+    {
+      "event": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "\"Change threshold from 50 to 75.\"",
+                "type": "text"
+              }
+            ],
+            "id": "json-g1",
+            "role": "user"
+          }
+        ]
+      },
+      "id": "observed-content-array-json-string-generic-edit",
+      "intent": "generic_edit",
+      "source": "content_text_part_text_json_string"
+    }
+  ],
+  "protocol": "task-context-fixtures-v1"
+}
