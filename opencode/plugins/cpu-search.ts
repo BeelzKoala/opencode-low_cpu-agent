@@ -193,6 +193,8 @@ const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
 const TASK_CONTEXT_PROTOCOL = "task-context-v1"
 const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
+const TASK_ACTION_PROTOCOL = "task-action-v1"
+const TASK_SEARCH_PLAN_PROTOCOL = "task-search-plan-v1"
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
 const TASK_CONTEXT_MAX_PARTS = 64
 const TASK_CONTEXT_MAX_REPORTED_PART_TYPES = 16
@@ -2546,6 +2548,7 @@ function getSessionState(sessionID) {
       taskContextShape: null,
       taskContextReason: "unresolved",
       taskContextDrift: false,
+      taskAction: null,
       mutationIntent: "unknown",
       mutationIntentReason: "unresolved",
       visibleToolSchemaSha256: null,
@@ -2614,6 +2617,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskContextShape = null
   state.taskContextReason = "unresolved"
   state.taskContextDrift = false
+  state.taskAction = null
   state.mutationIntent = "unknown"
   state.mutationIntentReason = "unresolved"
   state.visibleToolSchemaSha256 = null
@@ -2705,6 +2709,85 @@ function resolveMutationActionForState(state) {
 function mutationToolsForState(state) {
   const resolution = resolveMutationActionForState(state)
   return resolution.tool ? [resolution.tool] : []
+}
+
+function compileTaskSearchPlanForState(
+  state,
+  requestedQueries,
+  requestedPath = ".",
+  requestedGlob = undefined,
+) {
+  const requested = [
+    ...new Set(
+      (Array.isArray(requestedQueries) ? requestedQueries : [])
+        .filter((query) => typeof query === "string" && query.length > 0),
+    ),
+  ]
+  const fallback = {
+    protocol: TASK_SEARCH_PLAN_PROTOCOL,
+    applied: false,
+    reason: "model_search_plan",
+    task_sha256: state?.taskTextSha256 ?? null,
+    requested_queries: requested,
+    effective_queries: requested,
+    requested_path:
+      typeof requestedPath === "string" && requestedPath.length > 0
+        ? requestedPath
+        : ".",
+    effective_path:
+      typeof requestedPath === "string" && requestedPath.length > 0
+        ? requestedPath
+        : ".",
+    requested_glob:
+      typeof requestedGlob === "string" && requestedGlob.length > 0
+        ? requestedGlob
+        : null,
+    effective_glob:
+      typeof requestedGlob === "string" && requestedGlob.length > 0
+        ? requestedGlob
+        : null,
+  }
+
+  const action = state?.taskAction ?? null
+  const oldName = taskActionIdentifier(action?.old_name)
+  const newName = taskActionIdentifier(action?.new_name)
+  const exactRename =
+    state?.executionState === EXEC_STATE_LOCATE &&
+    state?.mutationIntent === "rename_symbol" &&
+    action?.protocol === TASK_ACTION_PROTOCOL &&
+    action?.status === "exact" &&
+    action?.operation === "rename_symbol" &&
+    typeof action?.task_sha256 === "string" &&
+    action.task_sha256 === state?.taskTextSha256 &&
+    oldName !== null &&
+    newName !== null &&
+    oldName !== newName
+
+  if (!exactRename) return fallback
+
+  const globalSourceGlob = buildLanguageGlob(
+    "**/*",
+    SOURCE_LANGUAGE_EXTENSIONS,
+  )
+  if (!globalSourceGlob) {
+    return {
+      ...fallback,
+      reason: "exact_rename_source_glob_unavailable",
+    }
+  }
+
+  return {
+    protocol: TASK_SEARCH_PLAN_PROTOCOL,
+    applied: true,
+    reason: "exact_global_rename_identifier",
+    task_sha256: action.task_sha256,
+    requested_queries: requested,
+    effective_queries: [oldName],
+    requested_path: fallback.requested_path,
+    effective_path: ".",
+    requested_glob: fallback.requested_glob,
+    effective_glob: globalSourceGlob,
+  }
 }
 
 function allowedToolsForState(state) {
@@ -10510,6 +10593,117 @@ function classifyMutationIntent(text) {
   }
 }
 
+function taskActionIdentifier(value) {
+  const text = String(value ?? "").trim()
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text)
+    ? text
+    : null
+}
+
+function unresolvedTaskAction(reason, taskSha256 = null) {
+  return {
+    protocol: TASK_ACTION_PROTOCOL,
+    status: "unresolved",
+    operation: null,
+    old_name: null,
+    new_name: null,
+    task_sha256:
+      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
+        ? taskSha256
+        : null,
+    reason,
+  }
+}
+
+function exactRenameTaskAction(oldName, newName, taskSha256, reason) {
+  const oldIdentifier = taskActionIdentifier(oldName)
+  const newIdentifier = taskActionIdentifier(newName)
+
+  if (!oldIdentifier || !newIdentifier || oldIdentifier === newIdentifier) {
+    return unresolvedTaskAction("task_action_identifier_invalid", taskSha256)
+  }
+
+  return {
+    protocol: TASK_ACTION_PROTOCOL,
+    status: "exact",
+    operation: "rename_symbol",
+    old_name: oldIdentifier,
+    new_name: newIdentifier,
+    task_sha256:
+      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
+        ? taskSha256
+        : null,
+    reason,
+  }
+}
+
+function compileTaskAction(value, taskSha256 = null) {
+  const text = String(value ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
+  if (!text) return unresolvedTaskAction("task_action_text_empty", taskSha256)
+
+  const negativeRename =
+    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
+    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
+    /(?:^|\s)(?:не|без)\s+переимен/iu.test(text)
+
+  if (negativeRename) {
+    return unresolvedTaskAction("task_action_negative_rename", taskSha256)
+  }
+
+  const ident = "[`'\"]?([A-Za-z_$][A-Za-z0-9_$]*)[`'\"]?"
+  const patterns = [
+    new RegExp(
+      "(?:^|[.!?]\\s*)(?:please\\s+)?rename\\b.{0,140}?" +
+      ident +
+      "\\s+(?:to|as|->|→)\\s*" +
+      ident,
+      "giu",
+    ),
+    new RegExp(
+      "(?:^|[.!?]\\s*)change\\s+(?:the\\s+)?(?:name|identifier)\\s+of\\s+" +
+      ident +
+      ".{0,40}?\\b(?:to|as)\\b\\s*" +
+      ident,
+      "giu",
+    ),
+    new RegExp(
+      "(?:^|[.!?]\\s*)(?:пожалуйста[,\\s]+)?переимен(?:уй|уйте)" +
+      "(?=\\s|$|[,:;.!?]).{0,140}?" +
+      ident +
+      "(?:\\s*[:,]?\\s*)(?:в|на|->|→)\\s*" +
+      ident,
+      "giu",
+    ),
+  ]
+
+  const pairs = new Map()
+
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const oldName = taskActionIdentifier(match[1])
+      const newName = taskActionIdentifier(match[2])
+      if (!oldName || !newName || oldName === newName) continue
+      pairs.set(`${oldName}\u0000${newName}`, { oldName, newName })
+    }
+  }
+
+  if (pairs.size < 1) {
+    return unresolvedTaskAction("task_action_not_exact", taskSha256)
+  }
+
+  if (pairs.size > 1) {
+    return unresolvedTaskAction("task_action_multiple_rename_pairs", taskSha256)
+  }
+
+  const pair = [...pairs.values()][0]
+  return exactRenameTaskAction(
+    pair.oldName,
+    pair.newName,
+    taskSha256,
+    "exact_rename_pair",
+  )
+}
+
 function userTurnSnapshotFromContext(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : []
   let userOrdinal = 0
@@ -10555,6 +10749,10 @@ function latchTaskContextForTurn(state, snapshot) {
     ) {
       state.taskContextDrift = true
       state.taskContextReason = "task_text_drift_same_turn"
+      state.taskAction = unresolvedTaskAction(
+        "task_text_drift_same_turn",
+        state.taskTextSha256,
+      )
       state.mutationIntent = "unknown"
       state.mutationIntentReason = "task_text_drift_same_turn"
       return { ok:false, reason:"task_text_drift_same_turn", drift:true }
@@ -10574,6 +10772,7 @@ function latchTaskContextForTurn(state, snapshot) {
 
   if (snapshot?.turnID && state.turnID && snapshot.turnID !== state.turnID) {
     state.taskContextReason = "task_turn_mismatch"
+    state.taskAction = unresolvedTaskAction("task_turn_mismatch")
     state.mutationIntent = "unknown"
     state.mutationIntentReason = "task_turn_mismatch"
     return { ok:false, reason:"task_turn_mismatch" }
@@ -10581,18 +10780,44 @@ function latchTaskContextForTurn(state, snapshot) {
 
   if (snapshot?.ok !== true) {
     state.taskContextReason = snapshot?.reason ?? "user_task_text_unavailable"
+    state.taskAction = unresolvedTaskAction(state.taskContextReason)
     state.mutationIntent = "unknown"
     state.mutationIntentReason = state.taskContextReason
     return { ok:false, reason:state.taskContextReason }
   }
 
   const intent = classifyMutationIntent(snapshot.text)
+  const taskAction = compileTaskAction(snapshot.text, snapshot.textSha256)
   state.taskTextSha256 = snapshot.textSha256
   state.taskTextBytes = snapshot.textBytes
   state.taskContextReason = snapshot.reason
+  state.taskAction = taskAction
+
+  if (
+    taskAction.status === "exact" &&
+    taskAction.operation !== intent.kind
+  ) {
+    state.taskAction = unresolvedTaskAction(
+      "task_action_intent_mismatch",
+      snapshot.textSha256,
+    )
+    state.mutationIntent = "unknown"
+    state.mutationIntentReason = "task_action_intent_mismatch"
+    return {
+      ok: false,
+      reason: "task_action_intent_mismatch",
+      intent: "unknown",
+    }
+  }
+
   state.mutationIntent = intent.kind
   state.mutationIntentReason = intent.reason
-  return { ok:intent.kind !== "unknown", reason:intent.reason, intent:intent.kind }
+  return {
+    ok: intent.kind !== "unknown",
+    reason: intent.reason,
+    intent: intent.kind,
+    task_action_status: state.taskAction.status,
+  }
 }
 
 function turnIDFromContext(event) {
@@ -10871,6 +11096,7 @@ export default {
           }
 
           let attemptIndex = null
+          let taskSearchPlan = null
           if (state) {
             state.searchAttempts += 1
             state.lastSeen = nowMs()
@@ -10891,6 +11117,22 @@ export default {
               turn_search_attempts: state?.searchAttempts ?? null,
               turn_executed_searches: state?.executedSearches ?? null,
               turn_evidence_bytes: state?.evidenceBytes ?? null,
+              task_search_plan_protocol:
+                taskSearchPlan?.protocol ?? TASK_SEARCH_PLAN_PROTOCOL,
+              task_search_plan_applied: taskSearchPlan?.applied ?? false,
+              task_search_plan_reason: taskSearchPlan?.reason ?? "not_compiled",
+              task_search_requested_queries:
+                taskSearchPlan?.requested_queries ?? null,
+              task_search_effective_queries:
+                taskSearchPlan?.effective_queries ?? null,
+              task_search_requested_path:
+                taskSearchPlan?.requested_path ?? null,
+              task_search_effective_path:
+                taskSearchPlan?.effective_path ?? null,
+              task_search_requested_glob:
+                taskSearchPlan?.requested_glob ?? null,
+              task_search_effective_glob:
+                taskSearchPlan?.effective_glob ?? null,
               ...extra,
             })
 
@@ -10921,19 +11163,55 @@ export default {
             }
           }
 
-          queries = [...new Set(queries)]
+          const requestedQueries = [...new Set(queries)]
+          const requestedPath =
+            typeof input?.path === "string" && input.path.length > 0
+              ? input.path
+              : "."
+          const modelRequestedGlob =
+            typeof input?.glob === "string" && input.glob.length > 0
+              ? input.glob
+              : undefined
+
+          taskSearchPlan = compileTaskSearchPlanForState(
+            state,
+            requestedQueries,
+            requestedPath,
+            modelRequestedGlob,
+          )
+          queries = taskSearchPlan.effective_queries
+
+          await writeProjectTrace(root, "search-trace.jsonl", {
+            ts: nowMs(),
+            protocol: SEARCH_PROTOCOL,
+            kind: "task_search_plan",
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            task_action_protocol: state?.taskAction?.protocol ?? null,
+            task_action_status: state?.taskAction?.status ?? null,
+            task_action_operation: state?.taskAction?.operation ?? null,
+            task_action_old_name: state?.taskAction?.old_name ?? null,
+            task_action_new_name: state?.taskAction?.new_name ?? null,
+            task_search_plan_protocol: taskSearchPlan.protocol,
+            task_search_plan_applied: taskSearchPlan.applied,
+            task_search_plan_reason: taskSearchPlan.reason,
+            task_search_requested_queries: taskSearchPlan.requested_queries,
+            task_search_effective_queries: taskSearchPlan.effective_queries,
+            task_search_requested_path: taskSearchPlan.requested_path,
+            task_search_effective_path: taskSearchPlan.effective_path,
+            task_search_requested_glob: taskSearchPlan.requested_glob,
+            task_search_effective_glob: taskSearchPlan.effective_glob,
+          })
 
           let target
           try {
-            target = await safeTarget(root, input?.path ?? ".")
+            target = await safeTarget(root, taskSearchPlan.effective_path)
           } catch (error) {
             return { content: "SEARCH_ERROR: " + String(error?.message ?? error) }
           }
 
-          const requestedGlob =
-            typeof input?.glob === "string"
-              ? input.glob
-              : undefined
+          const requestedGlob = taskSearchPlan.effective_glob ?? undefined
 
           const globResolution =
             await resolveSearchLanguageGlob(

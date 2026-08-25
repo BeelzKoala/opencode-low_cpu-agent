@@ -1,17 +1,17 @@
 {
   "entrypoint": "opencode/plugins/cpu-search.ts",
-  "entrypoint_bytes": 452266,
-  "entrypoint_sha256": "7bfc87ebbec23a0478f3db3df8fdda9dff56daa4d43c0f57b9f1dd5caa4e559d",
+  "entrypoint_bytes": 461287,
+  "entrypoint_sha256": "456d76677aa6916ca73cbce4e2bca29370f7081f234cbd81f3c482f573ec209e",
   "parts": [
     {
-      "bytes": 70171,
+      "bytes": 70273,
       "path": "opencode/plugins/cpu-search.fragments/00.part.ts",
-      "sha256": "6cd8e287e39795908b6f9047d85cf0eacc4cf62a0d7287b996b52bbace1b7c27"
+      "sha256": "92ca25e3bdc5bfe7265d75585580c6b24e4f7569c595937a8b638cacaa04697d"
     },
     {
-      "bytes": 66388,
+      "bytes": 68713,
       "path": "opencode/plugins/cpu-search.fragments/01.part.ts",
-      "sha256": "e3ba9cb576d19a190ed9b630d7e9a37e34cf2bb938638dbc31139b1ddec2bdc0"
+      "sha256": "606d0f037c5aedbeec1a94ae7c8b32a37141fba663a8f03f8158cb87d1e06639"
     },
     {
       "bytes": 65560,
@@ -24,24 +24,24 @@
       "sha256": "bb8cfa14109e516891c4f479bb79dac038b62146204ed5904b1cee4264db4d50"
     },
     {
-      "bytes": 30832,
+      "bytes": 34757,
       "path": "opencode/plugins/cpu-search.fragments/04.part.ts",
-      "sha256": "bffaf1c696a03831f39f0ddf110963603219e3bedc6a35ddc3929158767d0b97"
+      "sha256": "174522f05f4c1529e26f673178f3f12d3383d4b7ea4c19a35b5fb03297ff2ec8"
     },
     {
-      "bytes": 65570,
+      "bytes": 65573,
       "path": "opencode/plugins/cpu-search.fragments/05.part.ts",
-      "sha256": "af31ebd141db04aa5cd48dfd914bf3c220999066379cfdb39c64a3ce894a0657"
+      "sha256": "c3f698d100ce17c5dc839194612e9404002e634e80fe895c23dd4ec2106f58ab"
     },
     {
-      "bytes": 65577,
+      "bytes": 65603,
       "path": "opencode/plugins/cpu-search.fragments/06.part.ts",
-      "sha256": "982673379e326ff4c618e488f0763381254d7f62c2b35ee31ca721d7debbd181"
+      "sha256": "7a26a829b86088856ebc725f8575c48aa006c77534eee400171fc029f54e737d"
     },
     {
-      "bytes": 16916,
+      "bytes": 19556,
       "path": "opencode/plugins/cpu-search.fragments/07.part.ts",
-      "sha256": "72394f85490033dbbfcb43a2d616a0df89e5b6c69dcb4a3e4a4349e9efecd8a6"
+      "sha256": "b355b97b2ef792826abd03f71b2be44a174bdd14dc8c5a6a96b9dc6e13da1f09"
     }
   ],
   "protocol": "cpu-search-fragments-v1",

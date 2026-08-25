@@ -11,6 +11,7 @@ quick() {
   python3 scripts/check-interface-freeze.py
   python3 benchmarks/runtime/v2.25-stabilization-action-routing.py
   python3 benchmarks/runtime/v2.25-task-context-v1.py
+  python3 benchmarks/runtime/v2.27-task-action-fastpath.py
   python3 benchmarks/corpus/v1/check.py
   python3 benchmarks/corpus/v2/check.py
   node --check opencode/plugins/cpu-search.ts

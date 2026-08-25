@@ -202,10 +202,17 @@ def static_gate() -> None:
     )
 
     # Promotion boundary: shadow data does not participate in authority.
-    assert (
-        "let ok = reason.is_none() && invariants_failed == 0 && worktree_cleaned;"
-        in verifier
+    # Promotion boundary: authoritative deterministic checks may evolve,
+    # but formatting is not part of the contract and differential shadow
+    # observations must never participate in verdict.
+    verifier_ws = " ".join(verifier.split())
+    authority_formula = (
+        "let ok = reason.is_none() "
+        "&& invariants_failed == 0 "
+        "&& worktree_cleaned "
+        "&& candidate_hygiene;"
     )
+    assert authority_formula in verifier_ws, authority_formula
     assert "differential_observations.is_empty()" not in verifier
     assert "differential_observations.iter()" not in verifier
 

@@ -18,14 +18,25 @@ ast.parse(new)
 
 assert 'PROTOCOL = "real-task-benchmark-v2"' in new
 
-assert (
-    "Use only search and the single capability-derived mutation tool "
-    "exposed by the runtime."
-    in new
-)
 
 assert '"execute_replace_node"' in new
 assert '"execute_rename_symbol"' in new
+
+# Benchmark transport must preserve semantic task identity exactly.
+# Safety/tool confinement belongs to the runtime tool surface, not user text.
+assert "full_prompt = prompt" in new
+
+# Candidate hygiene has exactly one authority implementation.
+assert 'candidate_diff_check_failed' not in new
+assert 'git(worktree, "diff", "--check")' not in new
+
+for forbidden in (
+    'f"TASK:\\n{prompt}"',
+    'f"TASK: {prompt}"',
+    "Use only search and the single capability-derived mutation tool",
+    "real-task-benchmark-v2 requires a single-line task prompt",
+):
+    assert forbidden not in new, forbidden
 
 assert 'tool_records(rows, "execute_replace_node")' in new
 assert 'tool_records(rows, "execute_rename_symbol")' in new
@@ -57,7 +68,6 @@ for anchor in (
     '"patch_ready_without_passing_proofs"',
     '"candidate_not_replayable"',
     '"candidate_apply_failed"',
-    '"candidate_diff_check_failed"',
     '"task_acceptance_failed"',
     '"base_checkout_changed"',
 ):

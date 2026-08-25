@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
-use opencode_evidence_distiller::candidate_validity::validate_candidate;
 use opencode_evidence_distiller::impact_index_core::{
     SymbolClosureBinding, SymbolClosureResponse, resolve_symbol_closure,
+};
+use opencode_evidence_distiller::{
+    candidate_hygiene::audit_candidate_hygiene, candidate_validity::validate_candidate,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -143,6 +145,7 @@ struct Response {
     changed_file_set: bool,
     replay_exact: bool,
     ast_parse: bool,
+    candidate_hygiene: bool,
     candidate_validity_barrier: bool,
     candidate_validity_coverage: &'static str,
     top_level_conservation: bool,
@@ -174,6 +177,7 @@ impl Response {
         let changed_file_set = all_kind("changed_file_set");
         let replay_exact = all_kind("replay_exact");
         let ast_parse = all_kind("ast_parse");
+        let candidate_hygiene = all_kind("candidate_hygiene");
         let candidate_validity_barrier = all_kind("candidate_validity_barrier");
         let candidate_validity_coverage = {
             let mut native_enforced = false;
@@ -207,7 +211,8 @@ impl Response {
             .iter()
             .filter(|c| c.kind == "rename_global_closure")
             .all(|c| c.pass);
-        let ok = reason.is_none() && invariants_failed == 0 && worktree_cleaned;
+        let ok =
+            reason.is_none() && invariants_failed == 0 && worktree_cleaned && candidate_hygiene;
         Self {
             protocol: PROTOCOL,
             verification_protocol: VERIFICATION_PROTOCOL,
@@ -225,6 +230,7 @@ impl Response {
             changed_file_set,
             replay_exact,
             ast_parse,
+            candidate_hygiene,
             candidate_validity_barrier,
             candidate_validity_coverage,
             top_level_conservation,
@@ -1218,7 +1224,8 @@ fn verify(request: &Request) -> Result<Response> {
         let patch_file = wt.join(".opencode-v215.patch");
         fs::write(&patch_file, &request.patch).context("patch_temp_write_failed")?;
         let patch_s = patch_file.to_string_lossy().to_string();
-        run_git(&wt, &["apply", "--whitespace=error-all", &patch_s])?;
+        run_git(&wt, &["apply", "--check", &patch_s])?;
+        run_git(&wt, &["apply", &patch_s])?;
         let _ = fs::remove_file(&patch_file);
         let diff_names = run_git_output(&wt, &["diff", "--name-only", "--no-ext-diff"], false)?
             .lines()
@@ -1232,6 +1239,19 @@ fn verify(request: &Request) -> Result<Response> {
                 "actual={}",
                 diff_names.into_iter().collect::<Vec<_>>().join(",")
             )),
+        });
+
+        let hygiene_files = changed.iter().cloned().collect::<Vec<_>>();
+        let hygiene = audit_candidate_hygiene(&root, &wt, &hygiene_files)
+            .context("candidate_hygiene_failed")?;
+        checks.push(Check {
+            kind: "candidate_hygiene".to_string(),
+            pass: hygiene.ok,
+            file: None,
+            detail: Some(
+                serde_json::to_string(&hygiene)
+                    .unwrap_or_else(|_| "candidate-hygiene-v1 serialization failed".to_string()),
+            ),
         });
 
         for file in &changed {
@@ -1687,5 +1707,42 @@ mod tests {
             &after,
             "calculate_price",
         ));
+    }
+
+    #[test]
+    fn candidate_hygiene_is_mandatory_for_verified() {
+        let missing = Response::finish(
+            Instant::now(),
+            vec!["sample.ts".to_string()],
+            vec![Check {
+                kind: "replay_exact".to_string(),
+                pass: true,
+                file: Some("sample.ts".to_string()),
+                detail: None,
+            }],
+            true,
+            None,
+        );
+
+        assert!(!missing.ok);
+        assert!(!missing.candidate_hygiene);
+        assert_eq!(missing.reason.as_deref(), Some("invariant_failed"));
+
+        let failed = Response::finish(
+            Instant::now(),
+            vec!["sample.ts".to_string()],
+            vec![Check {
+                kind: "candidate_hygiene".to_string(),
+                pass: false,
+                file: Some("sample.ts".to_string()),
+                detail: Some("fixture failure".to_string()),
+            }],
+            true,
+            None,
+        );
+
+        assert!(!failed.ok);
+        assert!(!failed.candidate_hygiene);
+        assert_eq!(failed.reason.as_deref(), Some("invariant_failed"));
     }
 }

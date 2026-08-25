@@ -374,16 +374,10 @@ def run_agent(
     stdout_path: Path,
     stderr_path: Path,
 ) -> dict[str, Any]:
-    full_prompt = (
-        "Use only search and the single capability-derived mutation tool exposed by the runtime. "
-        "Do not use shell or direct filesystem mutation tools. "
-        "Treat the following as a developer task; determine localization, "
-        "affected scope and mutation yourself. "
-        "Do not ask for filenames, symbols or mutation kinds. "
-        "Use at most the bounded repair allowed by the tool. "
-        "When PATCH_READY or PATCH_STOP is returned, stop.\n\n"
-        f"TASK:\n{prompt}"
-    )
+    # Benchmark transport is identity: the product must observe exactly the
+    # semantic developer task being scored. Tool confinement is enforced by
+    # the runtime surface, not by contaminating user task text.
+    full_prompt = prompt
 
     started = time.monotonic()
 
@@ -878,15 +872,9 @@ def run_task(
             })
             return result
 
-        diff_check = git(worktree, "diff", "--check")
-
-        if diff_check["rc"] != 0:
-            result.update({
-                "result": "FALSE_VERIFIED",
-                "failure_class": "implementation_bug",
-                "reason": "candidate_diff_check_failed",
-            })
-            return result
+        # Git/EOL/whitespace validity is authoritative inside the verifier
+        # as candidate_hygiene-v1. The benchmark proves exact replay and task
+        # acceptance, but must not implement a competing whitespace policy.
 
         changed_files, changed_lines = changed_stats(worktree)
 

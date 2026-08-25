@@ -1,3 +1,86 @@
+
+                  if (!owners.has(key)) {
+                    owners.set(key, {
+                      file,
+                      symbol_kind: symbolKind,
+                      symbol_name: symbolName,
+                      start_line: startLine,
+                      end_line: endLine,
+                    })
+                  }
+                }
+
+                ownerRecoveryOwners =
+                  [...owners.values()].slice(0, 16)
+              } else {
+                ownerRecoveryReason =
+                  "no_valid_owner_batches"
+              }
+            }
+          }
+
+          const exactStructuralGroups =
+            Array.isArray(exactGroupsForCapsule) &&
+            exactGroupsForCapsule.length > 0
+              ? exactGroupsForCapsule
+              : null
+
+          const recoveredStructuralGroups =
+            Array.isArray(ownerRecoveryGroups) &&
+            ownerRecoveryGroups.length > 0
+              ? ownerRecoveryGroups
+              : null
+
+          const renameMutationCapability =
+            await attestRenameTargetCapability(
+              root,
+              state,
+              queries,
+              discoveryResults,
+              exactStructuralGroups ?? [],
+            )
+          state.renameMutationCapability =
+            renameMutationCapability?.ok === true
+              ? renameMutationCapability
+              : null
+
+          const impactMutationCandidateRecovery =
+            await recoverValidatedImpactMutationCandidateGroups(
+              root,
+              selectedImpactFiles,
+            )
+
+          const capsuleGroups = [
+            ...(exactStructuralGroups ?? recoveredStructuralGroups ?? []),
+            ...(impactMutationCandidateRecovery.groups ?? []),
+          ]
+
+          const capsuleStructuralSource =
+            existingExactStructuralGroups
+              ? "evidence_ir"
+              : capsuleExactProbeGroups
+                ? "exact_structural_probe"
+                : recoveredStructuralGroups ||
+                    impactMutationCandidateRecovery.groups.length > 0
+                  ? "line_owner_recovery"
+                  : "none"
+
+          let editCapsule = null
+          let localMutationCapability = null
+          let localMutationCandidateSet = null
+          let localCompetitorCheck = null
+          if (mutationLocalization.eligible) {
+            editCapsule = await buildEditCapsule(
+              root,
+              sessionID,
+              state,
+              capsuleGroups,
+              scoutHandoff,
+              capsuleStructuralSource,
+              mutationLocalization,
+            )
+
+            if (editCapsule?.mutationReady === true) {
               localCompetitorCheck = await confirmLocalMutationCompetitors(
                 root,
                 state,
@@ -1299,39 +1382,3 @@
                 }
               }
               applyExecutionEvent(state, "fatal", "proof_obligation_failed")
-              await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
-              return {
-                content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
-              }
-            }
-            const persisted = await writePatchReceipt(root, sessionID, state, response, compilerResponse, verificationResponse, proofAssessment)
-            if (!persisted) {
-              applyExecutionEvent(state, "fatal", "receipt_write_failed")
-              await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
-              return {
-                content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
-              }
-            }
-            state.patchAccepted = true
-            state.patchReceiptPath = persisted.path
-            applyExecutionEvent(state, "patch_ready", "verification_passed")
-            await trace({
-              admitted: true,
-              reason: null,
-              action: "ready",
-              plan_signature: signature,
-              compiler_elapsed_ms: compiled.elapsedMs,
-              compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
-              compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
-              compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
-              compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
-              compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
-              executor_elapsed_ms: result.elapsedMs,
-              verifier_elapsed_ms: verified.elapsedMs,
-              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
-              invariants_total: verificationResponse?.invariants_total ?? 0,
-              invariants_passed: verificationResponse?.invariants_passed ?? 0,
-              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
-              proof_obligations: proofAssessment.obligations.map((item) => item.id),

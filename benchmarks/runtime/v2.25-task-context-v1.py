@@ -29,6 +29,7 @@ import {{ createHash }} from "node:crypto";
 const TASK_CONTEXT_PROTOCOL = "task-context-v1";
 const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string";
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1";
+const TASK_ACTION_PROTOCOL = "task-action-v1";
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024;
 const TASK_CONTEXT_MAX_PARTS = 64;
 const TASK_CONTEXT_MAX_REPORTED_PART_TYPES = 16;

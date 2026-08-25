@@ -98,6 +98,7 @@ export default {
           }
 
           let attemptIndex = null
+          let taskSearchPlan = null
           if (state) {
             state.searchAttempts += 1
             state.lastSeen = nowMs()
@@ -118,6 +119,22 @@ export default {
               turn_search_attempts: state?.searchAttempts ?? null,
               turn_executed_searches: state?.executedSearches ?? null,
               turn_evidence_bytes: state?.evidenceBytes ?? null,
+              task_search_plan_protocol:
+                taskSearchPlan?.protocol ?? TASK_SEARCH_PLAN_PROTOCOL,
+              task_search_plan_applied: taskSearchPlan?.applied ?? false,
+              task_search_plan_reason: taskSearchPlan?.reason ?? "not_compiled",
+              task_search_requested_queries:
+                taskSearchPlan?.requested_queries ?? null,
+              task_search_effective_queries:
+                taskSearchPlan?.effective_queries ?? null,
+              task_search_requested_path:
+                taskSearchPlan?.requested_path ?? null,
+              task_search_effective_path:
+                taskSearchPlan?.effective_path ?? null,
+              task_search_requested_glob:
+                taskSearchPlan?.requested_glob ?? null,
+              task_search_effective_glob:
+                taskSearchPlan?.effective_glob ?? null,
               ...extra,
             })
 
@@ -148,19 +165,55 @@ export default {
             }
           }
 
-          queries = [...new Set(queries)]
+          const requestedQueries = [...new Set(queries)]
+          const requestedPath =
+            typeof input?.path === "string" && input.path.length > 0
+              ? input.path
+              : "."
+          const modelRequestedGlob =
+            typeof input?.glob === "string" && input.glob.length > 0
+              ? input.glob
+              : undefined
+
+          taskSearchPlan = compileTaskSearchPlanForState(
+            state,
+            requestedQueries,
+            requestedPath,
+            modelRequestedGlob,
+          )
+          queries = taskSearchPlan.effective_queries
+
+          await writeProjectTrace(root, "search-trace.jsonl", {
+            ts: nowMs(),
+            protocol: SEARCH_PROTOCOL,
+            kind: "task_search_plan",
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            task_action_protocol: state?.taskAction?.protocol ?? null,
+            task_action_status: state?.taskAction?.status ?? null,
+            task_action_operation: state?.taskAction?.operation ?? null,
+            task_action_old_name: state?.taskAction?.old_name ?? null,
+            task_action_new_name: state?.taskAction?.new_name ?? null,
+            task_search_plan_protocol: taskSearchPlan.protocol,
+            task_search_plan_applied: taskSearchPlan.applied,
+            task_search_plan_reason: taskSearchPlan.reason,
+            task_search_requested_queries: taskSearchPlan.requested_queries,
+            task_search_effective_queries: taskSearchPlan.effective_queries,
+            task_search_requested_path: taskSearchPlan.requested_path,
+            task_search_effective_path: taskSearchPlan.effective_path,
+            task_search_requested_glob: taskSearchPlan.requested_glob,
+            task_search_effective_glob: taskSearchPlan.effective_glob,
+          })
 
           let target
           try {
-            target = await safeTarget(root, input?.path ?? ".")
+            target = await safeTarget(root, taskSearchPlan.effective_path)
           } catch (error) {
             return { content: "SEARCH_ERROR: " + String(error?.message ?? error) }
           }
 
-          const requestedGlob =
-            typeof input?.glob === "string"
-              ? input.glob
-              : undefined
+          const requestedGlob = taskSearchPlan.effective_glob ?? undefined
 
           const globResolution =
             await resolveSearchLanguageGlob(
@@ -1554,86 +1607,3 @@ export default {
                   const key =
                     `${file}\0${symbolKind}\0${symbolName}` +
                     `\0${startLine}\0${endLine}`
-
-                  if (!owners.has(key)) {
-                    owners.set(key, {
-                      file,
-                      symbol_kind: symbolKind,
-                      symbol_name: symbolName,
-                      start_line: startLine,
-                      end_line: endLine,
-                    })
-                  }
-                }
-
-                ownerRecoveryOwners =
-                  [...owners.values()].slice(0, 16)
-              } else {
-                ownerRecoveryReason =
-                  "no_valid_owner_batches"
-              }
-            }
-          }
-
-          const exactStructuralGroups =
-            Array.isArray(exactGroupsForCapsule) &&
-            exactGroupsForCapsule.length > 0
-              ? exactGroupsForCapsule
-              : null
-
-          const recoveredStructuralGroups =
-            Array.isArray(ownerRecoveryGroups) &&
-            ownerRecoveryGroups.length > 0
-              ? ownerRecoveryGroups
-              : null
-
-          const renameMutationCapability =
-            await attestRenameTargetCapability(
-              root,
-              state,
-              queries,
-              discoveryResults,
-              exactStructuralGroups ?? [],
-            )
-          state.renameMutationCapability =
-            renameMutationCapability?.ok === true
-              ? renameMutationCapability
-              : null
-
-          const impactMutationCandidateRecovery =
-            await recoverValidatedImpactMutationCandidateGroups(
-              root,
-              selectedImpactFiles,
-            )
-
-          const capsuleGroups = [
-            ...(exactStructuralGroups ?? recoveredStructuralGroups ?? []),
-            ...(impactMutationCandidateRecovery.groups ?? []),
-          ]
-
-          const capsuleStructuralSource =
-            existingExactStructuralGroups
-              ? "evidence_ir"
-              : capsuleExactProbeGroups
-                ? "exact_structural_probe"
-                : recoveredStructuralGroups ||
-                    impactMutationCandidateRecovery.groups.length > 0
-                  ? "line_owner_recovery"
-                  : "none"
-
-          let editCapsule = null
-          let localMutationCapability = null
-          let localMutationCandidateSet = null
-          let localCompetitorCheck = null
-          if (mutationLocalization.eligible) {
-            editCapsule = await buildEditCapsule(
-              root,
-              sessionID,
-              state,
-              capsuleGroups,
-              scoutHandoff,
-              capsuleStructuralSource,
-              mutationLocalization,
-            )
-
-            if (editCapsule?.mutationReady === true) {

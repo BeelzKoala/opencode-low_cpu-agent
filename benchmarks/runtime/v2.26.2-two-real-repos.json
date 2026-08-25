@@ -1,0 +1,45 @@
+{
+  "protocol": "real-task-benchmark-v2",
+  "min_verified": 2,
+  "defaults": {
+    "timeout_s": 240,
+    "max_model_calls": 4,
+    "max_patch_attempts": 2,
+    "max_changed_files": 1,
+    "max_changed_lines": 20
+  },
+  "tasks": [
+    {
+      "id": "django-private-helper-rename-v226",
+      "repo": "~/projects/bench-repos/django",
+      "base_ref": "03988c5a5ba248c3b9b11ea96fd4fda5e98849aa",
+      "prompt": "Rename the private helper `_path_from_module` to `_path_from_module_v226_probe` and update only its proven references. Do not make unrelated changes.",
+      "checks": [
+        {
+          "argv": [
+            "python3",
+            "-c",
+            "from pathlib import Path; import re; p=Path('django/apps/config.py'); s=p.read_text(); old=len(re.findall(r'(?<![A-Za-z0-9_$])_path_from_module(?![A-Za-z0-9_$])',s)); new=len(re.findall(r'(?<![A-Za-z0-9_$])_path_from_module_v226_probe(?![A-Za-z0-9_$])',s)); assert old==0,(old,new); assert new==2,(old,new); compile(s,str(p),'exec')"
+          ],
+          "timeout_s": 30
+        }
+      ]
+    },
+    {
+      "id": "typescript-private-helper-rename-v226",
+      "repo": "~/projects/bench-repos/typescript",
+      "base_ref": "d6c4afddb2c55f4a9dea7b59293a99a8fdea1799",
+      "prompt": "Rename the private helper `getNodeFromPath` to `getNodeFromPathV226Probe` and update only its proven references. Do not make unrelated changes.",
+      "checks": [
+        {
+          "argv": [
+            "python3",
+            "-c",
+            "from pathlib import Path; import re; p=Path('packages/typescript/src/api/fs.ts'); s=p.read_text(); old=len(re.findall(r'(?<![A-Za-z0-9_$])getNodeFromPath(?![A-Za-z0-9_$])',s)); new=len(re.findall(r'(?<![A-Za-z0-9_$])getNodeFromPathV226Probe(?![A-Za-z0-9_$])',s)); assert old==0,(old,new); assert new==4,(old,new)"
+          ],
+          "timeout_s": 30
+        }
+      ]
+    }
+  ]
+}
