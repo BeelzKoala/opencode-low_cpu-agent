@@ -33,6 +33,17 @@ const RETRIEVAL_RANKER_TIMEOUT_MS = 1500
 const RETRIEVAL_RANKER_MAX_STDOUT_BYTES = 256 * 1024
 const RETRIEVAL_RANKER_MAX_FILES = 32
 
+// Semantic source validation is shadow-only in v2.24. It observes existing
+// source-validated Impact edges but cannot change routing, emit, or mutation
+// authority.
+const SEMANTIC_RESOLVER_PROTOCOL = "semantic-resolver-v1.1"
+const SEMANTIC_RESOLVER_AUTHORITY = "shadow_semantic"
+const SEMANTIC_RESOLVER_TIMEOUT_MS = 1500
+const SEMANTIC_RESOLVER_MAX_STDOUT_BYTES = 256 * 1024
+const SEMANTIC_IMPACT_MAX_QUERIES = 8
+const SEMANTIC_IMPACT_MAX_RESULTS = 8
+const SEMANTIC_IMPACT_WITNESS_WINDOW_LINES = 12
+
 const QUERY_COMPILER_MIN_TOKENS = 2
 const QUERY_COMPILER_MAX_TOKENS = 6
 
@@ -194,7 +205,7 @@ const EDIT_CAPSULE_WINDOW_RADIUS = 6
 const MUTATION_CANDIDATE_SET_PROTOCOL = "bounded-mutation-candidates-v1"
 const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
-const SEARCH_PROTOCOL = "search-v2.23.1-provenance-bm25f-rrf-routing"
+const SEARCH_PROTOCOL = "search-v2.24.0-semantic-impact-shadow"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
@@ -4070,6 +4081,720 @@ function rankDiscoveredFiles(discoveryResults) {
   )
 }
 
+
+
+function semanticResolverBinary() {
+  const override = process.env.OPENCODE_SEMANTIC_RESOLVER
+  if (typeof override === "string" && override.length > 0) {
+    return override
+  }
+
+  const dir = runtimeStackDirectory()
+  if (!dir) return null
+
+  return path.join(dir, "opencode-semantic-resolver")
+}
+
+function semanticLanguageForFile(file) {
+  const lower = String(file ?? "").toLowerCase()
+
+  if (lower.endsWith(".py") || lower.endsWith(".pyi")) {
+    return "python"
+  }
+
+  if (
+    lower.endsWith(".ts") ||
+    lower.endsWith(".tsx") ||
+    lower.endsWith(".mts") ||
+    lower.endsWith(".cts")
+  ) {
+    return "typescript"
+  }
+
+  if (
+    lower.endsWith(".js") ||
+    lower.endsWith(".jsx") ||
+    lower.endsWith(".mjs") ||
+    lower.endsWith(".cjs")
+  ) {
+    return "javascript"
+  }
+
+  return null
+}
+
+function semanticExpectedImpactTarget(relation) {
+  if (relation?.direction === "forward") {
+    return evidenceFileKey(relation?.file)
+  }
+
+  if (relation?.direction === "reverse") {
+    return evidenceFileKey(relation?.seed)
+  }
+
+  return ""
+}
+
+function semanticSpecCursorOffset(spec) {
+  const value = String(spec ?? "")
+  if (!value) return 0
+
+  const slash = Math.max(
+    value.lastIndexOf("/"),
+    value.lastIndexOf("\\"),
+  )
+
+  if (slash >= 0 && slash + 1 < value.length) {
+    return slash + 1
+  }
+
+  const dot = value.lastIndexOf(".")
+  if (dot >= 0 && dot + 1 < value.length) {
+    return dot + 1
+  }
+
+  return 0
+}
+
+function semanticLineWindow(text, oneBasedLine, maxLines) {
+  if (
+    !Number.isInteger(oneBasedLine) ||
+    oneBasedLine < 1 ||
+    !Number.isInteger(maxLines) ||
+    maxLines < 1
+  ) {
+    return null
+  }
+
+  let line = 1
+  let start = 0
+
+  while (line < oneBasedLine) {
+    const next = text.indexOf("\n", start)
+    if (next < 0) return null
+    start = next + 1
+    line += 1
+  }
+
+  let end = start
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const next = text.indexOf("\n", end)
+    if (next < 0) {
+      end = text.length
+      break
+    }
+
+    end = next + 1
+  }
+
+  return { start, end }
+}
+
+async function semanticImpactQueryForRelation(
+  root,
+  relation,
+  id,
+) {
+  const witnessFile = evidenceFileKey(relation?.witness_file)
+  const expectedFile = semanticExpectedImpactTarget(relation)
+  const spec =
+    typeof relation?.spec === "string"
+      ? relation.spec
+      : ""
+  const witnessLine = relation?.witness_line
+  const language = semanticLanguageForFile(witnessFile)
+
+  if (
+    !witnessFile ||
+    !expectedFile ||
+    !spec ||
+    !language ||
+    !Number.isInteger(witnessLine) ||
+    witnessLine < 1
+  ) {
+    return {
+      ok: false,
+      reason: "unsupported_relation",
+    }
+  }
+
+  const resolved = path.resolve(root, witnessFile)
+
+  if (
+    resolved !== root &&
+    !resolved.startsWith(root + path.sep)
+  ) {
+    return {
+      ok: false,
+      reason: "witness_outside_root",
+    }
+  }
+
+  let canonical
+  let info
+  let source
+
+  try {
+    canonical = await realpath(resolved)
+
+    if (
+      canonical !== root &&
+      !canonical.startsWith(root + path.sep)
+    ) {
+      return {
+        ok: false,
+        reason: "witness_realpath_outside_root",
+      }
+    }
+
+    info = await stat(canonical)
+
+    if (
+      !info.isFile() ||
+      info.size > MAX_CONTEXT_FILE_BYTES
+    ) {
+      return {
+        ok: false,
+        reason: "witness_file_budget",
+      }
+    }
+
+    source = await readFile(canonical, "utf8")
+  } catch {
+    return {
+      ok: false,
+      reason: "witness_unavailable",
+    }
+  }
+
+  const window = semanticLineWindow(
+    source,
+    witnessLine,
+    SEMANTIC_IMPACT_WITNESS_WINDOW_LINES,
+  )
+
+  if (!window) {
+    return {
+      ok: false,
+      reason: "witness_line_invalid",
+    }
+  }
+
+  const fragment = source.slice(window.start, window.end)
+  const occurrences = []
+
+  let cursor = 0
+
+  while (true) {
+    const found = fragment.indexOf(spec, cursor)
+    if (found < 0) break
+
+    occurrences.push(found)
+
+    if (occurrences.length > 1) break
+
+    cursor = found + Math.max(1, spec.length)
+  }
+
+  if (occurrences.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        occurrences.length === 0
+          ? "module_spec_not_found"
+          : "module_spec_ambiguous",
+    }
+  }
+
+  const charOffset =
+    window.start +
+    occurrences[0] +
+    semanticSpecCursorOffset(spec)
+
+  const byteOffset =
+    Buffer.byteLength(
+      source.slice(0, charOffset),
+      "utf8",
+    )
+
+  return {
+    ok: true,
+    language,
+    expectedFile,
+    relation: {
+      file: evidenceFileKey(relation?.file),
+      seed: evidenceFileKey(relation?.seed),
+      direction: relation?.direction ?? null,
+      witness_file: witnessFile,
+      witness_line: witnessLine,
+      spec,
+    },
+    query: {
+      id,
+      operation: "definition",
+      file: witnessFile,
+      byte_offset: byteOffset,
+      max_results: SEMANTIC_IMPACT_MAX_RESULTS,
+    },
+  }
+}
+
+function runSemanticResolverBatch(
+  root,
+  language,
+  planned,
+) {
+  return new Promise((resolve) => {
+    const binary = semanticResolverBinary()
+
+    if (!binary) {
+      resolve({
+        ok: false,
+        reason: "binary_unavailable",
+        language,
+        elapsedMs: 0,
+      })
+      return
+    }
+
+    const started = performance.now()
+
+    let child
+
+    try {
+      child = spawn(binary, [], {
+        cwd: root,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    } catch {
+      resolve({
+        ok: false,
+        reason: "spawn_error",
+        language,
+        elapsedMs:
+          Math.round(
+            (performance.now() - started) * 100,
+          ) / 100,
+      })
+      return
+    }
+
+    let stdout = []
+    let stdoutBytes = 0
+    let stderr = ""
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const elapsed = () =>
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, SEMANTIC_RESOLVER_TIMEOUT_MS)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+
+      if (
+        stdoutBytes >
+        SEMANTIC_RESOLVER_MAX_STDOUT_BYTES
+      ) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      stdout.push(Buffer.from(chunk))
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) {
+        stderr += chunk.toString("utf8")
+      }
+    })
+
+    child.on("error", () => {
+      finish({
+        ok: false,
+        reason: "spawn_error",
+        language,
+        elapsedMs: elapsed(),
+      })
+    })
+
+    child.on("close", (code) => {
+      if (timedOut) {
+        finish({
+          ok: false,
+          reason: "timeout",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      if (outputLimited) {
+        finish({
+          ok: false,
+          reason: "stdout_limit",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      if (code !== 0) {
+        finish({
+          ok: false,
+          reason: "exit_error",
+          language,
+          elapsedMs: elapsed(),
+          error: stderr.trim() || null,
+        })
+        return
+      }
+
+      let response
+
+      try {
+        response = JSON.parse(
+          Buffer.concat(stdout).toString("utf8"),
+        )
+      } catch {
+        finish({
+          ok: false,
+          reason: "invalid_json",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      const expectedIds =
+        new Set(
+          planned.map((entry) => entry.query.id),
+        )
+
+      const results = response?.results
+
+      const ids =
+        Array.isArray(results)
+          ? results.map((entry) => entry?.id)
+          : []
+
+      const validIds =
+        ids.length === expectedIds.size &&
+        new Set(ids).size === ids.length &&
+        ids.every((id) => expectedIds.has(id))
+
+      if (
+        response?.protocol !== SEMANTIC_RESOLVER_PROTOCOL ||
+        response?.authority !== SEMANTIC_RESOLVER_AUTHORITY ||
+        typeof response?.engine !== "string" ||
+        !response.engine ||
+        !Array.isArray(results) ||
+        !validIds
+      ) {
+        finish({
+          ok: false,
+          reason: "response_contract_invalid",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      finish({
+        ok: true,
+        reason: "resolved",
+        language,
+        engine: response.engine,
+        elapsedMs: elapsed(),
+        response,
+      })
+    })
+
+    const request = {
+      protocol: SEMANTIC_RESOLVER_PROTOCOL,
+      root,
+      language,
+      queries:
+        planned.map((entry) => entry.query),
+    }
+
+    child.stdin.end(
+      JSON.stringify(request),
+      "utf8",
+    )
+  })
+}
+
+async function runSemanticImpactShadow(
+  root,
+  validatedImpact,
+) {
+  const sourceValidated =
+    Array.isArray(validatedImpact)
+      ? validatedImpact
+      : []
+
+  if (sourceValidated.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_source_validated_impact",
+      elapsedMs: 0,
+      queries: 0,
+      confirmed: 0,
+      contradicted: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      unavailable: 0,
+      skipped: 0,
+      engines: [],
+      outcomes: [],
+    }
+  }
+
+  const started = performance.now()
+  const planned = []
+  const seen = new Set()
+  let skipped = 0
+
+  outer:
+  for (const hypothesis of sourceValidated) {
+    for (const relation of hypothesis?.relations ?? []) {
+      if (planned.length >= SEMANTIC_IMPACT_MAX_QUERIES) {
+        break outer
+      }
+
+      const expectedFile =
+        semanticExpectedImpactTarget(relation)
+
+      const key = [
+        evidenceFileKey(relation?.witness_file),
+        relation?.witness_line,
+        relation?.spec,
+        expectedFile,
+      ].join("\0")
+
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      const entry =
+        await semanticImpactQueryForRelation(
+          root,
+          relation,
+          `impact-semantic-${planned.length + 1}`,
+        )
+
+      if (!entry.ok) {
+        skipped += 1
+        continue
+      }
+
+      planned.push(entry)
+    }
+  }
+
+  if (planned.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_supported_semantic_witnesses",
+      elapsedMs:
+        Math.round(
+          (performance.now() - started) * 100,
+        ) / 100,
+      queries: 0,
+      confirmed: 0,
+      contradicted: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      unavailable: 0,
+      skipped,
+      engines: [],
+      outcomes: [],
+    }
+  }
+
+  const byLanguage = new Map()
+
+  for (const entry of planned) {
+    const batch =
+      byLanguage.get(entry.language) ?? []
+    batch.push(entry)
+    byLanguage.set(entry.language, batch)
+  }
+
+  const batches =
+    await Promise.all(
+      [...byLanguage.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([language, entries]) =>
+          runSemanticResolverBatch(
+            root,
+            language,
+            entries,
+          ),
+        ),
+    )
+
+  const batchByLanguage =
+    new Map(
+      batches.map((batch) => [
+        batch.language,
+        batch,
+      ]),
+    )
+
+  const outcomes = []
+
+  for (const plan of planned) {
+    const batch =
+      batchByLanguage.get(plan.language)
+
+    if (!batch?.ok) {
+      outcomes.push({
+        verdict: "unavailable",
+        expected_file: plan.expectedFile,
+        actual_file: null,
+        engine: null,
+        reason:
+          batch?.reason ??
+          "batch_unavailable",
+        ...plan.relation,
+      })
+      continue
+    }
+
+    const result =
+      batch.response.results.find(
+        (entry) =>
+          entry?.id === plan.query.id,
+      )
+
+    if (!result) {
+      outcomes.push({
+        verdict: "unavailable",
+        expected_file: plan.expectedFile,
+        actual_file: null,
+        engine: batch.engine,
+        reason: "result_missing",
+        ...plan.relation,
+      })
+      continue
+    }
+
+    const locations =
+      Array.isArray(result?.locations)
+        ? result.locations
+        : []
+
+    let verdict = "unresolved"
+    let actualFile = null
+    let reason = result?.status ?? "unknown"
+
+    if (
+      result?.status === "resolved" &&
+      result?.bounded_complete === true &&
+      locations.length === 1
+    ) {
+      actualFile =
+        evidenceFileKey(locations[0]?.file)
+
+      verdict =
+        actualFile === plan.expectedFile
+          ? "confirmed"
+          : "contradicted"
+
+      reason =
+        verdict === "confirmed"
+          ? "semantic_target_match"
+          : "semantic_target_mismatch"
+    } else if (
+      result?.status === "ambiguous" ||
+      result?.bounded_complete !== true ||
+      locations.length > 1
+    ) {
+      verdict = "ambiguous"
+      reason = "semantic_result_ambiguous"
+    } else if (
+      result?.status === "unsupported" ||
+      result?.status === "error"
+    ) {
+      verdict = "unavailable"
+    }
+
+    outcomes.push({
+      verdict,
+      expected_file: plan.expectedFile,
+      actual_file: actualFile,
+      engine: batch.engine,
+      reason,
+      ...plan.relation,
+    })
+  }
+
+  const count = (verdict) =>
+    outcomes.filter(
+      (entry) => entry.verdict === verdict,
+    ).length
+
+  const confirmed = count("confirmed")
+  const contradicted = count("contradicted")
+  const ambiguous = count("ambiguous")
+  const unresolved = count("unresolved")
+  const unavailable = count("unavailable")
+  const allBatchesOk =
+    batches.every((batch) => batch.ok)
+
+  return {
+    attempted: true,
+    ok: allBatchesOk,
+    reason:
+      !allBatchesOk
+        ? "resolver_partial"
+        : contradicted > 0
+          ? "semantic_contradictions_observed"
+          : confirmed > 0
+            ? "semantic_confirmations_observed"
+            : "semantic_no_confirmation",
+    elapsedMs:
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100,
+    queries: planned.length,
+    confirmed,
+    contradicted,
+    ambiguous,
+    unresolved,
+    unavailable,
+    skipped,
+    engines:
+      [...new Set(
+        batches
+          .map((batch) => batch.engine)
+          .filter(Boolean),
+      )].sort(),
+    outcomes: outcomes.slice(
+      0,
+      SEMANTIC_IMPACT_MAX_QUERIES,
+    ),
+  }
+}
 
 function retrievalRankerBinary() {
   const override = process.env.OPENCODE_RETRIEVAL_RANKER
@@ -10074,6 +10799,15 @@ export default {
             probeResults,
           )
           const impactIndexShadow = impactValidation.indexStats
+          const semanticImpactShadow =
+            await runSemanticImpactShadow(
+              root,
+              impactValidation.validated,
+            )
+
+          // v2.24 shadow only: existing source-validated Impact routing remains
+          // authoritative until real-repo semantic telemetry proves zero false
+          // confirmations.
           const selectedFiles = selectEmitFilesWithImpact(
             probeRankedFiles,
             discoveryResults,
@@ -11515,6 +12249,34 @@ export default {
             impact_hypotheses: impactValidation.hypotheses.length,
             impact_validated: impactValidation.validated.length,
             impact_rejected: impactValidation.rejected.length,
+
+            semantic_impact_attempted:
+              semanticImpactShadow.attempted,
+            semantic_impact_ok:
+              semanticImpactShadow.ok,
+            semantic_impact_reason:
+              semanticImpactShadow.reason,
+            semantic_impact_elapsed_ms:
+              semanticImpactShadow.elapsedMs,
+            semantic_impact_queries:
+              semanticImpactShadow.queries,
+            semantic_impact_confirmed:
+              semanticImpactShadow.confirmed,
+            semantic_impact_contradicted:
+              semanticImpactShadow.contradicted,
+            semantic_impact_ambiguous:
+              semanticImpactShadow.ambiguous,
+            semantic_impact_unresolved:
+              semanticImpactShadow.unresolved,
+            semantic_impact_unavailable:
+              semanticImpactShadow.unavailable,
+            semantic_impact_skipped:
+              semanticImpactShadow.skipped,
+            semantic_impact_engines:
+              semanticImpactShadow.engines,
+            semantic_impact_outcomes:
+              semanticImpactShadow.outcomes,
+
             impact_scope_conditioned: true,
             impact_scope_seed_contexts: impactValidation.seedContexts,
             impact_scope_owner_symbols: impactValidation.ownerSymbols,
@@ -11989,6 +12751,24 @@ export default {
             impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
             impact_validation_reason: impactValidation.reason,
             impact_validated: impactValidation.validated.length,
+            semantic_impact_attempted:
+              semanticImpactShadow.attempted,
+            semantic_impact_ok:
+              semanticImpactShadow.ok,
+            semantic_impact_reason:
+              semanticImpactShadow.reason,
+            semantic_impact_confirmed:
+              semanticImpactShadow.confirmed,
+            semantic_impact_contradicted:
+              semanticImpactShadow.contradicted,
+            semantic_impact_ambiguous:
+              semanticImpactShadow.ambiguous,
+            semantic_impact_unresolved:
+              semanticImpactShadow.unresolved,
+            semantic_impact_unavailable:
+              semanticImpactShadow.unavailable,
+            semantic_impact_elapsed_ms:
+              semanticImpactShadow.elapsedMs,
             impact_scope_owner_symbols: impactValidation.ownerSymbols,
             impact_pairwise_conditioned: impactValidation.pairwiseConditioned === true,
             impact_scope_relations_rejected: impactValidation.scopeRejected,

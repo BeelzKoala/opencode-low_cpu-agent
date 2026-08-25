@@ -17,6 +17,7 @@ COMPONENTS=(
   opencode-invariant-verifier
   opencode-impact-index
   opencode-retrieval-ranker
+  opencode-semantic-resolver
 )
 
 build_stack() {
@@ -28,7 +29,8 @@ build_stack() {
     --bin opencode-patch-executor \
     --bin opencode-invariant-verifier \
     --bin opencode-impact-index \
-    --bin opencode-retrieval-ranker
+    --bin opencode-retrieval-ranker \
+    --bin opencode-semantic-resolver
 }
 
 write_manifest() {
