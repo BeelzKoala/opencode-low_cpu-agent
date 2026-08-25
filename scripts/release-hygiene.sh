@@ -30,7 +30,7 @@ if [[ -s "$LOCAL_PATTERNS_FILE" ]]; then
   for pattern in "${patterns[@]}"; do
     [[ -n "$pattern" ]] || continue
 
-    if git grep -nF -- "$pattern"; then
+    if git grep -nF -e "$pattern" --; then
       echo "FAIL tracked private identifier"
       fail=1
     fi
@@ -54,12 +54,26 @@ section "HIGH-SIGNAL SECRET MATERIAL"
 
 secret_re='-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|AKIA[0-9A-Z]{16}'
 
-if git grep -nE "$secret_re"; then
-  echo "FAIL high-signal secret material found"
-  fail=1
-else
-  echo "PASS no high-signal tracked secrets"
-fi
+set +e
+secret_output="$(git grep -nE -e "$secret_re" -- 2>&1)"
+secret_rc=$?
+set -e
+
+case "$secret_rc" in
+  0)
+    printf '%s\n' "$secret_output"
+    echo "FAIL high-signal secret material found"
+    fail=1
+    ;;
+  1)
+    echo "PASS no high-signal tracked secrets"
+    ;;
+  *)
+    printf '%s\n' "$secret_output"
+    echo "FAIL secret scanner error rc=$secret_rc"
+    fail=1
+    ;;
+esac
 
 section "JUNK / BACKUP FILES"
 
