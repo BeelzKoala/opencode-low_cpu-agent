@@ -1,0 +1,21 @@
+{
+  "files": {
+    "check.py": {
+      "bytes": 3461,
+      "sha256": "d40a1dd0c09585b6f6ca0fe889c0dc07decc42adb3c6f6337095b16356935816"
+    },
+    "corpus.json": {
+      "bytes": 2693,
+      "sha256": "94d107716673ffcbb37f074ef90bd59ef11607991cc1f35b6645f716285f9a94"
+    },
+    "repos.lock.json": {
+      "bytes": 515,
+      "sha256": "811415684ac95e8c79e0b73d6b3056f1342565146a27ef8f22468ca2fa0b2769"
+    },
+    "score.py": {
+      "bytes": 9483,
+      "sha256": "058ce0b6bc602684e720ad150297d7db0529de379b6e38c2958647b62d9919d7"
+    }
+  },
+  "protocol": "corpus-content-lock-v2"
+}

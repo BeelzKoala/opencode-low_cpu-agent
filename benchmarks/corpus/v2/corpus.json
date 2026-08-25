@@ -1,0 +1,110 @@
+{
+  "protocol": "immutable-corpus-v2",
+  "derived_from": "immutable-corpus-v1",
+  "policy": "never_edit_this_version_create_v3_instead",
+  "metrics": [
+    "false_verified",
+    "verified_tasks",
+    "product_success_rate",
+    "safety_pass_rate",
+    "contract_pass_rate",
+    "cpu_seconds",
+    "solved_tasks_per_cpu",
+    "model_calls",
+    "wall_seconds"
+  ],
+  "tasks": [
+    {
+      "id": "py-threshold-replace",
+      "kind": "bounded_replace",
+      "language": "python",
+      "role": "product",
+      "expected": "VERIFIED"
+    },
+    {
+      "id": "py-normalization-replace",
+      "kind": "bounded_replace",
+      "language": "python",
+      "role": "product",
+      "expected": "VERIFIED"
+    },
+    {
+      "id": "py-transitive-risk-replace",
+      "kind": "bounded_replace",
+      "language": "python",
+      "role": "product",
+      "expected": "VERIFIED"
+    },
+    {
+      "id": "django-private-helper-rename",
+      "kind": "rename",
+      "language": "python",
+      "role": "product",
+      "expected": "VERIFIED",
+      "repo_key": "django",
+      "file": "django/apps/config.py",
+      "symbol": "_path_from_module",
+      "expected_identifier_count": 2
+    },
+    {
+      "id": "typescript-private-helper-rename",
+      "kind": "rename",
+      "language": "typescript",
+      "role": "product",
+      "expected": "VERIFIED",
+      "repo_key": "typescript",
+      "file": "packages/typescript/src/api/fs.ts",
+      "symbol": "getNodeFromPath",
+      "expected_identifier_count": 4
+    },
+    {
+      "id": "duplicate-definition-rename",
+      "kind": "adversarial_rename",
+      "language": "python",
+      "role": "safety",
+      "expected": "SAFE_FAIL"
+    },
+    {
+      "id": "stale-capability",
+      "kind": "adversarial_authority",
+      "language": "python",
+      "role": "safety",
+      "expected": "SAFE_FAIL"
+    },
+    {
+      "id": "invalid-python-candidate",
+      "kind": "adversarial_validity",
+      "language": "python",
+      "role": "safety",
+      "expected": "SAFE_FAIL"
+    },
+    {
+      "id": "ambiguous-owner",
+      "kind": "adversarial_scope",
+      "language": "typescript",
+      "role": "safety",
+      "expected": "SAFE_FAIL"
+    },
+    {
+      "id": "mutation-action-cardinality",
+      "kind": "orchestrator_contract",
+      "language": "mixed",
+      "role": "contract",
+      "expected": "PASS"
+    },
+    {
+      "id": "terminal-outcome-transport-mismatch",
+      "kind": "host_contract",
+      "language": "mixed",
+      "role": "contract",
+      "expected": "PASS"
+    },
+    {
+      "id": "interface-freeze",
+      "kind": "abi_contract",
+      "language": "mixed",
+      "role": "contract",
+      "expected": "PASS"
+    }
+  ]
+}

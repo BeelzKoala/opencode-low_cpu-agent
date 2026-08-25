@@ -12,6 +12,7 @@ quick() {
   python3 benchmarks/runtime/v2.25-stabilization-action-routing.py
   python3 benchmarks/runtime/v2.25-task-context-v1.py
   python3 benchmarks/corpus/v1/check.py
+  python3 benchmarks/corpus/v2/check.py
   node --check opencode/plugins/cpu-search.ts
   echo "PASS ci quick"
 }
@@ -19,6 +20,8 @@ quick() {
 full() {
   quick
   cargo test --manifest-path rust/evidence-distiller/Cargo.toml --all-targets
+  cargo build --manifest-path rust/evidence-distiller/Cargo.toml --bins
+  python3 benchmarks/runtime/v2.25-differential-shadow-promotion.py
   bash scripts/release-hygiene.sh
   echo "PASS ci full"
 }
@@ -78,13 +81,14 @@ from pathlib import Path
 import hashlib
 import json
 
-root = Path("benchmarks/corpus/v1")
-lock = json.loads((root / "corpus.lock.json").read_text())
-for name, record in lock["files"].items():
-    body = (root / name).read_bytes()
-    assert len(body) == record["bytes"], name
-    assert hashlib.sha256(body).hexdigest() == record["sha256"], name
-print("PASS immutable corpus content lock")
+for version in ("v1", "v2"):
+    root = Path("benchmarks/corpus") / version
+    lock = json.loads((root / "corpus.lock.json").read_text())
+    for name, record in lock["files"].items():
+        body = (root / name).read_bytes()
+        assert len(body) == record["bytes"], f"{version}/{name}"
+        assert hashlib.sha256(body).hexdigest() == record["sha256"], f"{version}/{name}"
+    print(f"PASS immutable corpus content lock version={version}")
 PY
 }
 
