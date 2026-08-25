@@ -41,3 +41,7 @@ path = "src/structural_index.rs"
 [[bin]]
 name = "opencode-retrieval-ranker"
 path = "src/retrieval_ranker.rs"
+
+[[bin]]
+name = "opencode-semantic-resolver"
+path = "src/semantic_resolver.rs"
