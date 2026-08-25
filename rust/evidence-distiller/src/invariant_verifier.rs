@@ -15,6 +15,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "invariant_verifier/differential.rs"]
+mod differential;
+
+use differential::{DifferentialObservation, observe_python_control_flow};
+
 const PROTOCOL: &str = "invariant-verifier-v2";
 const VERIFICATION_PROTOCOL: &str = "verification-receipt-v1";
 const COMPILER_PROTOCOL: &str = "patch-compiler-v2";
@@ -147,6 +152,7 @@ struct Response {
     rename_global_closure: bool,
     worktree_cleaned: bool,
     elapsed_ms: f64,
+    differential_observations: Vec<DifferentialObservation>,
     checks: Vec<Check>,
 }
 
@@ -228,6 +234,7 @@ impl Response {
             rename_global_closure,
             worktree_cleaned,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            differential_observations: Vec::new(),
             checks,
         }
     }
@@ -952,6 +959,7 @@ fn verify(request: &Request) -> Result<Response> {
     let started = Instant::now();
     let root = fs::canonicalize(&request.root).context("root_unavailable")?;
     let mut checks = Vec::<Check>::new();
+    let mut differential_observations = Vec::<DifferentialObservation>::new();
 
     if request.compiler_protocol != COMPILER_PROTOCOL
         || request.mutation_protocol != MUTATION_PROTOCOL
@@ -1281,6 +1289,17 @@ fn verify(request: &Request) -> Result<Response> {
                 fs::read_to_string(wt.join(&file)).context("patched_target_unavailable")?;
 
             if mutation.kind == "replace_node" {
+                if let Some(observation) = observe_python_control_flow(
+                    &root.join(&file),
+                    before_src,
+                    &after_src,
+                    &mutation.symbol,
+                ) {
+                    differential_observations.push(observation);
+                }
+            }
+
+            if mutation.kind == "replace_node" {
                 let (pass, detail) = verify_replace_node_confinement(
                     &root.join(&file),
                     before_src,
@@ -1437,13 +1456,17 @@ fn verify(request: &Request) -> Result<Response> {
         Ok(value) => value,
         Err(err) => Some(format!("verification_runtime_failed:{err}")),
     };
-    Ok(Response::finish(
+    let mut response = Response::finish(
         started,
         changed.into_iter().collect(),
         checks,
         cleaned,
         reason,
-    ))
+    );
+
+    response.differential_observations = differential_observations;
+
+    Ok(response)
 }
 
 fn read_request() -> Result<Request> {
