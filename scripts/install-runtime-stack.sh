@@ -18,6 +18,7 @@ COMPONENTS=(
   opencode-impact-index
   opencode-retrieval-ranker
   opencode-semantic-resolver
+  opencode-completion-authorizer
 )
 
 build_stack() {
@@ -30,7 +31,8 @@ build_stack() {
     --bin opencode-invariant-verifier \
     --bin opencode-impact-index \
     --bin opencode-retrieval-ranker \
-    --bin opencode-semantic-resolver
+    --bin opencode-semantic-resolver \
+    --bin opencode-completion-authorizer
 }
 
 write_manifest() {

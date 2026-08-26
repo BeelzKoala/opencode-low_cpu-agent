@@ -1,4 +1,349 @@
 
+async function attestLocalMutationCapability(
+  root,
+  sessionID,
+  state,
+  scoutHandoff,
+  editCapsule,
+  competitorCheck,
+  targetOverride = null,
+) {
+  const reject = (reason, detail = null) => ({
+    ok: false,
+    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    reason,
+    detail,
+    globalReady: false,
+    replaceNodeReady: false,
+    renameSymbolReady: false,
+    localHandoffPath: null,
+    target: null,
+  })
+
+  if (
+    !root ||
+    !sessionID ||
+    !state ||
+    !scoutHandoff?.path ||
+    editCapsule?.mutationReady !== true ||
+    competitorCheck?.ok !== true
+  ) {
+    return reject("capability_inputs_incomplete")
+  }
+
+  const eligibility = scoutMutationLocalizationEligibility(
+    state,
+    scoutHandoff,
+  )
+  if (!eligibility.eligible) {
+    return reject("localization_not_eligible", eligibility.reason ?? null)
+  }
+
+  const rel = normalizeMutationFile(scoutHandoff.path)
+  if (!rel.startsWith(".opencode/scout-handoffs/")) {
+    return reject("source_handoff_path_invalid")
+  }
+
+  const handoffRoot = path.resolve(root, ".opencode", "scout-handoffs")
+  const absolute = path.resolve(root, rel)
+  if (
+    absolute !== handoffRoot &&
+    !absolute.startsWith(handoffRoot + path.sep)
+  ) {
+    return reject("source_handoff_path_escape")
+  }
+
+  let raw
+  let bundle
+  try {
+    raw = await readFile(absolute)
+    bundle = JSON.parse(raw.toString("utf8"))
+  } catch {
+    return reject("source_handoff_unreadable")
+  }
+
+  if (bundle?.protocol !== SCOUT_HANDOFF_PROTOCOL) {
+    return reject("source_handoff_protocol_mismatch")
+  }
+
+  const blockingReasons = Array.isArray(bundle.blocking_reasons)
+    ? bundle.blocking_reasons
+    : []
+  const partialReasons = Array.isArray(bundle.partial_reasons)
+    ? bundle.partial_reasons
+    : []
+
+  if (blockingReasons.length > 0) {
+    return reject("source_handoff_blocked", blockingReasons.join(","))
+  }
+
+  const globalReady =
+    bundle.status === "ready" && partialReasons.length === 0
+  const localPartialReady =
+    bundle.status === "partial" &&
+    localCapabilityPartialReasonsAllowed(partialReasons)
+
+  if (!globalReady && !localPartialReady) {
+    return reject(
+      "source_handoff_not_locally_sufficient",
+      `${bundle.status ?? "missing"}:${partialReasons.join(",")}`,
+    )
+  }
+
+  const loaded = await readAuthorizedEditCapsule(root, state)
+  if (!loaded.ok) {
+    return reject("edit_capsule_attestation_failed", loaded.reason ?? null)
+  }
+
+  const capsule = loaded.capsule
+  const authorizedScopes = (capsule.scopes ?? []).filter(
+    (scope) =>
+      scope?.mutation_authorized === true &&
+      scope?.context === "full",
+  )
+  if (authorizedScopes.length !== 1) {
+    return reject("authorized_scope_cardinality", String(authorizedScopes.length))
+  }
+
+  const initialTarget = authorizedScopes[0]
+  if (!sameAuthorizedScopeIdentity(initialTarget, capsule.authorized_mutation_scope)) {
+    return reject("authorized_scope_attestation_mismatch")
+  }
+
+  let target = initialTarget
+  let candidateMeta = null
+
+  if (targetOverride) {
+    candidateMeta =
+      (editCapsule?.mutationCandidates ?? [])
+        .find((candidate) =>
+          sameAuthorizedScopeIdentity(candidate, targetOverride),
+        ) ?? null
+
+    if (!candidateMeta) {
+      return reject("mutation_candidate_not_preauthorized")
+    }
+
+    const candidateScope =
+      (editCapsule?.scopeRecords ?? [])
+        .find((scope) =>
+          scope?.context === "full" &&
+          scope?.mutation_candidate === true &&
+          sameAuthorizedScopeIdentity(scope, candidateMeta),
+        ) ?? null
+
+    if (!candidateScope) {
+      return reject("mutation_candidate_scope_missing")
+    }
+
+    if (
+      !globalReady &&
+      !sameAuthorizedScopeIdentity(initialTarget, candidateScope)
+    ) {
+      return reject("partial_candidate_rebind_requires_rescout")
+    }
+
+    target = candidateScope
+  }
+
+  if (
+    typeof target.symbol_name !== "string" ||
+    target.symbol_name.length < 1 ||
+    target.symbol_name === "<module>" ||
+    target.symbol_name === "<evidence>" ||
+    !Number.isInteger(target.start_line) ||
+    !Number.isInteger(target.end_line) ||
+    target.start_line < 1 ||
+    target.end_line < target.start_line
+  ) {
+    return reject("authorized_scope_identity_invalid")
+  }
+
+  const wantedFile = canonicalMutationFile(root, target.file)
+  if (!wantedFile) return reject("authorized_scope_file_invalid")
+
+  const handoffFiles = Array.isArray(bundle.files) ? bundle.files : []
+  const targetFile = handoffFiles.find(
+    (file) => canonicalMutationFile(root, file?.file) === wantedFile,
+  )
+  if (!targetFile) return reject("authorized_file_not_in_handoff")
+
+  if (
+    !globalReady &&
+    !(Array.isArray(targetFile.origins) && targetFile.origins.includes("lexical"))
+  ) {
+    return reject("partial_target_requires_direct_lexical_origin")
+  }
+
+  const fingerprint = targetFile.fingerprint
+  if (
+    fingerprint?.kind !== "sha256" ||
+    fingerprint?.strong !== true ||
+    fingerprint?.evidence_fresh !== true ||
+    typeof fingerprint?.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
+    targetFile.changed_during_scout === true
+  ) {
+    return reject("target_fingerprint_not_strong_current")
+  }
+
+  // Re-read the target now. The derived handoff must carry a current source
+  // hash, not merely trust a prior Scout observation.
+  let currentBody
+  try {
+    currentBody = await readFile(path.resolve(root, wantedFile))
+  } catch {
+    return reject("target_file_unavailable")
+  }
+  const currentSha256 = createHash("sha256").update(currentBody).digest("hex")
+  if (currentSha256 !== fingerprint.sha256) {
+    return reject("target_fingerprint_stale")
+  }
+
+  const attestationTargetFile = {
+    ...targetFile,
+    evidence_lines:
+      [...new Set([
+        ...(targetFile.evidence_lines ?? []),
+        ...(candidateMeta?.evidence_lines ?? []),
+      ])]
+        .filter((line) => Number.isInteger(line) && line > 0)
+        .sort((a, b) => a - b),
+  }
+
+  const attestationCapsule =
+    targetOverride
+      ? {
+          ...editCapsule,
+          mutationReady: true,
+          structuralSource:
+            candidateMeta?.structural_source ??
+            editCapsule?.structuralSource ??
+            "candidate_set",
+          primaryMutationCandidate:
+            mutationCandidateIdentity(target),
+          authorizedMutationScope:
+            mutationCandidateIdentity(target),
+        }
+      : editCapsule
+
+  const ownerAttestation = buildOwnerAttestation(
+    attestationCapsule,
+    target,
+    attestationTargetFile,
+  )
+  if (!ownerAttestation.ok) {
+    return reject(
+      "target_owner_evidence_unavailable",
+      ownerAttestation.reason,
+    )
+  }
+
+  const attestedEvidenceLines = ownerAttestation.evidence_lines
+
+  const sourceHandoffSha256 = createHash("sha256").update(raw).digest("hex")
+  const identity = {
+    file: wantedFile,
+    symbol_kind: target.symbol_kind,
+    symbol_name: target.symbol_name,
+    start_line: target.start_line,
+    end_line: target.end_line,
+  }
+  const identitySha256 = createHash("sha256")
+    .update(JSON.stringify(identity))
+    .digest("hex")
+
+  const capability = {
+    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    operation: "replace_node",
+    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
+    basis: "single_full_source_validated_owner",
+    owner_attestation: ownerAttestation,
+    source_handoff: rel,
+    source_handoff_sha256: sourceHandoffSha256,
+    source_handoff_status: bundle.status,
+    source_partial_reasons: partialReasons,
+    edit_capsule: editCapsule.path,
+    edit_capsule_sha256: editCapsule.sha256,
+    target: identity,
+    target_identity_sha256: identitySha256,
+    target_source_sha256: currentSha256,
+    attested_evidence_lines: attestedEvidenceLines,
+    competitor_confirmation: competitorCheck,
+    global_discovery_complete: globalReady,
+  }
+
+  const localBundle = {
+    protocol: SCOUT_HANDOFF_PROTOCOL,
+    search_protocol: SEARCH_PROTOCOL,
+    session_key: scoutOpaqueKey(sessionID),
+    turn_key: scoutOpaqueKey(state.turnID ?? ""),
+    generated_at_ms: nowMs(),
+    status: "ready",
+    blocking_reasons: [],
+    partial_reasons: [],
+    scope_mode: "local_mutation_capability",
+    capability_protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
+    owner_attestation: ownerAttestation,
+    source_handoff: rel,
+    source_handoff_sha256: sourceHandoffSha256,
+    source_handoff_status: bundle.status,
+    source_partial_reasons: partialReasons,
+    edit_capsule: editCapsule.path,
+    edit_capsule_sha256: editCapsule.sha256,
+    capability,
+    budgets: bundle.budgets ?? {},
+    searches: bundle.searches ?? [],
+    files: [
+      {
+        ...targetFile,
+        file: wantedFile,
+        evidence_lines: attestedEvidenceLines,
+        fingerprint: {
+          ...fingerprint,
+          sha256: currentSha256,
+          strong: true,
+          evidence_fresh: true,
+        },
+        changed_during_scout: false,
+      },
+    ],
+  }
+
+  const localHandoffPath = await writeLocalMutationHandoff(
+    root,
+    sessionID,
+    state.turnID,
+    localBundle,
+    targetOverride ? identitySha256 : "primary",
+  )
+  if (!localHandoffPath) {
+    return reject("local_mutation_handoff_write_failed")
+  }
+
+  return {
+    ok: true,
+    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    reason: globalReady
+      ? "global_ready_local_scope_attested"
+      : "partial_global_local_scope_attested",
+    globalReady,
+    replaceNodeReady: true,
+    // Rename authority is a distinct capability derived from exact symbol
+    // identity. A replace-node owner must never implicitly authorize rename.
+    renameSymbolReady: false,
+    sourceHandoffPath: rel,
+    localHandoffPath,
+    target: identity,
+    targetSourceSha256: currentSha256,
+    sourcePartialReasons: partialReasons,
+    competitorCheck,
+    allowedMutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
+    ownerAttestation,
+  }
+}
+
 async function attestLocalMutationCandidateSet(
   root,
   sessionID,
@@ -149,6 +494,22 @@ function getSessionState(sessionID) {
       taskContextReason: "unresolved",
       taskContextDrift: false,
       taskAction: null,
+      actionCommitSha256: null,
+      actionCommitDispatches: 0,
+      terminalCommit: null,
+      terminalCommitSha256: null,
+      terminalCommitClaims: 0,
+      terminalShortCircuitAttemptedSha256: null,
+      terminalShortCircuitRequests: 0,
+      terminalShortCircuits: 0,
+      terminalShortCircuitFailures: 0,
+      completionSafeFail: null,
+      completionSafeFailSha256: null,
+      completionSafeFailClaims: 0,
+      completionSafeFailShortCircuitAttemptedSha256: null,
+      completionSafeFailShortCircuitRequests: 0,
+      completionSafeFailShortCircuits: 0,
+      completionSafeFailShortCircuitFailures: 0,
       mutationIntent: "unknown",
       mutationIntentReason: "unresolved",
       visibleToolSchemaSha256: null,
@@ -218,6 +579,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskContextReason = "unresolved"
   state.taskContextDrift = false
   state.taskAction = null
+  state.actionCommitSha256 = null
+  state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
   state.mutationIntentReason = "unresolved"
   state.visibleToolSchemaSha256 = null
@@ -311,84 +674,6 @@ function mutationToolsForState(state) {
   return resolution.tool ? [resolution.tool] : []
 }
 
-function compileTaskSearchPlanForState(
-  state,
-  requestedQueries,
-  requestedPath = ".",
-  requestedGlob = undefined,
-) {
-  const requested = [
-    ...new Set(
-      (Array.isArray(requestedQueries) ? requestedQueries : [])
-        .filter((query) => typeof query === "string" && query.length > 0),
-    ),
-  ]
-  const fallback = {
-    protocol: TASK_SEARCH_PLAN_PROTOCOL,
-    applied: false,
-    reason: "model_search_plan",
-    task_sha256: state?.taskTextSha256 ?? null,
-    requested_queries: requested,
-    effective_queries: requested,
-    requested_path:
-      typeof requestedPath === "string" && requestedPath.length > 0
-        ? requestedPath
-        : ".",
-    effective_path:
-      typeof requestedPath === "string" && requestedPath.length > 0
-        ? requestedPath
-        : ".",
-    requested_glob:
-      typeof requestedGlob === "string" && requestedGlob.length > 0
-        ? requestedGlob
-        : null,
-    effective_glob:
-      typeof requestedGlob === "string" && requestedGlob.length > 0
-        ? requestedGlob
-        : null,
-  }
-
-  const action = state?.taskAction ?? null
-  const oldName = taskActionIdentifier(action?.old_name)
-  const newName = taskActionIdentifier(action?.new_name)
-  const exactRename =
-    state?.executionState === EXEC_STATE_LOCATE &&
-    state?.mutationIntent === "rename_symbol" &&
-    action?.protocol === TASK_ACTION_PROTOCOL &&
-    action?.status === "exact" &&
-    action?.operation === "rename_symbol" &&
-    typeof action?.task_sha256 === "string" &&
-    action.task_sha256 === state?.taskTextSha256 &&
-    oldName !== null &&
-    newName !== null &&
-    oldName !== newName
-
-  if (!exactRename) return fallback
-
-  const globalSourceGlob = buildLanguageGlob(
-    "**/*",
-    SOURCE_LANGUAGE_EXTENSIONS,
-  )
-  if (!globalSourceGlob) {
-    return {
-      ...fallback,
-      reason: "exact_rename_source_glob_unavailable",
-    }
-  }
-
-  return {
-    protocol: TASK_SEARCH_PLAN_PROTOCOL,
-    applied: true,
-    reason: "exact_global_rename_identifier",
-    task_sha256: action.task_sha256,
-    requested_queries: requested,
-    effective_queries: [oldName],
-    requested_path: fallback.requested_path,
-    effective_path: ".",
-    requested_glob: fallback.requested_glob,
-    effective_glob: globalSourceGlob,
-  }
-}
 
 function allowedToolsForState(state) {
   if (!state) return []
@@ -2530,456 +2815,4 @@ async function runSemanticImpactShadow(
       SEMANTIC_IMPACT_MAX_QUERIES,
     ),
   }
-}
-
-function retrievalRankerBinary() {
-  const override = process.env.OPENCODE_RETRIEVAL_RANKER
-  if (typeof override === "string" && override.length > 0) {
-    return override
-  }
-
-  const dir = runtimeStackDirectory()
-  if (!dir) return null
-
-  return path.join(dir, "opencode-retrieval-ranker")
-}
-
-function retrievalRankerQuery(queries) {
-  /*
-   * Reuse the already-proven lexical tokenization used by Scout path
-   * relevance. Do not pass regex punctuation into BM25F.
-   *
-   * Preserve first-seen order so identical search input is reproducible.
-   */
-  const terms = []
-  const seen = new Set()
-
-  for (const query of queries ?? []) {
-    for (const term of queryPathTokens(query)) {
-      if (seen.has(term)) continue
-      seen.add(term)
-      terms.push(term)
-
-      if (terms.length >= 32) {
-        return terms.join(" ")
-      }
-    }
-  }
-
-  return terms.join(" ")
-}
-
-function retrievalRankerFallback(
-  rankedFiles,
-  reason,
-  extra = {},
-) {
-  return {
-    attempted: extra.attempted === true,
-    ok: false,
-    reason,
-    elapsedMs:
-      Number.isFinite(extra.elapsedMs)
-        ? extra.elapsedMs
-        : 0,
-    inputFiles:
-      Number.isInteger(extra.inputFiles)
-        ? extra.inputFiles
-        : 0,
-    outputFiles: 0,
-    degradedFiles: 0,
-    errorFiles: 0,
-    rankedFiles,
-  }
-}
-
-function validateRetrievalRankerResponse(
-  response,
-  candidates,
-) {
-  if (
-    response?.protocol !== RETRIEVAL_RANKER_PROTOCOL ||
-    response?.authority !== RETRIEVAL_RANKER_AUTHORITY ||
-    !Array.isArray(response?.results)
-  ) {
-    return {
-      ok: false,
-      reason: "response_contract_invalid",
-    }
-  }
-
-  const allowed = new Set(
-    candidates.map((entry) =>
-      evidenceFileKey(entry.file),
-    ),
-  )
-
-  const seen = new Set()
-
-  for (
-    let index = 0;
-    index < response.results.length;
-    index += 1
-  ) {
-    const result = response.results[index]
-    const file = evidenceFileKey(result?.file)
-
-    if (
-      !file ||
-      !allowed.has(file) ||
-      seen.has(file) ||
-      result?.rank !== index + 1 ||
-      !Number.isFinite(result?.rrf_score) ||
-      !Number.isFinite(result?.bm25f_score)
-    ) {
-      return {
-        ok: false,
-        reason: "result_contract_invalid",
-      }
-    }
-
-    seen.add(file)
-  }
-
-  return {
-    ok: true,
-    reason: "ranked",
-  }
-}
-
-function runRetrievalRanker(
-  root,
-  queries,
-  lexicalRankedFiles,
-) {
-  return new Promise((resolve) => {
-    const query = retrievalRankerQuery(queries)
-
-    const candidates =
-      (lexicalRankedFiles ?? [])
-        .slice(0, RETRIEVAL_RANKER_MAX_FILES)
-
-    if (candidates.length < 2) {
-      resolve(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "not_needed",
-        ),
-      )
-      return
-    }
-
-    if (!query) {
-      resolve(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "no_query_terms",
-        ),
-      )
-      return
-    }
-
-    const binary = retrievalRankerBinary()
-
-    if (!binary) {
-      resolve(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "binary_unavailable",
-        ),
-      )
-      return
-    }
-
-    const started = performance.now()
-
-    let child
-
-    try {
-      child = spawn(binary, [], {
-        cwd: root,
-        stdio: ["pipe", "pipe", "pipe"],
-      })
-    } catch (error) {
-      resolve(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "spawn_error",
-          {
-            attempted: true,
-            inputFiles: candidates.length,
-            elapsedMs:
-              Math.round(
-                (performance.now() - started) * 100,
-              ) / 100,
-          },
-        ),
-      )
-      return
-    }
-
-    let stdout = []
-    let stdoutBytes = 0
-    let stderr = ""
-    let timedOut = false
-    let outputLimited = false
-    let settled = false
-
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(result)
-    }
-
-    const elapsed = () =>
-      Math.round(
-        (performance.now() - started) * 100,
-      ) / 100
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGKILL")
-    }, RETRIEVAL_RANKER_TIMEOUT_MS)
-
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length
-
-      if (
-        stdoutBytes >
-        RETRIEVAL_RANKER_MAX_STDOUT_BYTES
-      ) {
-        outputLimited = true
-        child.kill("SIGKILL")
-        return
-      }
-
-      stdout.push(Buffer.from(chunk))
-    })
-
-    child.stderr.on("data", (chunk) => {
-      if (stderr.length < 4096) {
-        stderr += chunk.toString("utf8")
-      }
-    })
-
-    child.on("error", () => {
-      finish(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "spawn_error",
-          {
-            attempted: true,
-            inputFiles: candidates.length,
-            elapsedMs: elapsed(),
-          },
-        ),
-      )
-    })
-
-    child.on("close", (code) => {
-      if (settled) return
-
-      if (timedOut) {
-        finish(
-          retrievalRankerFallback(
-            lexicalRankedFiles,
-            "timeout",
-            {
-              attempted: true,
-              inputFiles: candidates.length,
-              elapsedMs: elapsed(),
-            },
-          ),
-        )
-        return
-      }
-
-      if (outputLimited) {
-        finish(
-          retrievalRankerFallback(
-            lexicalRankedFiles,
-            "stdout_limit",
-            {
-              attempted: true,
-              inputFiles: candidates.length,
-              elapsedMs: elapsed(),
-            },
-          ),
-        )
-        return
-      }
-
-      if (code !== 0) {
-        finish(
-          retrievalRankerFallback(
-            lexicalRankedFiles,
-            "nonzero_exit",
-            {
-              attempted: true,
-              inputFiles: candidates.length,
-              elapsedMs: elapsed(),
-            },
-          ),
-        )
-        return
-      }
-
-      let response
-
-      try {
-        response = JSON.parse(
-          Buffer.concat(stdout).toString("utf8"),
-        )
-      } catch {
-        finish(
-          retrievalRankerFallback(
-            lexicalRankedFiles,
-            "invalid_json",
-            {
-              attempted: true,
-              inputFiles: candidates.length,
-              elapsedMs: elapsed(),
-            },
-          ),
-        )
-        return
-      }
-
-      const contract =
-        validateRetrievalRankerResponse(
-          response,
-          candidates,
-        )
-
-      if (!contract.ok) {
-        finish(
-          retrievalRankerFallback(
-            lexicalRankedFiles,
-            contract.reason,
-            {
-              attempted: true,
-              inputFiles: candidates.length,
-              elapsedMs: elapsed(),
-            },
-          ),
-        )
-        return
-      }
-
-      const originalByFile = new Map(
-        candidates.map((entry, index) => [
-          evidenceFileKey(entry.file),
-          {
-            entry,
-            lexicalRank: index + 1,
-          },
-        ]),
-      )
-
-      const reranked = []
-      const rerankedKeys = new Set()
-
-      for (const result of response.results) {
-        const key = evidenceFileKey(result.file)
-        const original = originalByFile.get(key)
-
-        if (!original) continue
-
-        reranked.push({
-          ...original.entry,
-
-          // Routing telemetry only. These fields are never mutation
-          // authority and are not consumed as semantic evidence.
-          retrievalRank: result.rank,
-          retrievalRrfScore:
-            result.rrf_score,
-          retrievalBm25fScore:
-            result.bm25f_score,
-          retrievalLexicalRank:
-            result.exact_rank ?? original.lexicalRank,
-          retrievalBm25Rank:
-            result.bm25_rank ?? null,
-          retrievalStructuralComplete:
-            result.structural_complete === true,
-        })
-
-        rerankedKeys.add(key)
-      }
-
-      /*
-       * A candidate rejected by the ranker (for example >2 MiB) is not
-       * declared irrelevant. Keep it in the candidate universe in its
-       * original relative order after the successfully reranked prefix.
-       */
-      for (const entry of candidates) {
-        const key = evidenceFileKey(entry.file)
-        if (!rerankedKeys.has(key)) {
-          reranked.push(entry)
-        }
-      }
-
-      // Files outside the bounded rerank prefix retain original order.
-      const tail =
-        lexicalRankedFiles.slice(candidates.length)
-
-      finish({
-        attempted: true,
-        ok: true,
-        reason:
-          (response.errors?.length ?? 0) > 0
-            ? "ranked_partial"
-            : "ranked",
-        elapsedMs: elapsed(),
-        inputFiles: candidates.length,
-        outputFiles: response.results.length,
-        degradedFiles:
-          Array.isArray(response.degraded_files)
-            ? response.degraded_files.length
-            : 0,
-        errorFiles:
-          Array.isArray(response.errors)
-            ? response.errors.length
-            : 0,
-        rankedFiles: [
-          ...reranked,
-          ...tail,
-        ],
-      })
-    })
-
-    try {
-      child.stdin.end(
-        JSON.stringify({
-          root,
-          query,
-          files: candidates.map(
-            (entry, index) => ({
-              file: evidenceFileKey(entry.file),
-
-              // retrieval-ranker-v1 calls this exact_rank. In live Scout
-              // this is the deterministic lexical relevance rank.
-              exact_rank: index + 1,
-            }),
-          ),
-          max_results:
-            RETRIEVAL_RANKER_MAX_FILES,
-        }),
-      )
-    } catch {
-      child.kill("SIGKILL")
-
-      finish(
-        retrievalRankerFallback(
-          lexicalRankedFiles,
-          "stdin_error",
-          {
-            attempted: true,
-            inputFiles: candidates.length,
-            elapsedMs: elapsed(),
-          },
-        ),
-      )
-    }
-  })
 }

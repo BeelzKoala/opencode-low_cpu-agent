@@ -324,16 +324,16 @@ def extract_failure_reason(
     patches: list[dict[str, Any]],
     cli_timed_out: bool,
 ) -> str:
-    if patches:
-        output = tool_output(patches[-1])
+    for terminal_rows in (patches, searches):
+        if not terminal_rows:
+            continue
 
+        output = tool_output(terminal_rows[-1])
         if "PATCH_STOP" in output:
             marker = "reason="
             pos = output.find(marker)
-
             if pos >= 0:
                 return output[pos + len(marker):].split()[0]
-
             return "patch_stop"
 
     if searches:
@@ -666,6 +666,45 @@ def run_task(
             and isinstance(row.get("part"), dict)
             and row["part"].get("tool") in mutation_tools
         ]
+        terminal_patch_rows = [
+            row
+            for row in rows
+            if row.get("type") == "tool_use"
+            and any(
+                marker in tool_output(row)
+                for marker in (
+                    "PATCH_READY",
+                    "PATCH_STOP",
+                    "PATCH_RETRY",
+                    "PATCH_RESCOUT",
+                )
+            )
+        ]
+        driver_row = (
+            terminal_patch_rows[-1]
+            if terminal_patch_rows
+            else patches[-1]
+            if patches
+            else searches[-1]
+            if searches
+            else None
+        )
+        driver_sid = session_id(driver_row) if driver_row else None
+        trace = executor_trace_for_session(worktree, driver_sid)
+
+        executor_trace_rows = load_json_lines(
+            worktree / ".opencode" / "executor-trace.jsonl"
+        )
+        deterministic_commit_hashes = {
+            row.get("action_commit_sha256")
+            for row in executor_trace_rows
+            if row.get("sessionID") == driver_sid
+            and row.get("mutation_dispatch_origin")
+                == "deterministic_action_commit"
+            and isinstance(row.get("action_commit_sha256"), str)
+            and len(row["action_commit_sha256"]) == 64
+        }
+        deterministic_dispatches = len(deterministic_commit_hashes)
 
         cpu_trace_rows = load_json_lines(
             worktree / ".opencode" / "cpu-agent-trace.jsonl"
@@ -690,6 +729,123 @@ def run_task(
             for row in cpu_trace_rows
             if row.get("kind") == "model_dispatch"
         )
+        terminal_commit_rows = [
+            row
+            for row in cpu_trace_rows
+            if row.get("kind") == "terminal_commit"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        ]
+        terminal_commit_hashes = {
+            row.get("terminal_commit_sha256")
+            for row in terminal_commit_rows
+            if isinstance(row.get("terminal_commit_sha256"), str)
+            and len(row["terminal_commit_sha256"]) == 64
+        }
+        terminal_commits = len(terminal_commit_hashes)
+        terminal_short_circuit_requests = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "terminal_short_circuit_requested"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        terminal_short_circuits = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "terminal_short_circuit"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        terminal_short_circuit_failures = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "terminal_short_circuit_failed"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        completion_safe_fail_commit_rows = [
+            row
+            for row in cpu_trace_rows
+            if row.get("kind") == "completion_safe_fail_commit"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        ]
+        completion_safe_fail_commits = len({
+            row.get("completion_safe_fail_sha256")
+            for row in completion_safe_fail_commit_rows
+            if isinstance(row.get("completion_safe_fail_sha256"), str)
+            and len(row["completion_safe_fail_sha256"]) == 64
+        })
+        completion_safe_fail_requests = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "completion_safe_fail_requested"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        completion_safe_fails = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "completion_safe_fail"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        completion_safe_fail_failures = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "completion_safe_fail_failed"
+            and (
+                driver_sid is None
+                or row.get("sessionID") == driver_sid
+            )
+        )
+        completion_safe_fail_ts = [
+            row.get("ts")
+            for row in completion_safe_fail_commit_rows
+            if isinstance(row.get("ts"), (int, float))
+        ]
+        first_completion_safe_fail_ts = (
+            min(completion_safe_fail_ts)
+            if completion_safe_fail_ts
+            else None
+        )
+        post_completion_safe_fail_model_dispatches = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "model_dispatch"
+            and isinstance(row.get("ts"), (int, float))
+            and first_completion_safe_fail_ts is not None
+            and row["ts"] > first_completion_safe_fail_ts
+        )
+        terminal_ts = [
+            row.get("ts")
+            for row in terminal_commit_rows
+            if isinstance(row.get("ts"), (int, float))
+        ]
+        first_terminal_ts = min(terminal_ts) if terminal_ts else None
+        post_terminal_model_dispatches = sum(
+            1
+            for row in cpu_trace_rows
+            if row.get("kind") == "model_dispatch"
+            and isinstance(row.get("ts"), (int, float))
+            and first_terminal_ts is not None
+            and row["ts"] > first_terminal_ts
+        )
 
         files_considered = max_number(
             [
@@ -708,6 +864,26 @@ def run_task(
             "model_dispatches": model_dispatches,
             "search_calls": len(searches),
             "mutation_tool_calls": len(patches),
+            "model_mutation_tool_calls": len(patches),
+            "deterministic_dispatches": deterministic_dispatches,
+            "mutation_executions": len(patches) + deterministic_dispatches,
+            "terminal_commits": terminal_commits,
+            "terminal_short_circuit_requests":
+                terminal_short_circuit_requests,
+            "terminal_short_circuits": terminal_short_circuits,
+            "terminal_short_circuit_failures":
+                terminal_short_circuit_failures,
+            "post_terminal_model_dispatches":
+                post_terminal_model_dispatches,
+            "completion_safe_fail_commits":
+                completion_safe_fail_commits,
+            "completion_safe_fail_requests":
+                completion_safe_fail_requests,
+            "completion_safe_fails": completion_safe_fails,
+            "completion_safe_fail_failures":
+                completion_safe_fail_failures,
+            "post_completion_safe_fail_model_dispatches":
+                post_completion_safe_fail_model_dispatches,
             "execute_replace_node_calls": len(replace_calls),
             "execute_rename_symbol_calls": len(rename_calls),
             "files_considered": files_considered,
@@ -757,7 +933,7 @@ def run_task(
                 })
                 return result
 
-        if not patches:
+        if not patches and deterministic_dispatches < 1:
             result.update({
                 "result": "SAFE_FAIL",
                 "failure_class": (
@@ -773,10 +949,17 @@ def run_task(
             })
             return result
 
-        patch_row = patches[-1]
+        patch_row = driver_row
+        if patch_row is None:
+            result.update({
+                "result": "HARNESS_FAIL",
+                "failure_class": "telemetry_bug",
+                "reason": "terminal_patch_transport_missing",
+            })
+            return result
+
         patch_output = tool_output(patch_row)
-        sid = session_id(patch_row)
-        trace = executor_trace_for_session(worktree, sid)
+        sid = driver_sid
 
         result["session_id"] = sid
 
@@ -812,6 +995,31 @@ def run_task(
                     searches,
                     patches,
                     agent["timed_out"],
+                ),
+            })
+            return result
+
+        if completion_safe_fail_commits > 0:
+            safe_fail_reason = None
+            if completion_safe_fail_commit_rows:
+                safe_fail_reason = completion_safe_fail_commit_rows[-1].get(
+                    "completion_safe_fail_reason"
+                )
+            result.update({
+                "result": "SAFE_FAIL",
+                "failure_class": (
+                    "environment_bug"
+                    if safe_fail_reason in {
+                        "spawn_error",
+                        "timeout",
+                        "completion_authorizer_unavailable",
+                    }
+                    else "architecture_bug"
+                ),
+                "reason": (
+                    f"completion_safe_fail:{safe_fail_reason}"
+                    if isinstance(safe_fail_reason, str) and safe_fail_reason
+                    else "completion_safe_fail"
                 ),
             })
             return result

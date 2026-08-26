@@ -42,6 +42,10 @@ assert 'tool_records(rows, "execute_replace_node")' in new
 assert 'tool_records(rows, "execute_rename_symbol")' in new
 
 assert '"mutation_tool_calls": len(patches)' in new
+assert '"model_mutation_tool_calls": len(patches)' in new
+assert '"deterministic_dispatches": deterministic_dispatches' in new
+assert 'terminal_patch_rows = [' in new
+assert 'if not patches and deterministic_dispatches < 1:' in new
 assert '"execute_replace_node_calls": len(replace_calls)' in new
 assert '"execute_rename_symbol_calls": len(rename_calls)' in new
 

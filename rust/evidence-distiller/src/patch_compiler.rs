@@ -766,6 +766,89 @@ fn valid_ascii_identifier(value: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+fn rename_identifier_kind(kind: &str) -> bool {
+    kind == "identifier"
+        || kind.ends_with("_identifier")
+        || kind == "shorthand_property_identifier_pattern"
+}
+
+fn rename_identifier_leaf_count(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+) -> std::result::Result<usize, &'static str> {
+    let lang = SupportLang::from_path(path).ok_or("language_unsupported")?;
+    let ast = lang.ast_grep(source);
+    let root = ast.root();
+
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
+        return Err("source_syntax_invalid");
+    }
+
+    Ok(root
+        .dfs()
+        .filter(|node| {
+            node.is_named_leaf()
+                && rename_identifier_kind(node.kind().as_ref())
+                && node.text().as_ref() == symbol
+        })
+        .count())
+}
+
+fn python_reflective_builtin_hazard(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+) -> std::result::Result<bool, &'static str> {
+    let lang = SupportLang::from_path(path).ok_or("language_unsupported")?;
+    if !matches!(lang, SupportLang::Python) {
+        return Ok(false);
+    }
+
+    let ast = lang.ast_grep(source);
+    let root = ast.root();
+
+    if root
+        .clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+    {
+        return Err("source_syntax_invalid");
+    }
+
+    for node in root.dfs().filter(|node| node.is_named()) {
+        if node.kind().as_ref() != "call" {
+            continue;
+        }
+
+        let Some(function) = node.field("function") else {
+            continue;
+        };
+        let function_name = function.text();
+        let function_name = function_name.as_ref().trim();
+
+        if !matches!(
+            function_name,
+            "getattr" | "setattr" | "hasattr" | "delattr"
+        ) {
+            continue;
+        }
+
+        if node.clone().dfs().any(|child| {
+            child.kind().as_ref() == "string_content"
+                && child.text().as_ref() == symbol
+        }) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn line_bounds(source: &str, byte: usize) -> (usize, usize) {
     let start = source[..byte.min(source.len())]
         .rfind('\n')
@@ -1513,6 +1596,37 @@ fn compile_rename(
         }
     }
 
+    /*
+     * Destination freshness is semantic authority, not a style preference.
+     * A pre-existing structural identifier with the requested destination
+     * spelling anywhere in the proven closure can capture a renamed reference.
+     * Fail closed instead of attempting flow-sensitive name-resolution here.
+     */
+    for rel in &closure.files {
+        let Some(file) = allowed.get(rel) else {
+            return Err("rename_scope_incomplete");
+        };
+
+        if rename_identifier_leaf_count(&file.path, &file.source, new_name)? > 0 {
+            return Err("rename_destination_not_fresh");
+        }
+    }
+
+    /*
+     * Python dynamic attribute lookup is not represented by identifier leaves:
+     *
+     *     getattr(obj, "old_name")
+     *
+     * Exact lexical Scout evidence can still place such a file in the sealed
+     * handoff, so inspect every authorized source file deterministically.
+     * We do not rewrite strings. Unsupported dynamic identity => SAFE_FAIL.
+     */
+    for file in allowed.values() {
+        if python_reflective_builtin_hazard(&file.path, &file.source, &mutation.symbol)? {
+            return Err("rename_reflective_builtin_unsupported");
+        }
+    }
+
     let mut total_occurrences = facts.candidates.len();
 
     if closure.bindings.len() > MAX_RENAME_OCCURRENCES {
@@ -2062,6 +2176,66 @@ def second():
         assert_eq!(rendered.matches("def beta():").count(), 1);
         assert_eq!(rendered.matches("return beta()").count(), 2);
         assert!(!rendered.contains("alpha"));
+    }
+
+    #[test]
+    fn rename_rejects_destination_capture() {
+        let source = r#"def alpha():
+    return 1
+
+def caller():
+    beta = lambda: 2
+    return alpha()
+"#;
+
+        let file = rename_file(source, vec![1, 4, 5]);
+        let mut allowed = BTreeMap::new();
+        allowed.insert(file.rel.clone(), file.clone());
+
+        let err = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "rename_destination_not_fresh");
+    }
+
+    #[test]
+    fn rename_rejects_python_reflective_builtin_string() {
+        let source = r#"def alpha():
+    return 1
+
+def call_dynamic(module):
+    return getattr(module, "alpha")()
+"#;
+
+        let file = rename_file(source, vec![1, 4, 5]);
+        let mut allowed = BTreeMap::new();
+        allowed.insert(file.rel.clone(), file.clone());
+
+        let err = compile_rename(
+            file.path.parent().expect("fixture root"),
+            &allowed,
+            &file,
+            &rename_mutation("alpha", "beta"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "rename_reflective_builtin_unsupported");
+    }
+
+    #[test]
+    fn reflective_guard_ignores_plain_string_and_comment() {
+        let source = "def alpha():\n    note = \"alpha\"\n    return 1  # alpha\n";
+        let file = rename_file(source, vec![1, 2, 3]);
+
+        assert!(
+            !python_reflective_builtin_hazard(&file.path, &file.source, "alpha")
+                .expect("valid fixture")
+        );
     }
 
     #[test]

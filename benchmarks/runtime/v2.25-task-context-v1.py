@@ -23,8 +23,13 @@ helpers = section(
     "function usageFromTokens(tokens)",
 )
 
+task_action_module = (
+    ROOT / "opencode/plugins/cpu-search-core/task-action-v1.mjs"
+).resolve().as_uri()
+
 js = f"""
 import {{ createHash }} from "node:crypto";
+import {{ compileTaskAction, unresolvedTaskAction }} from {json.dumps(task_action_module)};
 
 const TASK_CONTEXT_PROTOCOL = "task-context-v1";
 const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string";

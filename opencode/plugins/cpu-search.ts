@@ -2,6 +2,27 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+import {
+  TASK_ACTION_PROTOCOL,
+  compileTaskAction,
+  unresolvedTaskAction,
+} from "./cpu-search-core/task-action-v1.mjs"
+import {
+  TASK_SEARCH_PLAN_PROTOCOL,
+  compileTaskSearchPlanForState,
+} from "./cpu-search-core/task-search-plan-v1.mjs"
+import {
+  ACTION_COMMIT_DISPATCH_ORIGIN,
+  ACTION_COMMIT_PROTOCOL,
+  claimActionCommit,
+  deriveActionCommit,
+} from "./cpu-search-core/action-commit-v1.mjs"
+import {
+  TERMINAL_COMMIT_PROTOCOL,
+  claimTerminalCommit,
+  deriveTerminalCommit,
+  terminalCommitMatchesTask,
+} from "./cpu-search-core/terminal-commit-v1.mjs"
 
 const MAX_QUERIES = 4
 const LINE_HIT_CAP_PER_QUERY = 1000
@@ -156,6 +177,11 @@ const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
 const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v2"
 const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
+const COMPLETION_AUTHORIZER_REQUEST_PROTOCOL = "completion-authorizer-request-v1"
+const COMPLETION_AUTHORIZER_PROTOCOL = "completion-authorizer-v1"
+const COMPLETION_AUTHORIZER_POLICY = "exact-rename-v1"
+const COMPLETION_SAFE_FAIL_PROTOCOL = "completion-safe-fail-v1"
+const COMPLETION_SAFE_FAIL_OUTCOME = "SAFE_FAIL"
 // Wall-clock limits in the deterministic mutation plane are hard liveness
 // watchdogs, not capability or correctness budgets. Actual mutation scope is
 // bounded independently by files, edits, lines, bytes, checks, evidence and
@@ -169,6 +195,12 @@ const PATCH_EXECUTOR_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const PATCH_EXECUTOR_MAX_STDOUT_BYTES = 256 * 1024
 const INVARIANT_VERIFIER_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
+// Native completion authorization benchmarks at ~1 ms median / ~1.4 ms p95.
+// This is only a liveness watchdog. Timeout/ABSTAIN withholds terminal
+// optimization; the verified PATCH_READY candidate remains valid and the
+// ordinary agent loop may continue.
+const COMPLETION_AUTHORIZER_TIMEOUT_MS = 500
+const COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES = 64 * 1024
 const MAX_PATCH_ATTEMPTS_PER_TURN = 2
 
 // v2.16-B: deterministic runtime identity.
@@ -193,8 +225,6 @@ const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
 const TASK_CONTEXT_PROTOCOL = "task-context-v1"
 const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
-const TASK_ACTION_PROTOCOL = "task-action-v1"
-const TASK_SEARCH_PLAN_PROTOCOL = "task-search-plan-v1"
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
 const TASK_CONTEXT_MAX_PARTS = 64
 const TASK_CONTEXT_MAX_REPORTED_PART_TYPES = 16
@@ -223,6 +253,12 @@ const MAX_TURN_EVIDENCE_BYTES = 8192
 
 const MAX_MODEL_CALLS_PER_TURN = 4
 const MAX_TURN_WALL_MS = 120_000
+
+// v2.27-C: proof-carrying terminalization. The verifier remains authority;
+// this layer only prevents a redundant provider turn after immutable proof.
+const TERMINAL_ARTIFACT_MAX_BYTES = 512 * 1024
+const TERMINAL_SHORT_CIRCUIT_ENABLED =
+  process.env.OPENCODE_CPU_AGENT_TERMINAL_SHORT_CIRCUIT !== "0"
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000
 const MAX_TRACKED_SESSIONS = 256
@@ -636,6 +672,183 @@ async function writeProjectTrace(root, fileName, record) {
 
 function scoutOpaqueKey(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 20)
+}
+
+function clearTerminalCommitState(state) {
+  if (!state) return
+  state.terminalCommit = null
+  state.terminalCommitSha256 = null
+  state.terminalCommitClaims = 0
+  state.terminalShortCircuitAttemptedSha256 = null
+  state.terminalShortCircuitRequests = 0
+  state.terminalShortCircuits = 0
+  state.terminalShortCircuitFailures = 0
+}
+
+function clearCompletionSafeFailState(state) {
+  if (!state) return
+  state.completionSafeFail = null
+  state.completionSafeFailSha256 = null
+  state.completionSafeFailClaims = 0
+  state.completionSafeFailShortCircuitAttemptedSha256 = null
+  state.completionSafeFailShortCircuitRequests = 0
+  state.completionSafeFailShortCircuits = 0
+  state.completionSafeFailShortCircuitFailures = 0
+}
+
+function completionSafeFailMatchesTask(commit, snapshot) {
+  if (!commit || commit.protocol !== COMPLETION_SAFE_FAIL_PROTOCOL) {
+    return { ok: false, reason: "completion_safe_fail_invalid" }
+  }
+  if (!snapshot?.ok || typeof snapshot.turnID !== "string") {
+    return { ok: false, reason: "completion_safe_fail_task_unresolved" }
+  }
+  if (commit.user_turn_id !== snapshot.turnID) {
+    return { ok: false, reason: "completion_safe_fail_task_turn_changed" }
+  }
+  if (commit.task_sha256 !== snapshot.textSha256) {
+    return { ok: false, reason: "completion_safe_fail_task_text_drift" }
+  }
+  return { ok: true, reason: "completion_safe_fail_task_match" }
+}
+
+function deriveCompletionSafeFail({
+  state,
+  persisted,
+  completionAuthorization,
+}) {
+  if (!state || !persisted || !completionAuthorization) {
+    return { ok: false, reason: "completion_safe_fail_missing_input" }
+  }
+  if (completionAuthorization.applicable !== true) {
+    return { ok: false, reason: "completion_safe_fail_not_applicable" }
+  }
+  if (completionAuthorizationPermitsTerminal(completionAuthorization)) {
+    return { ok: false, reason: "completion_safe_fail_already_certified" }
+  }
+  const patchSha = persisted?.receipt?.patch_sha256
+  const actionCommitSha = persisted?.receipt?.action_commit_sha256
+  if (
+    typeof state.taskTurnID !== "string" ||
+    typeof state.taskTextSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(state.taskTextSha256) ||
+    typeof persisted.path !== "string" ||
+    typeof persisted.verificationPath !== "string" ||
+    typeof persisted.receiptSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(persisted.receiptSha256) ||
+    typeof persisted.verificationSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(persisted.verificationSha256) ||
+    typeof patchSha !== "string" ||
+    !/^[0-9a-f]{64}$/.test(patchSha) ||
+    typeof actionCommitSha !== "string" ||
+    !/^[0-9a-f]{64}$/.test(actionCommitSha)
+  ) {
+    return { ok: false, reason: "completion_safe_fail_identity_invalid" }
+  }
+
+  const canonical = {
+    protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+    outcome: COMPLETION_SAFE_FAIL_OUTCOME,
+    reason: completionAuthorization.reason ?? "completion_authorizer_unavailable",
+    completion_authorizer_transport_ok:
+      completionAuthorization.transport_ok === true,
+    completion_authorizer_decision:
+      completionAuthorization.decision ?? null,
+    user_turn_id: state.taskTurnID,
+    task_sha256: state.taskTextSha256,
+    action_commit_sha256: actionCommitSha,
+    patch_receipt_path: persisted.path,
+    patch_receipt_sha256: persisted.receiptSha256,
+    verification_receipt_path: persisted.verificationPath,
+    verification_receipt_sha256: persisted.verificationSha256,
+    patch_sha256: patchSha,
+  }
+  const commitSha256 = createHash("sha256")
+    .update(JSON.stringify(canonical))
+    .digest("hex")
+  return {
+    ok: true,
+    reason: "completion_safe_fail_ready",
+    commit: { ...canonical, commit_sha256: commitSha256 },
+  }
+}
+
+function claimCompletionSafeFail(state, commit) {
+  if (
+    !state ||
+    commit?.protocol !== COMPLETION_SAFE_FAIL_PROTOCOL ||
+    !/^[0-9a-f]{64}$/.test(commit?.commit_sha256 ?? "")
+  ) {
+    return { ok: false, reason: "completion_safe_fail_invalid" }
+  }
+  if (state.completionSafeFailSha256) {
+    return {
+      ok: state.completionSafeFailSha256 === commit.commit_sha256,
+      reason:
+        state.completionSafeFailSha256 === commit.commit_sha256
+          ? "completion_safe_fail_duplicate"
+          : "completion_safe_fail_conflict",
+    }
+  }
+  state.completionSafeFail = commit
+  state.completionSafeFailSha256 = commit.commit_sha256
+  state.completionSafeFailClaims = 1
+  return { ok: true, reason: "completion_safe_fail_claimed" }
+}
+
+async function terminalArtifactSha256(root, rawPath) {
+  if (
+    !root ||
+    typeof rawPath !== "string" ||
+    rawPath.length < 1 ||
+    rawPath.startsWith("/") ||
+    rawPath.includes("\0")
+  ) {
+    return null
+  }
+
+  const resolved = path.resolve(root, rawPath)
+  if (
+    resolved === root ||
+    !resolved.startsWith(root + path.sep)
+  ) {
+    return null
+  }
+
+  try {
+    const info = await stat(resolved)
+    if (
+      !info.isFile() ||
+      info.size < 1 ||
+      info.size > TERMINAL_ARTIFACT_MAX_BYTES
+    ) {
+      return null
+    }
+    const body = await readFile(resolved)
+    return createHash("sha256").update(body).digest("hex")
+  } catch {
+    return null
+  }
+}
+
+async function validateTerminalCommitArtifacts(root, commit) {
+  const checks = await Promise.all([
+    terminalArtifactSha256(root, commit?.patch_receipt_path),
+    terminalArtifactSha256(root, commit?.verification_receipt_path),
+    terminalArtifactSha256(root, commit?.patch_path),
+  ])
+
+  if (checks[0] !== commit?.patch_receipt_sha256) {
+    return { ok: false, reason: "terminal_patch_receipt_stale" }
+  }
+  if (checks[1] !== commit?.verification_receipt_sha256) {
+    return { ok: false, reason: "terminal_verification_receipt_stale" }
+  }
+  if (checks[2] !== commit?.patch_sha256) {
+    return { ok: false, reason: "terminal_patch_stale" }
+  }
+
+  return { ok: true, reason: "terminal_artifacts_match" }
 }
 
 function scoutFingerprintKey(fingerprint) {
@@ -2549,6 +2762,22 @@ function getSessionState(sessionID) {
       taskContextReason: "unresolved",
       taskContextDrift: false,
       taskAction: null,
+      actionCommitSha256: null,
+      actionCommitDispatches: 0,
+      terminalCommit: null,
+      terminalCommitSha256: null,
+      terminalCommitClaims: 0,
+      terminalShortCircuitAttemptedSha256: null,
+      terminalShortCircuitRequests: 0,
+      terminalShortCircuits: 0,
+      terminalShortCircuitFailures: 0,
+      completionSafeFail: null,
+      completionSafeFailSha256: null,
+      completionSafeFailClaims: 0,
+      completionSafeFailShortCircuitAttemptedSha256: null,
+      completionSafeFailShortCircuitRequests: 0,
+      completionSafeFailShortCircuits: 0,
+      completionSafeFailShortCircuitFailures: 0,
       mutationIntent: "unknown",
       mutationIntentReason: "unresolved",
       visibleToolSchemaSha256: null,
@@ -2618,6 +2847,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskContextReason = "unresolved"
   state.taskContextDrift = false
   state.taskAction = null
+  state.actionCommitSha256 = null
+  state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
   state.mutationIntentReason = "unresolved"
   state.visibleToolSchemaSha256 = null
@@ -2711,84 +2942,6 @@ function mutationToolsForState(state) {
   return resolution.tool ? [resolution.tool] : []
 }
 
-function compileTaskSearchPlanForState(
-  state,
-  requestedQueries,
-  requestedPath = ".",
-  requestedGlob = undefined,
-) {
-  const requested = [
-    ...new Set(
-      (Array.isArray(requestedQueries) ? requestedQueries : [])
-        .filter((query) => typeof query === "string" && query.length > 0),
-    ),
-  ]
-  const fallback = {
-    protocol: TASK_SEARCH_PLAN_PROTOCOL,
-    applied: false,
-    reason: "model_search_plan",
-    task_sha256: state?.taskTextSha256 ?? null,
-    requested_queries: requested,
-    effective_queries: requested,
-    requested_path:
-      typeof requestedPath === "string" && requestedPath.length > 0
-        ? requestedPath
-        : ".",
-    effective_path:
-      typeof requestedPath === "string" && requestedPath.length > 0
-        ? requestedPath
-        : ".",
-    requested_glob:
-      typeof requestedGlob === "string" && requestedGlob.length > 0
-        ? requestedGlob
-        : null,
-    effective_glob:
-      typeof requestedGlob === "string" && requestedGlob.length > 0
-        ? requestedGlob
-        : null,
-  }
-
-  const action = state?.taskAction ?? null
-  const oldName = taskActionIdentifier(action?.old_name)
-  const newName = taskActionIdentifier(action?.new_name)
-  const exactRename =
-    state?.executionState === EXEC_STATE_LOCATE &&
-    state?.mutationIntent === "rename_symbol" &&
-    action?.protocol === TASK_ACTION_PROTOCOL &&
-    action?.status === "exact" &&
-    action?.operation === "rename_symbol" &&
-    typeof action?.task_sha256 === "string" &&
-    action.task_sha256 === state?.taskTextSha256 &&
-    oldName !== null &&
-    newName !== null &&
-    oldName !== newName
-
-  if (!exactRename) return fallback
-
-  const globalSourceGlob = buildLanguageGlob(
-    "**/*",
-    SOURCE_LANGUAGE_EXTENSIONS,
-  )
-  if (!globalSourceGlob) {
-    return {
-      ...fallback,
-      reason: "exact_rename_source_glob_unavailable",
-    }
-  }
-
-  return {
-    protocol: TASK_SEARCH_PLAN_PROTOCOL,
-    applied: true,
-    reason: "exact_global_rename_identifier",
-    task_sha256: action.task_sha256,
-    requested_queries: requested,
-    effective_queries: [oldName],
-    requested_path: fallback.requested_path,
-    effective_path: ".",
-    requested_glob: fallback.requested_glob,
-    effective_glob: globalSourceGlob,
-  }
-}
 
 function allowedToolsForState(state) {
   if (!state) return []
@@ -6290,6 +6443,18 @@ function invariantVerifierBinary() {
   return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-invariant-verifier")
 }
 
+function completionAuthorizerBinary() {
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(
+    home,
+    ".local",
+    "libexec",
+    "opencode-cpu-agent",
+    "opencode-completion-authorizer",
+  )
+}
+
 function patchPlanSignature(compiled) {
   return createHash("sha256")
     .update(JSON.stringify({ edits: compiled?.edits ?? [], checks: compiled?.checks ?? [] }))
@@ -7068,7 +7233,116 @@ function runInvariantVerifier(root, request) {
   )
 }
 
-async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment) {
+function runCompletionAuthorizer(root, request) {
+  return runJsonBinary(
+    completionAuthorizerBinary(),
+    root,
+    request,
+    COMPLETION_AUTHORIZER_PROTOCOL,
+    COMPLETION_AUTHORIZER_TIMEOUT_MS,
+    COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES,
+  )
+}
+
+function completionAuthorizationPermitsTerminal(observation) {
+  return (
+    observation?.applicable === true &&
+    observation?.transport_ok === true &&
+    observation?.decision === "CERTIFY" &&
+    typeof observation?.certificate_sha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(observation.certificate_sha256)
+  )
+}
+
+async function observeCompletionAuthorization(
+  root,
+  sessionID,
+  state,
+  persisted,
+  proofAssessment,
+  dispatchOrigin,
+  actionCommit,
+) {
+  const applicable =
+    dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+    actionCommit?.protocol === ACTION_COMMIT_PROTOCOL &&
+    state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
+    state.taskAction.status === "exact" &&
+    state.taskAction.operation === "rename_symbol"
+
+  if (!applicable) {
+    return {
+      applicable: false,
+      transport_ok: false,
+      decision: null,
+      reason: "completion_authorizer_not_applicable",
+      certificate_sha256: null,
+      elapsed_ms: 0,
+    }
+  }
+
+  const request = {
+    protocol: COMPLETION_AUTHORIZER_REQUEST_PROTOCOL,
+    policy: COMPLETION_AUTHORIZER_POLICY,
+    user_turn_id: state.taskTurnID,
+    task_action: state.taskAction,
+    action_commit: actionCommit,
+    patch_receipt_path: persisted.path,
+    patch_receipt_body: JSON.stringify(persisted.receipt, null, 2) + "\n",
+    verification_receipt_path: persisted.verificationPath,
+    verification_receipt_body:
+      JSON.stringify(persisted.verificationReceipt, null, 2) + "\n",
+    proof_assessment: proofAssessment,
+  }
+
+  const result = await runCompletionAuthorizer(root, request)
+  const response = result?.ok === true ? result.response : null
+  const certificateSha256 =
+    response?.decision === "CERTIFY" &&
+    typeof response?.certificate?.certificate_sha256 === "string"
+      ? response.certificate.certificate_sha256
+      : null
+
+  const observation = {
+    applicable: true,
+    transport_ok: result?.ok === true,
+    decision: response?.decision ?? null,
+    reason:
+      response?.reason ??
+      result?.reason ??
+      "completion_authorizer_unknown",
+    certificate_sha256: certificateSha256,
+    elapsed_ms: result?.elapsedMs ?? null,
+  }
+
+  await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+    ts: nowMs(),
+    protocol: AGENT_PROTOCOL,
+    kind: "completion_authorizer",
+    completion_authorizer_protocol: COMPLETION_AUTHORIZER_PROTOCOL,
+    completion_authorizer_policy: COMPLETION_AUTHORIZER_POLICY,
+    completion_authorizer_authority: "terminal_permission",
+    completion_authorizer_applicable: observation.applicable,
+    completion_authorizer_transport_ok: observation.transport_ok,
+    completion_authorizer_decision: observation.decision,
+    completion_authorizer_reason: observation.reason,
+    completion_certificate_sha256: observation.certificate_sha256,
+    completion_authorizer_elapsed_ms: observation.elapsed_ms,
+    sessionID,
+    turnID: state.turnID,
+    task_turn_id: state.taskTurnID,
+    task_sha256: state.taskTextSha256,
+    action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+    patch_receipt: persisted.path,
+    verification_receipt: persisted.verificationPath,
+    patch_sha256: persisted.receipt?.patch_sha256 ?? null,
+    project_root: root,
+  })
+
+  return observation
+}
+
+async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment, dispatch = null) {
   const patch = typeof executorResponse?.patch === "string" ? executorResponse.patch : null
   if (!patch || !sessionID || !state?.turnID) return null
 
@@ -7087,6 +7361,9 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
     verification_receipt: path.relative(root, verificationPath),
     execution_protocol: EXECUTION_LOOP_PROTOCOL,
     mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+    mutation_dispatch_origin: dispatch?.origin ?? "model_tool",
+    action_commit_protocol: dispatch?.actionCommit?.protocol ?? null,
+    action_commit_sha256: dispatch?.actionCommit?.commit_sha256 ?? null,
     mutation_tool: state.activeMutationTool,
     visible_tool_schema_sha256: state.visibleToolSchemaSha256,
     tool_contract_failures: state.contractFailures,
@@ -7170,13 +7447,26 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
       proof_assessment: proofAssessment,
       verifier: verificationResponse,
     }
+    const receiptBody = JSON.stringify(receipt, null, 2) + "\n"
+    const verificationBody = JSON.stringify(verificationReceipt, null, 2) + "\n"
+    const receiptSha256 =
+      createHash("sha256").update(receiptBody).digest("hex")
+    const verificationSha256 =
+      createHash("sha256").update(verificationBody).digest("hex")
     await writeFile(patchTemp, patch, "utf8")
-    await writeFile(receiptTemp, JSON.stringify(receipt, null, 2) + "\n", "utf8")
-    await writeFile(verificationTemp, JSON.stringify(verificationReceipt, null, 2) + "\n", "utf8")
+    await writeFile(receiptTemp, receiptBody, "utf8")
+    await writeFile(verificationTemp, verificationBody, "utf8")
     await rename(patchTemp, patchPath)
     await rename(receiptTemp, receiptPath)
     await rename(verificationTemp, verificationPath)
-    return { path: path.relative(root, receiptPath), verificationPath: path.relative(root, verificationPath), receipt, verificationReceipt }
+    return {
+      path: path.relative(root, receiptPath),
+      verificationPath: path.relative(root, verificationPath),
+      receipt,
+      verificationReceipt,
+      receiptSha256,
+      verificationSha256,
+    }
   } catch {
     await rm(patchTemp, { force: true }).catch(() => {})
     await rm(receiptTemp, { force: true }).catch(() => {})
@@ -10593,116 +10883,6 @@ function classifyMutationIntent(text) {
   }
 }
 
-function taskActionIdentifier(value) {
-  const text = String(value ?? "").trim()
-  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text)
-    ? text
-    : null
-}
-
-function unresolvedTaskAction(reason, taskSha256 = null) {
-  return {
-    protocol: TASK_ACTION_PROTOCOL,
-    status: "unresolved",
-    operation: null,
-    old_name: null,
-    new_name: null,
-    task_sha256:
-      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
-        ? taskSha256
-        : null,
-    reason,
-  }
-}
-
-function exactRenameTaskAction(oldName, newName, taskSha256, reason) {
-  const oldIdentifier = taskActionIdentifier(oldName)
-  const newIdentifier = taskActionIdentifier(newName)
-
-  if (!oldIdentifier || !newIdentifier || oldIdentifier === newIdentifier) {
-    return unresolvedTaskAction("task_action_identifier_invalid", taskSha256)
-  }
-
-  return {
-    protocol: TASK_ACTION_PROTOCOL,
-    status: "exact",
-    operation: "rename_symbol",
-    old_name: oldIdentifier,
-    new_name: newIdentifier,
-    task_sha256:
-      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
-        ? taskSha256
-        : null,
-    reason,
-  }
-}
-
-function compileTaskAction(value, taskSha256 = null) {
-  const text = String(value ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
-  if (!text) return unresolvedTaskAction("task_action_text_empty", taskSha256)
-
-  const negativeRename =
-    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
-    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
-    /(?:^|\s)(?:не|без)\s+переимен/iu.test(text)
-
-  if (negativeRename) {
-    return unresolvedTaskAction("task_action_negative_rename", taskSha256)
-  }
-
-  const ident = "[`'\"]?([A-Za-z_$][A-Za-z0-9_$]*)[`'\"]?"
-  const patterns = [
-    new RegExp(
-      "(?:^|[.!?]\\s*)(?:please\\s+)?rename\\b.{0,140}?" +
-      ident +
-      "\\s+(?:to|as|->|→)\\s*" +
-      ident,
-      "giu",
-    ),
-    new RegExp(
-      "(?:^|[.!?]\\s*)change\\s+(?:the\\s+)?(?:name|identifier)\\s+of\\s+" +
-      ident +
-      ".{0,40}?\\b(?:to|as)\\b\\s*" +
-      ident,
-      "giu",
-    ),
-    new RegExp(
-      "(?:^|[.!?]\\s*)(?:пожалуйста[,\\s]+)?переимен(?:уй|уйте)" +
-      "(?=\\s|$|[,:;.!?]).{0,140}?" +
-      ident +
-      "(?:\\s*[:,]?\\s*)(?:в|на|->|→)\\s*" +
-      ident,
-      "giu",
-    ),
-  ]
-
-  const pairs = new Map()
-
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      const oldName = taskActionIdentifier(match[1])
-      const newName = taskActionIdentifier(match[2])
-      if (!oldName || !newName || oldName === newName) continue
-      pairs.set(`${oldName}\u0000${newName}`, { oldName, newName })
-    }
-  }
-
-  if (pairs.size < 1) {
-    return unresolvedTaskAction("task_action_not_exact", taskSha256)
-  }
-
-  if (pairs.size > 1) {
-    return unresolvedTaskAction("task_action_multiple_rename_pairs", taskSha256)
-  }
-
-  const pair = [...pairs.values()][0]
-  return exactRenameTaskAction(
-    pair.oldName,
-    pair.newName,
-    taskSha256,
-    "exact_rename_pair",
-  )
-}
 
 function userTurnSnapshotFromContext(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : []
@@ -11008,6 +11188,877 @@ export default {
 
     const unsubscribeEvents = await subscribeEvents(ctx)
 
+    const executeCapabilityMutationCore = async (
+      rawInput,
+      toolContext,
+      forcedKind,
+      toolName,
+      dispatch = null,
+    ) => {
+      const input = {
+        ...(rawInput ?? {}),
+        kind: forcedKind,
+      }
+        const dispatchOrigin =
+        dispatch?.origin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? ACTION_COMMIT_DISPATCH_ORIGIN
+          : "model_tool"
+      const actionCommit =
+        dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? dispatch?.actionCommit ?? null
+          : null
+      const started = performance.now()
+        const sessionID =
+          typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
+            ? toolContext.sessionID
+            : null
+        const state = getSessionState(sessionID)
+        const root = await rootForTool(ctx, toolContext, sessionID, state)
+        const runtimeIdentity = await runtimeStackIdentity()
+
+        const trace = async (record) => {
+          await writeProjectTrace(root, "executor-trace.jsonl", {
+            ts: nowMs(),
+            protocol: EXECUTION_LOOP_PROTOCOL,
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            mutation_attempt: state?.mutationAttempts ?? null,
+            repair_attempts: state?.repairAttempts ?? null,
+            compiler_runs: state?.compilerRuns ?? null,
+            patch_attempt: state?.patchAttempts ?? null,
+            executor_runs: state?.executorRuns ?? null,
+            executed_patches: state?.executedPatches ?? null,
+            turn_model_calls: state?.modelCalls ?? null,
+            scout_handoff_path: state?.scoutHandoffPath ?? null,
+            edit_capsule_path: state?.editCapsulePath ?? null,
+            bound_mutation_target: state?.boundMutationTarget ?? null,
+            preauthorized_mutation_candidates:
+              state?.localMutationCandidates?.length ?? 0,
+            execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_state: state?.executionState ?? null,
+            execution_reason: state?.executionReason ?? null,
+            mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+            mutation_tool: toolName,
+            semantic_kind: forcedKind,
+            mutation_dispatch_origin: dispatchOrigin,
+            action_commit_protocol: actionCommit?.protocol ?? null,
+            action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+            tool_contract_failures: state?.contractFailures ?? null,
+            ...runtimeIdentity,
+            ...record,
+            tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+          })
+        }
+
+        if (!root || !state) {
+          await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
+          return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
+        }
+        if (
+          dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+          (
+            actionCommit?.protocol !== ACTION_COMMIT_PROTOCOL ||
+            actionCommit?.operation !== "rename_symbol" ||
+            actionCommit?.tool !== toolName ||
+            actionCommit?.task_sha256 !== state.taskTextSha256 ||
+            actionCommit?.new_name !== rawInput?.new_name ||
+            actionCommit?.old_name !==
+              state?.renameMutationCapability?.target?.symbol_name ||
+            actionCommit?.scout_handoff_path !== state.scoutHandoffPath ||
+            actionCommit?.target_identity_sha256 !==
+              state?.renameMutationCapability?.targetIdentitySha256 ||
+            actionCommit?.target_source_sha256 !==
+              state?.renameMutationCapability?.targetSourceSha256 ||
+            actionCommit?.commit_sha256 !== state.actionCommitSha256
+          )
+        ) {
+          applyExecutionEvent(state, "fatal", "action_commit_stale")
+          await trace({ admitted: false, reason: "action_commit_stale", action: "stop" })
+          return {
+            content: "PATCH_STOP reason=action_commit_stale action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "action_commit_stale",
+            },
+          }
+        }
+
+        const exactTaskRename =
+          state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
+          state?.taskAction?.status === "exact" &&
+          state?.taskAction?.operation === "rename_symbol" &&
+          state?.taskAction?.task_sha256 === state?.taskTextSha256
+
+        if (
+          forcedKind === "rename_symbol" &&
+          exactTaskRename &&
+          rawInput?.new_name !== state.taskAction.new_name
+        ) {
+          applyExecutionEvent(state, "fatal", "task_action_argument_mismatch")
+          await trace({
+            admitted: false,
+            reason: "task_action_argument_mismatch",
+            action: "stop",
+          })
+          return {
+            content:
+              "PATCH_STOP reason=task_action_argument_mismatch " +
+              "action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "task_action_argument_mismatch",
+            },
+          }
+        }
+        if (!toolAllowedForExecutionState(state, toolName)) {
+          const next = nextActionForExecutionState(state)
+          const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
+          await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
+          return {
+            content: `${action === "rescout" ? "PATCH_RESCOUT" : "PATCH_STOP"} reason=causal_frontier state=${state.executionState} action=${next}`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action,
+              reason: "causal_frontier",
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              next_action: next,
+            },
+          }
+        }
+        if (!state.scoutHandoffPath) {
+          applyExecutionEvent(state, "patch_rescout", "scout_handoff_missing", { reason: "scout_handoff_missing" })
+          await trace({ admitted: false, reason: "scout_handoff_missing", action: "rescout" })
+          return {
+            content: "PATCH_RESCOUT reason=scout_handoff_missing action=search_first",
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "scout_handoff_missing" },
+          }
+        }
+        if (state.patchAccepted) {
+          applyExecutionEvent(state, "patch_ready", "patch_already_accepted")
+          await trace({ admitted: false, reason: "patch_already_accepted", action: "stop", receipt_path: state.patchReceiptPath })
+          return {
+            content: `PATCH_STOP reason=patch_already_accepted receipt=${state.patchReceiptPath ?? "unknown"} action=use_receipt`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
+          }
+        }
+        if (state.mutationAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
+          applyExecutionEvent(state, "fatal", "mutation_attempt_budget")
+          await trace({
+            admitted: false,
+            reason: "mutation_attempt_budget",
+            action: "stop",
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_attempt_budget ` +
+              `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_attempt_budget",
+            },
+          }
+        }
+
+        const forbiddenRawAuthorityField = [
+          "kind",
+          "file",
+          "symbol",
+          "scope",
+        ].find((field) => mutationFieldPresent(rawInput, field))
+
+        const shape = forbiddenRawAuthorityField
+          ? mutationShapeFailure(
+              forcedKind,
+              `action_tool_forbids_${forbiddenRawAuthorityField}`,
+            )
+          : validateMutationShape(input)
+
+        // Tool-schema/transport violations are not semantic patch attempts.
+        // With action-specific top-level required fields these should be
+        // unreachable under a conforming provider; if they reach runtime,
+        // fail closed without consuming the one semantic repair.
+        if (shape.ok !== true) {
+          state.contractFailures += 1
+          const repeated = state.contractFailureSignatures.has(shape.signature)
+          state.contractFailureSignatures.add(shape.signature)
+          applyExecutionEvent(state, "fatal", "tool_contract_violation")
+
+          await trace({
+            admitted: false,
+            failure_layer: "tool_contract",
+            reason: "tool_contract_violation",
+            contract_detail: shape.detail,
+            contract_signature: shape.signature,
+            repeated_contract_failure: repeated,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+
+          return {
+            content:
+              `PATCH_STOP reason=tool_contract_violation ` +
+              `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `contract_failures=${state.contractFailures} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "tool_contract_violation",
+              detail: shape.detail,
+              failure_layer: "tool_contract",
+              semantic_attempt_consumed: false,
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        if (
+          state.activeMutationTool &&
+          state.activeMutationTool !== toolName
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_action_changed_during_attempt")
+          await trace({
+            admitted: false,
+            failure_layer: "orchestrator_contract",
+            reason: "mutation_action_changed_during_attempt",
+            previous_tool: state.activeMutationTool,
+            attempted_tool: toolName,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_action_changed_during_attempt ` +
+              `expected=${state.activeMutationTool} got=${toolName} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_action_changed_during_attempt",
+              failure_layer: "orchestrator_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        state.activeMutationTool = toolName
+
+        if (state.executionState === EXEC_STATE_REPAIR) {
+          state.repairAttempts += 1
+        }
+
+        state.mutationAttempts += 1
+        state.lastSeen = nowMs()
+
+        const authorization =
+          await materializeCapabilityBoundMutation(
+            root,
+            state,
+            input,
+          )
+
+        if (authorization.ok !== true) {
+          const reason =
+            typeof authorization.reason === "string"
+              ? authorization.reason
+              : "mutation_scope_unavailable"
+
+          const detail =
+            typeof authorization.detail === "string"
+              ? authorization.detail
+              : reason
+
+          const canRetryAuthorization =
+            authorization.repairable === true &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+
+          if (canRetryAuthorization) {
+            applyExecutionEvent(
+              state,
+              "patch_retry",
+              reason,
+            )
+
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "retry",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_RETRY reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=revise_semantic_owner_binding`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "retry",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          if (authorization.rescout === true) {
+            applyExecutionEvent(
+              state,
+              "patch_rescout",
+              reason,
+              {
+                reason,
+                detail,
+              },
+            )
+
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "rescout",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_RESCOUT reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=refine_search`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "rescout",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          applyExecutionEvent(
+            state,
+            "fatal",
+            reason,
+          )
+
+          await trace({
+            admitted: false,
+            failure_layer: "internal_contract",
+            reason,
+            scope_detail: detail,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+
+          return {
+            content:
+              `PATCH_STOP reason=${reason} ` +
+              `detail=${detail} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason,
+              detail,
+              failure_layer: "internal_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        const mutation =
+          authorization.mutation
+
+        const mutations = [mutation]
+
+        const activeMutationHandoffPath =
+          authorization.handoff_path
+
+        if (
+          typeof activeMutationHandoffPath !== "string" ||
+          activeMutationHandoffPath.length < 1
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_handoff_unavailable")
+          await trace({
+            admitted: false,
+            reason: "mutation_handoff_unavailable",
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              "PATCH_STOP reason=mutation_handoff_unavailable action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_handoff_unavailable",
+            },
+          }
+        }
+
+        state.activeMutationHandoffPath = activeMutationHandoffPath
+        state.compilerRuns += 1
+
+        const compiled = await runPatchCompiler(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mutation_protocol: PATCH_MUTATION_PROTOCOL,
+          mutations,
+        })
+        if (!compiled.ok) {
+          const reason = `compiler_${compiled.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", compiler_elapsed_ms: compiled.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+        const compilerResponse = compiled.response
+        if (compilerResponse?.ok !== true) {
+          const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
+          const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
+          const canRetry =
+            PATCH_COMPILER_RETRY_REASONS.has(reason) &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+          const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+          if (needsRescout) {
+            applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
+          } else if (canRetry) {
+            applyExecutionEvent(state, "patch_retry", reason)
+          } else {
+            applyExecutionEvent(state, "fatal", reason)
+          }
+          await trace({
+            admitted: false,
+            reason,
+            action,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutation_index: compilerResponse?.mutation_index ?? null,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            executor_run: false,
+          })
+          if (needsRescout) {
+            return {
+              content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
+            }
+          }
+          if (canRetry) {
+            return {
+              content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+            }
+          }
+          return {
+            content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        state.patchAttempts += 1
+
+        const signature = patchPlanSignature(compilerResponse)
+        if (state.patchSignatures.has(signature)) {
+          applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
+          await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
+          return {
+            content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
+          }
+        }
+        state.patchSignatures.add(signature)
+        state.executorRuns += 1
+        state.executedPatches += 1
+
+        const result = await runPatchExecutor(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mode: "guarded",
+          edit_protocol: PATCH_EDIT_PROTOCOL,
+          edits: compilerResponse?.edits ?? [],
+          checks: compilerResponse?.checks ?? [],
+        })
+
+        if (!result.ok) {
+          const reason = `executor_${result.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        const response = result.response
+        if (response?.admitted === true) {
+          const proofObligations = proofObligationsForMutations(mutations)
+          state.proofObligations = proofObligations
+          const verified = await runInvariantVerifier(root, {
+            root,
+            handoff: activeMutationHandoffPath,
+            patch: response?.patch ?? "",
+            compiler_protocol: PATCH_COMPILER_PROTOCOL,
+            mutation_protocol: PATCH_MUTATION_PROTOCOL,
+            mutations,
+            changed_files: compilerResponse?.changed_files ?? [],
+            edits: compilerResponse?.edits ?? [],
+          })
+          if (!verified.ok) {
+            const reason = `verifier_${verified.reason}`
+            applyExecutionEvent(state, "fatal", reason)
+            await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=${reason} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+          const verificationResponse = verified.response
+          const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
+          if (!proofAssessment.ok) {
+            const failedProofs = compactProofFailure(proofAssessment)
+            const canRepair =
+              proofAssessment.disposition === "repair" &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+            if (proofAssessment.disposition === "rescout") {
+              applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
+                reason: "proof_obligation_failed",
+                failed: proofAssessment.failed,
+              })
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "rescout", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RESCOUT reason=proof_obligation_failed failed=${failedProofs} action=refine_search`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            if (canRepair) {
+              applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            applyExecutionEvent(state, "fatal", "proof_obligation_failed")
+            await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+            }
+          }
+          const persisted = await writePatchReceipt(
+            root,
+            sessionID,
+            state,
+            response,
+            compilerResponse,
+            verificationResponse,
+            proofAssessment,
+            { origin: dispatchOrigin, actionCommit },
+          )
+          if (!persisted) {
+            applyExecutionEvent(state, "fatal", "receipt_write_failed")
+            await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+            return {
+              content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
+            }
+          }
+          const completionAuthorization =
+            await observeCompletionAuthorization(
+              root,
+              sessionID,
+              state,
+              persisted,
+              proofAssessment,
+              dispatchOrigin,
+              actionCommit,
+            )
+
+          state.patchAccepted = true
+          state.patchReceiptPath = persisted.path
+          applyExecutionEvent(state, "patch_ready", "verification_passed")
+
+          // Native CompletionAuthorizer is the only permission to create a
+          // TerminalCommit. ABSTAIN/transport failure withholds only the
+          // terminal optimization; the verified patch remains PATCH_READY and
+          // the ordinary agent loop may continue.
+          const completionAuthorized =
+            completionAuthorizationPermitsTerminal(
+              completionAuthorization,
+            )
+          let completionSafeFail = null
+          let completionSafeFailClaim = null
+          if (!completionAuthorized) {
+            const completionSafeFailResult = deriveCompletionSafeFail({
+              state,
+              persisted,
+              completionAuthorization,
+            })
+            if (completionSafeFailResult.ok === true) {
+              completionSafeFailClaim = claimCompletionSafeFail(
+                state,
+                completionSafeFailResult.commit,
+              )
+              if (completionSafeFailClaim.ok === true) {
+                completionSafeFail = completionSafeFailResult.commit
+                await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                  ts: nowMs(),
+                  protocol: AGENT_PROTOCOL,
+                  kind: "completion_safe_fail_commit",
+                  completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+                  completion_safe_fail_sha256:
+                    completionSafeFail.commit_sha256,
+                  completion_safe_fail_reason: completionSafeFail.reason,
+                  completion_authorizer_transport_ok:
+                    completionAuthorization.transport_ok,
+                  completion_authorizer_decision:
+                    completionAuthorization.decision,
+                  sessionID,
+                  turnID: state.turnID,
+                  task_turn_id: state.taskTurnID,
+                  task_sha256: state.taskTextSha256,
+                  action_commit_sha256:
+                    completionSafeFail.action_commit_sha256,
+                  patch_receipt: completionSafeFail.patch_receipt_path,
+                  verification_receipt:
+                    completionSafeFail.verification_receipt_path,
+                  patch_sha256: completionSafeFail.patch_sha256,
+                  project_root: root,
+                })
+              }
+            }
+          }
+
+          const terminalCommitResult = completionAuthorized
+            ? deriveTerminalCommit({
+                state,
+                persisted,
+                proofAssessment,
+              })
+            : {
+                ok: false,
+                reason:
+                  completionAuthorization.applicable !== true
+                    ? "completion_authorizer_not_applicable"
+                    : completionAuthorization.transport_ok !== true
+                      ? "completion_authorizer_unavailable"
+                      : completionAuthorization.decision !== "CERTIFY"
+                        ? "completion_authorizer_abstain"
+                        : "completion_certificate_invalid",
+              }
+          let terminalCommit = null
+          let terminalClaim = null
+          if (terminalCommitResult.ok === true) {
+            terminalClaim = claimTerminalCommit(
+              state,
+              terminalCommitResult.commit,
+            )
+            if (terminalClaim.ok === true) {
+              terminalCommit = terminalCommitResult.commit
+              await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                ts: nowMs(),
+                protocol: AGENT_PROTOCOL,
+                kind: "terminal_commit",
+                terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                terminal_commit_sha256: terminalCommit.commit_sha256,
+                completion_authorizer_protocol:
+                  COMPLETION_AUTHORIZER_PROTOCOL,
+                completion_authorizer_authority:
+                  "terminal_permission",
+                completion_authorizer_permits_terminal:
+                  completionAuthorized,
+                completion_certificate_sha256:
+                  completionAuthorization.certificate_sha256,
+                sessionID,
+                turnID: state.turnID,
+                task_turn_id: state.taskTurnID,
+                task_sha256: state.taskTextSha256,
+                project_root: root,
+                proof_disposition: "pass",
+                patch_receipt: terminalCommit.patch_receipt_path,
+                verification_receipt:
+                  terminalCommit.verification_receipt_path,
+                patch_sha256: terminalCommit.patch_sha256,
+              })
+            }
+          }
+
+          await trace({
+            admitted: true,
+            reason: null,
+            action: "ready",
+            plan_signature: signature,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
+            compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+            executor_elapsed_ms: result.elapsedMs,
+            verifier_elapsed_ms: verified.elapsedMs,
+            invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+            invariants_total: verificationResponse?.invariants_total ?? 0,
+            invariants_passed: verificationResponse?.invariants_passed ?? 0,
+            proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+            proof_obligations: proofAssessment.obligations.map((item) => item.id),
+            proof_disposition: proofAssessment.disposition,
+            terminal_commit_protocol:
+              terminalCommit?.protocol ?? null,
+            terminal_commit_sha256:
+              terminalCommit?.commit_sha256 ?? null,
+            terminal_commit_reason:
+              terminalCommitResult.reason,
+            terminal_commit_claim_reason:
+              terminalClaim?.reason ?? null,
+            completion_safe_fail_protocol:
+              completionSafeFail?.protocol ?? null,
+            completion_safe_fail_sha256:
+              completionSafeFail?.commit_sha256 ?? null,
+            completion_safe_fail_claim_reason:
+              completionSafeFailClaim?.reason ?? null,
+            completion_authorizer_protocol:
+              COMPLETION_AUTHORIZER_PROTOCOL,
+            completion_authorizer_authority:
+              "terminal_permission",
+            completion_authorizer_permits_terminal:
+              completionAuthorized,
+            completion_authorizer_applicable:
+              completionAuthorization.applicable,
+            completion_authorizer_transport_ok:
+              completionAuthorization.transport_ok,
+            completion_authorizer_decision:
+              completionAuthorization.decision,
+            completion_authorizer_reason:
+              completionAuthorization.reason,
+            completion_certificate_sha256:
+              completionAuthorization.certificate_sha256,
+            completion_authorizer_elapsed_ms:
+              completionAuthorization.elapsed_ms,
+            verification_receipt: persisted.verificationPath,
+            receipt_path: persisted.path,
+            patch_path: persisted.receipt.patch_path,
+            patch_sha256: persisted.receipt.patch_sha256,
+            changed_files: response.changed_files ?? [],
+            changed_lines: response.changed_lines ?? 0,
+            patch_bytes: response.patch_bytes ?? 0,
+            structural_edits: response.structural_edits ?? 0,
+            repo_mutated: response.repo_mutated === true,
+          })
+          return {
+            content:
+              `PATCH_READY receipt=${persisted.path} changed_files=${(response.changed_files ?? []).length} ` +
+              `changed_lines=${response.changed_lines ?? 0} semantic_mutations=${compilerResponse?.mutations_effective ?? 0} ` +
+              `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
+              `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
+              `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
+              `capsule=${state.editCapsulePath ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "ready",
+              receipt_protocol: PATCH_RECEIPT_PROTOCOL,
+              receipt_path: persisted.path,
+              verification_receipt: persisted.verificationPath,
+              verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
+              terminal_commit_protocol:
+                terminalCommit?.protocol ?? null,
+              terminal_commit_sha256:
+                terminalCommit?.commit_sha256 ?? null,
+              terminal_commit_reason:
+                terminalCommitResult.reason,
+              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+              invariants_total: verificationResponse?.invariants_total ?? 0,
+              invariants_passed: verificationResponse?.invariants_passed ?? 0,
+              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+              proof_obligations: proofAssessment.obligations,
+              edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
+              edit_capsule_path: state.editCapsulePath,
+              edit_capsule_sha256: state.editCapsuleHash,
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              compiler_protocol: PATCH_COMPILER_PROTOCOL,
+              mutation_protocol: PATCH_MUTATION_PROTOCOL,
+                patch_tool_protocol: PATCH_TOOL_PROTOCOL,
+              mutation_dispatch_origin: dispatchOrigin,
+              action_commit_protocol: actionCommit?.protocol ?? null,
+              action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+              semantic_mutations: compilerResponse?.mutations_effective ?? 0,
+              lowered_edits: compilerResponse?.lowered_edits ?? 0,
+              changed_files: response.changed_files ?? [],
+              changed_lines: response.changed_lines ?? 0,
+              patch_bytes: response.patch_bytes ?? 0,
+              truncated: false,
+            },
+          }
+        }
+
+        const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
+        const canRetry =
+          PATCH_RETRY_REASONS.has(reason) &&
+          state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+        const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
+        const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+        if (needsRescout) {
+          applyExecutionEvent(state, "patch_rescout", reason, { reason, allowed_files: response?.allowed_files ?? [] })
+        } else if (canRetry) {
+          applyExecutionEvent(state, "patch_retry", reason)
+        } else {
+          applyExecutionEvent(state, "fatal", reason)
+        }
+        await trace({
+          admitted: false,
+          reason,
+          action,
+          plan_signature: signature,
+          compiler_elapsed_ms: compiled.elapsedMs,
+          compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+          executor_elapsed_ms: result.elapsedMs,
+          executor_diagnostic:
+            result.diagnostic ?? null,
+          allowed_files: response?.allowed_files ?? [],
+          changed_files: response?.changed_files ?? [],
+        })
+
+        if (needsRescout) {
+          return {
+            content: `PATCH_RESCOUT reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
+          }
+        }
+        if (canRetry) {
+          return {
+            content: `PATCH_RETRY reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+          }
+        }
+        return {
+          content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+          metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+        }
+    }
+
     await track(ctx.tool.transform((tools) => {
       tools.add({
         name: "search",
@@ -11178,6 +12229,7 @@ export default {
             requestedQueries,
             requestedPath,
             modelRequestedGlob,
+            buildLanguageGlob("**/*", SOURCE_LANGUAGE_EXTENSIONS),
           )
           queries = taskSearchPlan.effective_queries
 
@@ -13281,9 +14333,48 @@ export default {
           // Full Scout evidence remains persisted in search trace / handoff
           // artifacts; this changes only the next model-facing projection.
           const mutationFrontier = mutationToolsForState(state)
-          const actionableContent = mutationFrontier.length > 0
-            ? `${editCapsule.text}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=edit_capsule_ready search_locked=true`
-            : content
+          const frontierResolution = resolveMutationActionForState(state)
+          const actionCommitResult = deriveActionCommit({
+            state,
+            editCapsule,
+            frontier: frontierResolution,
+            renameToolName: EXECUTE_RENAME_SYMBOL_TOOL,
+            renameCapabilityProtocol: SCOUT_RENAME_TARGET_PROTOCOL,
+          })
+
+          let actionCommitClaim = null
+          let deterministicMutationResult = null
+
+          if (actionCommitResult.ok === true) {
+            actionCommitClaim =
+              claimActionCommit(state, actionCommitResult.commit)
+
+            if (actionCommitClaim.ok === true) {
+              deterministicMutationResult =
+                await executeCapabilityMutationCore(
+                  { new_name: actionCommitResult.commit.new_name },
+                  toolContext,
+                  "rename_symbol",
+                  EXECUTE_RENAME_SYMBOL_TOOL,
+                  {
+                    origin: ACTION_COMMIT_DISPATCH_ORIGIN,
+                    actionCommit: actionCommitResult.commit,
+                  },
+                )
+            } else {
+              applyExecutionEvent(state, "fatal", actionCommitClaim.reason)
+            }
+          }
+
+          const baseActionContent = editCapsule?.text ?? content
+          const actionableContent =
+            deterministicMutationResult
+              ? `${baseActionContent}\nACTION_COMMIT protocol=${ACTION_COMMIT_PROTOCOL} sha256=${actionCommitResult.commit.commit_sha256} origin=${ACTION_COMMIT_DISPATCH_ORIGIN}\n${deterministicMutationResult.content}`
+              : actionCommitResult.ok === true && actionCommitClaim?.ok !== true
+                ? `${baseActionContent}\nACTION_COMMIT_STOP reason=${actionCommitClaim?.reason ?? "action_commit_claim_failed"} action=report_blocked`
+                : mutationFrontier.length > 0
+                  ? `${baseActionContent}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=edit_capsule_ready search_locked=true`
+                  : content
 
           return {
             content: actionableContent,
@@ -13398,8 +14489,23 @@ export default {
               mutation_intent_router_protocol: "mutation-intent-router-v1.1-task-context",
               mutation_intent: state?.mutationIntent ?? "unknown",
               mutation_intent_reason: state?.mutationIntentReason ?? null,
+              task_action_protocol:
+                state?.taskAction?.protocol ?? TASK_ACTION_PROTOCOL,
+              task_action_status: state?.taskAction?.status ?? null,
+              task_action_operation: state?.taskAction?.operation ?? null,
               mutation_action_frontier: mutationFrontier,
-              mutation_action_reason: resolveMutationActionForState(state).reason,
+              mutation_action_reason: frontierResolution.reason,
+              action_commit_protocol: ACTION_COMMIT_PROTOCOL,
+              action_commit_ready: actionCommitResult.ok === true,
+              action_commit_reason: actionCommitResult.reason,
+              action_commit_sha256:
+                actionCommitResult.commit?.commit_sha256 ?? null,
+              action_commit_claimed: actionCommitClaim?.ok === true,
+              action_commit_dispatches: state?.actionCommitDispatches ?? 0,
+              mutation_dispatch_origin:
+                deterministicMutationResult
+                  ? ACTION_COMMIT_DISPATCH_ORIGIN
+                  : null,
               next_action: nextActionForExecutionState(state),
               candidate_files: rankedFiles.length,
               lexical_candidate_files: lexicalRankedFiles.length,
@@ -13490,635 +14596,6 @@ export default {
     }))
 
     await track(ctx.tool.transform((tools) => {
-      const executeCapabilityMutation = async (rawInput, toolContext, forcedKind, toolName) => {
-        const input = {
-          ...(rawInput ?? {}),
-          kind: forcedKind,
-        }
-          const started = performance.now()
-          const sessionID =
-            typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
-              ? toolContext.sessionID
-              : null
-          const state = getSessionState(sessionID)
-          const root = await rootForTool(ctx, toolContext, sessionID, state)
-          const runtimeIdentity = await runtimeStackIdentity()
-
-          const trace = async (record) => {
-            await writeProjectTrace(root, "executor-trace.jsonl", {
-              ts: nowMs(),
-              protocol: EXECUTION_LOOP_PROTOCOL,
-              sessionID,
-              turnID: state?.turnID ?? null,
-              project_root: root,
-              mutation_attempt: state?.mutationAttempts ?? null,
-              repair_attempts: state?.repairAttempts ?? null,
-              compiler_runs: state?.compilerRuns ?? null,
-              patch_attempt: state?.patchAttempts ?? null,
-              executor_runs: state?.executorRuns ?? null,
-              executed_patches: state?.executedPatches ?? null,
-              turn_model_calls: state?.modelCalls ?? null,
-              scout_handoff_path: state?.scoutHandoffPath ?? null,
-              edit_capsule_path: state?.editCapsulePath ?? null,
-              bound_mutation_target: state?.boundMutationTarget ?? null,
-              preauthorized_mutation_candidates:
-                state?.localMutationCandidates?.length ?? 0,
-              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-              execution_state: state?.executionState ?? null,
-              execution_reason: state?.executionReason ?? null,
-              mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
-              mutation_tool: toolName,
-              semantic_kind: forcedKind,
-              tool_contract_failures: state?.contractFailures ?? null,
-              ...runtimeIdentity,
-              ...record,
-              tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
-            })
-          }
-
-          if (!root || !state) {
-            await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
-            return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
-          }
-          if (!toolAllowedForExecutionState(state, toolName)) {
-            const next = nextActionForExecutionState(state)
-            const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
-            await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
-            return {
-              content: `${action === "rescout" ? "PATCH_RESCOUT" : "PATCH_STOP"} reason=causal_frontier state=${state.executionState} action=${next}`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action,
-                reason: "causal_frontier",
-                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-                execution_state: state.executionState,
-                next_action: next,
-              },
-            }
-          }
-          if (!state.scoutHandoffPath) {
-            applyExecutionEvent(state, "patch_rescout", "scout_handoff_missing", { reason: "scout_handoff_missing" })
-            await trace({ admitted: false, reason: "scout_handoff_missing", action: "rescout" })
-            return {
-              content: "PATCH_RESCOUT reason=scout_handoff_missing action=search_first",
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "scout_handoff_missing" },
-            }
-          }
-          if (state.patchAccepted) {
-            applyExecutionEvent(state, "patch_ready", "patch_already_accepted")
-            await trace({ admitted: false, reason: "patch_already_accepted", action: "stop", receipt_path: state.patchReceiptPath })
-            return {
-              content: `PATCH_STOP reason=patch_already_accepted receipt=${state.patchReceiptPath ?? "unknown"} action=use_receipt`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
-            }
-          }
-          if (state.mutationAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
-            applyExecutionEvent(state, "fatal", "mutation_attempt_budget")
-            await trace({
-              admitted: false,
-              reason: "mutation_attempt_budget",
-              action: "stop",
-            })
-            return {
-              content:
-                `PATCH_STOP reason=mutation_attempt_budget ` +
-                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                `action=report_blocked`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "stop",
-                reason: "mutation_attempt_budget",
-              },
-            }
-          }
-
-          const forbiddenRawAuthorityField = [
-            "kind",
-            "file",
-            "symbol",
-            "scope",
-          ].find((field) => mutationFieldPresent(rawInput, field))
-
-          const shape = forbiddenRawAuthorityField
-            ? mutationShapeFailure(
-                forcedKind,
-                `action_tool_forbids_${forbiddenRawAuthorityField}`,
-              )
-            : validateMutationShape(input)
-
-          // Tool-schema/transport violations are not semantic patch attempts.
-          // With action-specific top-level required fields these should be
-          // unreachable under a conforming provider; if they reach runtime,
-          // fail closed without consuming the one semantic repair.
-          if (shape.ok !== true) {
-            state.contractFailures += 1
-            const repeated = state.contractFailureSignatures.has(shape.signature)
-            state.contractFailureSignatures.add(shape.signature)
-            applyExecutionEvent(state, "fatal", "tool_contract_violation")
-
-            await trace({
-              admitted: false,
-              failure_layer: "tool_contract",
-              reason: "tool_contract_violation",
-              contract_detail: shape.detail,
-              contract_signature: shape.signature,
-              repeated_contract_failure: repeated,
-              action: "stop",
-              compiler_run: false,
-              executor_run: false,
-            })
-
-            return {
-              content:
-                `PATCH_STOP reason=tool_contract_violation ` +
-                `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                `contract_failures=${state.contractFailures} action=report_blocked`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "stop",
-                reason: "tool_contract_violation",
-                detail: shape.detail,
-                failure_layer: "tool_contract",
-                semantic_attempt_consumed: false,
-                compiler_run: false,
-                executor_run: false,
-              },
-            }
-          }
-
-          if (
-            state.activeMutationTool &&
-            state.activeMutationTool !== toolName
-          ) {
-            applyExecutionEvent(state, "fatal", "mutation_action_changed_during_attempt")
-            await trace({
-              admitted: false,
-              failure_layer: "orchestrator_contract",
-              reason: "mutation_action_changed_during_attempt",
-              previous_tool: state.activeMutationTool,
-              attempted_tool: toolName,
-              action: "stop",
-              compiler_run: false,
-              executor_run: false,
-            })
-            return {
-              content:
-                `PATCH_STOP reason=mutation_action_changed_during_attempt ` +
-                `expected=${state.activeMutationTool} got=${toolName} action=report_blocked`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "stop",
-                reason: "mutation_action_changed_during_attempt",
-                failure_layer: "orchestrator_contract",
-                compiler_run: false,
-                executor_run: false,
-              },
-            }
-          }
-
-          state.activeMutationTool = toolName
-
-          if (state.executionState === EXEC_STATE_REPAIR) {
-            state.repairAttempts += 1
-          }
-
-          state.mutationAttempts += 1
-          state.lastSeen = nowMs()
-
-          const authorization =
-            await materializeCapabilityBoundMutation(
-              root,
-              state,
-              input,
-            )
-
-          if (authorization.ok !== true) {
-            const reason =
-              typeof authorization.reason === "string"
-                ? authorization.reason
-                : "mutation_scope_unavailable"
-
-            const detail =
-              typeof authorization.detail === "string"
-                ? authorization.detail
-                : reason
-
-            const canRetryAuthorization =
-              authorization.repairable === true &&
-              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
-
-            if (canRetryAuthorization) {
-              applyExecutionEvent(
-                state,
-                "patch_retry",
-                reason,
-              )
-
-              await trace({
-                admitted: false,
-                failure_layer: "scope_authorization",
-                reason,
-                scope_detail: detail,
-                action: "retry",
-                compiler_run: false,
-                executor_run: false,
-              })
-
-              return {
-                content:
-                  `PATCH_RETRY reason=${reason} ` +
-                  `detail=${detail} ` +
-                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                  `action=revise_semantic_owner_binding`,
-                metadata: {
-                  protocol: EXECUTION_LOOP_PROTOCOL,
-                  action: "retry",
-                  reason,
-                  detail,
-                  failure_layer: "scope_authorization",
-                  compiler_run: false,
-                  executor_run: false,
-                },
-              }
-            }
-
-            if (authorization.rescout === true) {
-              applyExecutionEvent(
-                state,
-                "patch_rescout",
-                reason,
-                {
-                  reason,
-                  detail,
-                },
-              )
-
-              await trace({
-                admitted: false,
-                failure_layer: "scope_authorization",
-                reason,
-                scope_detail: detail,
-                action: "rescout",
-                compiler_run: false,
-                executor_run: false,
-              })
-
-              return {
-                content:
-                  `PATCH_RESCOUT reason=${reason} ` +
-                  `detail=${detail} ` +
-                  `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                  `action=refine_search`,
-                metadata: {
-                  protocol: EXECUTION_LOOP_PROTOCOL,
-                  action: "rescout",
-                  reason,
-                  detail,
-                  failure_layer: "scope_authorization",
-                  compiler_run: false,
-                  executor_run: false,
-                },
-              }
-            }
-
-            applyExecutionEvent(
-              state,
-              "fatal",
-              reason,
-            )
-
-            await trace({
-              admitted: false,
-              failure_layer: "internal_contract",
-              reason,
-              scope_detail: detail,
-              action: "stop",
-              compiler_run: false,
-              executor_run: false,
-            })
-
-            return {
-              content:
-                `PATCH_STOP reason=${reason} ` +
-                `detail=${detail} action=report_blocked`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "stop",
-                reason,
-                detail,
-                failure_layer: "internal_contract",
-                compiler_run: false,
-                executor_run: false,
-              },
-            }
-          }
-
-          const mutation =
-            authorization.mutation
-
-          const mutations = [mutation]
-
-          const activeMutationHandoffPath =
-            authorization.handoff_path
-
-          if (
-            typeof activeMutationHandoffPath !== "string" ||
-            activeMutationHandoffPath.length < 1
-          ) {
-            applyExecutionEvent(state, "fatal", "mutation_handoff_unavailable")
-            await trace({
-              admitted: false,
-              reason: "mutation_handoff_unavailable",
-              action: "stop",
-              compiler_run: false,
-              executor_run: false,
-            })
-            return {
-              content:
-                "PATCH_STOP reason=mutation_handoff_unavailable action=report_blocked",
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "stop",
-                reason: "mutation_handoff_unavailable",
-              },
-            }
-          }
-
-          state.activeMutationHandoffPath = activeMutationHandoffPath
-          state.compilerRuns += 1
-
-          const compiled = await runPatchCompiler(root, {
-            root,
-            handoff: activeMutationHandoffPath,
-            mutation_protocol: PATCH_MUTATION_PROTOCOL,
-            mutations,
-          })
-          if (!compiled.ok) {
-            const reason = `compiler_${compiled.reason}`
-            applyExecutionEvent(state, "fatal", reason)
-            await trace({ admitted: false, reason, action: "stop", compiler_elapsed_ms: compiled.elapsedMs })
-            return {
-              content: `PATCH_STOP reason=${reason} action=report_blocked`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
-            }
-          }
-          const compilerResponse = compiled.response
-          if (compilerResponse?.ok !== true) {
-            const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
-            const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
-            const canRetry =
-              PATCH_COMPILER_RETRY_REASONS.has(reason) &&
-              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
-            const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
-            if (needsRescout) {
-              applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
-            } else if (canRetry) {
-              applyExecutionEvent(state, "patch_retry", reason)
-            } else {
-              applyExecutionEvent(state, "fatal", reason)
-            }
-            await trace({
-              admitted: false,
-              reason,
-              action,
-              compiler_elapsed_ms: compiled.elapsedMs,
-              compiler_mutation_index: compilerResponse?.mutation_index ?? null,
-              compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
-              compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
-              executor_run: false,
-            })
-            if (needsRescout) {
-              return {
-                content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
-              }
-            }
-            if (canRetry) {
-              return {
-                content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
-              }
-            }
-            return {
-              content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
-            }
-          }
-
-          state.patchAttempts += 1
-
-          const signature = patchPlanSignature(compilerResponse)
-          if (state.patchSignatures.has(signature)) {
-            applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
-            await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
-            return {
-              content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
-            }
-          }
-          state.patchSignatures.add(signature)
-          state.executorRuns += 1
-          state.executedPatches += 1
-
-          const result = await runPatchExecutor(root, {
-            root,
-            handoff: activeMutationHandoffPath,
-            mode: "guarded",
-            edit_protocol: PATCH_EDIT_PROTOCOL,
-            edits: compilerResponse?.edits ?? [],
-            checks: compilerResponse?.checks ?? [],
-          })
-
-          if (!result.ok) {
-            const reason = `executor_${result.reason}`
-            applyExecutionEvent(state, "fatal", reason)
-            await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
-            return {
-              content: `PATCH_STOP reason=${reason} action=report_blocked`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
-            }
-          }
-
-          const response = result.response
-          if (response?.admitted === true) {
-            const proofObligations = proofObligationsForMutations(mutations)
-            state.proofObligations = proofObligations
-            const verified = await runInvariantVerifier(root, {
-              root,
-              handoff: activeMutationHandoffPath,
-              patch: response?.patch ?? "",
-              compiler_protocol: PATCH_COMPILER_PROTOCOL,
-              mutation_protocol: PATCH_MUTATION_PROTOCOL,
-              mutations,
-              changed_files: compilerResponse?.changed_files ?? [],
-              edits: compilerResponse?.edits ?? [],
-            })
-            if (!verified.ok) {
-              const reason = `verifier_${verified.reason}`
-              applyExecutionEvent(state, "fatal", reason)
-              await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
-              return {
-                content: `PATCH_STOP reason=${reason} action=report_blocked`,
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
-              }
-            }
-            const verificationResponse = verified.response
-            const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
-            if (!proofAssessment.ok) {
-              const failedProofs = compactProofFailure(proofAssessment)
-              const canRepair =
-                proofAssessment.disposition === "repair" &&
-                state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
-              if (proofAssessment.disposition === "rescout") {
-                applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
-                  reason: "proof_obligation_failed",
-                  failed: proofAssessment.failed,
-                })
-                await trace({ admitted: false, reason: "proof_obligation_failed", action: "rescout", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
-                return {
-                  content: `PATCH_RESCOUT reason=proof_obligation_failed failed=${failedProofs} action=refine_search`,
-                  metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
-                }
-              }
-              if (canRepair) {
-                applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
-                await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
-                return {
-                  content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
-                  metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
-                }
-              }
-              applyExecutionEvent(state, "fatal", "proof_obligation_failed")
-              await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
-              return {
-                content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
-              }
-            }
-            const persisted = await writePatchReceipt(root, sessionID, state, response, compilerResponse, verificationResponse, proofAssessment)
-            if (!persisted) {
-              applyExecutionEvent(state, "fatal", "receipt_write_failed")
-              await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
-              return {
-                content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
-                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
-              }
-            }
-            state.patchAccepted = true
-            state.patchReceiptPath = persisted.path
-            applyExecutionEvent(state, "patch_ready", "verification_passed")
-            await trace({
-              admitted: true,
-              reason: null,
-              action: "ready",
-              plan_signature: signature,
-              compiler_elapsed_ms: compiled.elapsedMs,
-              compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
-              compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
-              compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
-              compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
-              compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
-              executor_elapsed_ms: result.elapsedMs,
-              verifier_elapsed_ms: verified.elapsedMs,
-              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
-              invariants_total: verificationResponse?.invariants_total ?? 0,
-              invariants_passed: verificationResponse?.invariants_passed ?? 0,
-              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
-              proof_obligations: proofAssessment.obligations.map((item) => item.id),
-              proof_disposition: proofAssessment.disposition,
-              verification_receipt: persisted.verificationPath,
-              receipt_path: persisted.path,
-              patch_path: persisted.receipt.patch_path,
-              patch_sha256: persisted.receipt.patch_sha256,
-              changed_files: response.changed_files ?? [],
-              changed_lines: response.changed_lines ?? 0,
-              patch_bytes: response.patch_bytes ?? 0,
-              structural_edits: response.structural_edits ?? 0,
-              repo_mutated: response.repo_mutated === true,
-            })
-            return {
-              content:
-                `PATCH_READY receipt=${persisted.path} changed_files=${(response.changed_files ?? []).length} ` +
-                `changed_lines=${response.changed_lines ?? 0} semantic_mutations=${compilerResponse?.mutations_effective ?? 0} ` +
-                `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
-                `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
-                `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
-                `capsule=${state.editCapsulePath ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
-              metadata: {
-                protocol: EXECUTION_LOOP_PROTOCOL,
-                action: "ready",
-                receipt_protocol: PATCH_RECEIPT_PROTOCOL,
-                receipt_path: persisted.path,
-                verification_receipt: persisted.verificationPath,
-                verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
-                invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
-                invariants_total: verificationResponse?.invariants_total ?? 0,
-                invariants_passed: verificationResponse?.invariants_passed ?? 0,
-                proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
-                proof_obligations: proofAssessment.obligations,
-                edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
-                edit_capsule_path: state.editCapsulePath,
-                edit_capsule_sha256: state.editCapsuleHash,
-                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-                execution_state: state.executionState,
-                compiler_protocol: PATCH_COMPILER_PROTOCOL,
-                mutation_protocol: PATCH_MUTATION_PROTOCOL,
-                patch_tool_protocol: PATCH_TOOL_PROTOCOL,
-                semantic_mutations: compilerResponse?.mutations_effective ?? 0,
-                lowered_edits: compilerResponse?.lowered_edits ?? 0,
-                changed_files: response.changed_files ?? [],
-                changed_lines: response.changed_lines ?? 0,
-                patch_bytes: response.patch_bytes ?? 0,
-                truncated: false,
-              },
-            }
-          }
-
-          const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
-          const canRetry =
-            PATCH_RETRY_REASONS.has(reason) &&
-            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
-          const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
-          const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
-          if (needsRescout) {
-            applyExecutionEvent(state, "patch_rescout", reason, { reason, allowed_files: response?.allowed_files ?? [] })
-          } else if (canRetry) {
-            applyExecutionEvent(state, "patch_retry", reason)
-          } else {
-            applyExecutionEvent(state, "fatal", reason)
-          }
-          await trace({
-            admitted: false,
-            reason,
-            action,
-            plan_signature: signature,
-            compiler_elapsed_ms: compiled.elapsedMs,
-            compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
-            executor_elapsed_ms: result.elapsedMs,
-            executor_diagnostic:
-              result.diagnostic ?? null,
-            allowed_files: response?.allowed_files ?? [],
-            changed_files: response?.changed_files ?? [],
-          })
-
-          if (needsRescout) {
-            return {
-              content: `PATCH_RESCOUT reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
-            }
-          }
-          if (canRetry) {
-            return {
-              content: `PATCH_RETRY reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
-              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
-            }
-          }
-          return {
-            content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
-            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
-          }
-      }
-
       tools.add({
         name: EXECUTE_REPLACE_NODE_TOOL,
         description:
@@ -14149,7 +14626,7 @@ export default {
           permission: PATCH_PERMISSION_ACTION,
         },
         execute: async (input, toolContext) =>
-          executeCapabilityMutation(
+          executeCapabilityMutationCore(
             input,
             toolContext,
             "replace_node",
@@ -14180,7 +14657,7 @@ export default {
           permission: PATCH_PERMISSION_ACTION,
         },
         execute: async (input, toolContext) =>
-          executeCapabilityMutation(
+          executeCapabilityMutationCore(
             input,
             toolContext,
             "rename_symbol",
@@ -14222,6 +14699,280 @@ export default {
       // versioned snapshot. Async public events remain telemetry only.
       const taskContextSnapshot = userTurnSnapshotFromContext(event)
       const contextTurnID = taskContextSnapshot.turnID
+
+      // Completion safe-fail gate. Once an exact task has a verified candidate
+      // but CompletionAuthorizer cannot issue terminal permission, do not pay
+      // for more model turns. This is not VERIFIED authority: it is a bounded
+      // safe failure that preserves the candidate and proof artifacts.
+      if (state.completionSafeFail) {
+        const safeFailTaskMatch = completionSafeFailMatchesTask(
+          state.completionSafeFail,
+          taskContextSnapshot,
+        )
+
+        if (safeFailTaskMatch.reason === "completion_safe_fail_task_turn_changed") {
+          clearCompletionSafeFailState(state)
+        } else if (safeFailTaskMatch.ok !== true) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_blocked",
+            reason: safeFailTaskMatch.reason,
+            completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+            completion_safe_fail_sha256: state.completionSafeFailSha256,
+            sessionID,
+            turnID: state.turnID,
+            task_turn_id: taskContextSnapshot.turnID,
+            task_text_sha256: taskContextSnapshot.textSha256,
+            project_root: root,
+          })
+          throw new Error(`CPU_AGENT ${safeFailTaskMatch.reason}`)
+        } else if (
+          state.completionSafeFailShortCircuitAttemptedSha256 !==
+          state.completionSafeFailSha256
+        ) {
+          state.completionSafeFailShortCircuitAttemptedSha256 =
+            state.completionSafeFailSha256
+          state.completionSafeFailShortCircuitRequests += 1
+
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "completion_safe_fail_requested",
+            completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+            completion_safe_fail_sha256: state.completionSafeFailSha256,
+            completion_safe_fail_reason: state.completionSafeFail.reason,
+            sessionID,
+            turnID: state.turnID,
+            task_turn_id: taskContextSnapshot.turnID,
+            project_root: root,
+            completion_safe_fail_short_circuit_requests:
+              state.completionSafeFailShortCircuitRequests,
+          })
+
+          const interrupt =
+            typeof ctx.session?.interrupt === "function"
+              ? ctx.session.interrupt.bind(ctx.session)
+              : null
+
+          if (!interrupt) {
+            state.completionSafeFailShortCircuitFailures += 1
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "completion_safe_fail_failed",
+              reason: "session_interrupt_unavailable",
+              completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+              completion_safe_fail_sha256: state.completionSafeFailSha256,
+              sessionID,
+              turnID: state.turnID,
+              project_root: root,
+            })
+            throw new Error("CPU_AGENT completion_safe_fail_interrupt_unavailable")
+          }
+
+          try {
+            await interrupt({ sessionID, continue: false })
+            state.completionSafeFailShortCircuits += 1
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "completion_safe_fail",
+              completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+              completion_safe_fail_sha256: state.completionSafeFailSha256,
+              completion_safe_fail_reason: state.completionSafeFail.reason,
+              sessionID,
+              turnID: state.turnID,
+              task_turn_id: taskContextSnapshot.turnID,
+              project_root: root,
+              completion_safe_fail_short_circuits:
+                state.completionSafeFailShortCircuits,
+            })
+            return
+          } catch (error) {
+            state.completionSafeFailShortCircuitFailures += 1
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "completion_safe_fail_failed",
+              reason: "session_interrupt_failed",
+              error: String(error?.message ?? error),
+              completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+              completion_safe_fail_sha256: state.completionSafeFailSha256,
+              sessionID,
+              turnID: state.turnID,
+              project_root: root,
+            })
+            throw new Error("CPU_AGENT completion_safe_fail_interrupt_failed")
+          }
+        } else if (state.completionSafeFailShortCircuits > 0) {
+          return
+        }
+      }
+
+      // v2.27-C terminal gate. A TerminalCommit is not new VERIFIED
+      // authority: it only binds the already-persisted verifier proof to this
+      // exact user turn and suppresses a redundant provider continuation.
+      if (state.terminalCommit) {
+        const terminalTaskMatch = terminalCommitMatchesTask(
+          state.terminalCommit,
+          taskContextSnapshot,
+        )
+
+        if (terminalTaskMatch.reason === "terminal_task_turn_changed") {
+          clearTerminalCommitState(state)
+        } else if (terminalTaskMatch.ok !== true) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_blocked",
+            reason: terminalTaskMatch.reason,
+            terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+            terminal_commit_sha256: state.terminalCommitSha256,
+            sessionID,
+            turnID: state.turnID,
+            task_turn_id: taskContextSnapshot.turnID,
+            task_text_sha256: taskContextSnapshot.textSha256,
+            project_root: root,
+          })
+          throw new Error(
+            `CPU_AGENT ${terminalTaskMatch.reason}`,
+          )
+        } else {
+          const terminalArtifacts =
+            await validateTerminalCommitArtifacts(
+              root,
+              state.terminalCommit,
+            )
+
+          if (terminalArtifacts.ok !== true) {
+            applyExecutionEvent(
+              state,
+              "fatal",
+              terminalArtifacts.reason,
+            )
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "model_blocked",
+              reason: terminalArtifacts.reason,
+              terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+              terminal_commit_sha256: state.terminalCommitSha256,
+              sessionID,
+              turnID: state.turnID,
+              task_turn_id: taskContextSnapshot.turnID,
+              task_text_sha256: taskContextSnapshot.textSha256,
+              project_root: root,
+            })
+            throw new Error(
+              `CPU_AGENT ${terminalArtifacts.reason}`,
+            )
+          }
+
+          if (
+            TERMINAL_SHORT_CIRCUIT_ENABLED &&
+            state.terminalShortCircuits > 0
+          ) {
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "terminal_short_circuit_replay",
+              terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+              terminal_commit_sha256: state.terminalCommitSha256,
+              sessionID,
+              turnID: state.turnID,
+              task_turn_id: taskContextSnapshot.turnID,
+              project_root: root,
+            })
+            return
+          }
+
+          if (
+            TERMINAL_SHORT_CIRCUIT_ENABLED &&
+            state.terminalShortCircuitAttemptedSha256 !==
+              state.terminalCommitSha256
+          ) {
+            state.terminalShortCircuitAttemptedSha256 =
+              state.terminalCommitSha256
+            state.terminalShortCircuitRequests += 1
+
+            await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+              ts: nowMs(),
+              protocol: AGENT_PROTOCOL,
+              kind: "terminal_short_circuit_requested",
+              terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+              terminal_commit_sha256: state.terminalCommitSha256,
+              sessionID,
+              turnID: state.turnID,
+              task_turn_id: taskContextSnapshot.turnID,
+              task_text_sha256: taskContextSnapshot.textSha256,
+              project_root: root,
+              terminal_short_circuit_requests:
+                state.terminalShortCircuitRequests,
+            })
+
+            const interrupt =
+              typeof ctx.session?.interrupt === "function"
+                ? ctx.session.interrupt.bind(ctx.session)
+                : null
+
+            if (!interrupt) {
+              state.terminalShortCircuitFailures += 1
+              await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                ts: nowMs(),
+                protocol: AGENT_PROTOCOL,
+                kind: "terminal_short_circuit_failed",
+                reason: "session_interrupt_unavailable",
+                terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                terminal_commit_sha256: state.terminalCommitSha256,
+                sessionID,
+                turnID: state.turnID,
+                project_root: root,
+                terminal_short_circuit_failures:
+                  state.terminalShortCircuitFailures,
+              })
+            } else {
+              try {
+                await interrupt({
+                  sessionID,
+                  continue: false,
+                })
+                state.terminalShortCircuits += 1
+                await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                  ts: nowMs(),
+                  protocol: AGENT_PROTOCOL,
+                  kind: "terminal_short_circuit",
+                  terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                  terminal_commit_sha256: state.terminalCommitSha256,
+                  sessionID,
+                  turnID: state.turnID,
+                  task_turn_id: taskContextSnapshot.turnID,
+                  project_root: root,
+                  terminal_short_circuits:
+                    state.terminalShortCircuits,
+                })
+                return
+              } catch (error) {
+                state.terminalShortCircuitFailures += 1
+                await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                  ts: nowMs(),
+                  protocol: AGENT_PROTOCOL,
+                  kind: "terminal_short_circuit_failed",
+                  reason: "session_interrupt_failed",
+                  error: String(error?.message ?? error),
+                  terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                  terminal_commit_sha256: state.terminalCommitSha256,
+                  sessionID,
+                  turnID: state.turnID,
+                  project_root: root,
+                  terminal_short_circuit_failures:
+                    state.terminalShortCircuitFailures,
+                })
+              }
+            }
+          }
+        }
+      }
 
       if (contextTurnID && state.turnID !== contextTurnID) {
         resetTurnState(state, contextTurnID, nowMs())
@@ -14370,6 +15121,29 @@ export default {
         mutation_intent_protocol: MUTATION_INTENT_PROTOCOL,
         mutation_intent: state.mutationIntent,
         mutation_intent_reason: state.mutationIntentReason,
+        task_action_protocol:
+          state.taskAction?.protocol ?? TASK_ACTION_PROTOCOL,
+        task_action_status: state.taskAction?.status ?? null,
+        task_action_operation: state.taskAction?.operation ?? null,
+        action_commit_protocol: ACTION_COMMIT_PROTOCOL,
+        action_commit_sha256: state.actionCommitSha256,
+        action_commit_dispatches: state.actionCommitDispatches,
+        terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+        terminal_commit_sha256: state.terminalCommitSha256,
+        terminal_commit_claims: state.terminalCommitClaims,
+        terminal_short_circuit_requests:
+          state.terminalShortCircuitRequests,
+        terminal_short_circuits: state.terminalShortCircuits,
+        terminal_short_circuit_failures:
+          state.terminalShortCircuitFailures,
+        completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+        completion_safe_fail_sha256: state.completionSafeFailSha256,
+        completion_safe_fail_short_circuit_requests:
+          state.completionSafeFailShortCircuitRequests,
+        completion_safe_fail_short_circuits:
+          state.completionSafeFailShortCircuits,
+        completion_safe_fail_short_circuit_failures:
+          state.completionSafeFailShortCircuitFailures,
         project_root: root,
         agent: event.agent ?? null,
         providerID: event.model?.providerID ?? null,

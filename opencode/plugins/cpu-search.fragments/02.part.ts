@@ -1,4 +1,456 @@
 
+function retrievalRankerBinary() {
+  const override = process.env.OPENCODE_RETRIEVAL_RANKER
+  if (typeof override === "string" && override.length > 0) {
+    return override
+  }
+
+  const dir = runtimeStackDirectory()
+  if (!dir) return null
+
+  return path.join(dir, "opencode-retrieval-ranker")
+}
+
+function retrievalRankerQuery(queries) {
+  /*
+   * Reuse the already-proven lexical tokenization used by Scout path
+   * relevance. Do not pass regex punctuation into BM25F.
+   *
+   * Preserve first-seen order so identical search input is reproducible.
+   */
+  const terms = []
+  const seen = new Set()
+
+  for (const query of queries ?? []) {
+    for (const term of queryPathTokens(query)) {
+      if (seen.has(term)) continue
+      seen.add(term)
+      terms.push(term)
+
+      if (terms.length >= 32) {
+        return terms.join(" ")
+      }
+    }
+  }
+
+  return terms.join(" ")
+}
+
+function retrievalRankerFallback(
+  rankedFiles,
+  reason,
+  extra = {},
+) {
+  return {
+    attempted: extra.attempted === true,
+    ok: false,
+    reason,
+    elapsedMs:
+      Number.isFinite(extra.elapsedMs)
+        ? extra.elapsedMs
+        : 0,
+    inputFiles:
+      Number.isInteger(extra.inputFiles)
+        ? extra.inputFiles
+        : 0,
+    outputFiles: 0,
+    degradedFiles: 0,
+    errorFiles: 0,
+    rankedFiles,
+  }
+}
+
+function validateRetrievalRankerResponse(
+  response,
+  candidates,
+) {
+  if (
+    response?.protocol !== RETRIEVAL_RANKER_PROTOCOL ||
+    response?.authority !== RETRIEVAL_RANKER_AUTHORITY ||
+    !Array.isArray(response?.results)
+  ) {
+    return {
+      ok: false,
+      reason: "response_contract_invalid",
+    }
+  }
+
+  const allowed = new Set(
+    candidates.map((entry) =>
+      evidenceFileKey(entry.file),
+    ),
+  )
+
+  const seen = new Set()
+
+  for (
+    let index = 0;
+    index < response.results.length;
+    index += 1
+  ) {
+    const result = response.results[index]
+    const file = evidenceFileKey(result?.file)
+
+    if (
+      !file ||
+      !allowed.has(file) ||
+      seen.has(file) ||
+      result?.rank !== index + 1 ||
+      !Number.isFinite(result?.rrf_score) ||
+      !Number.isFinite(result?.bm25f_score)
+    ) {
+      return {
+        ok: false,
+        reason: "result_contract_invalid",
+      }
+    }
+
+    seen.add(file)
+  }
+
+  return {
+    ok: true,
+    reason: "ranked",
+  }
+}
+
+function runRetrievalRanker(
+  root,
+  queries,
+  lexicalRankedFiles,
+) {
+  return new Promise((resolve) => {
+    const query = retrievalRankerQuery(queries)
+
+    const candidates =
+      (lexicalRankedFiles ?? [])
+        .slice(0, RETRIEVAL_RANKER_MAX_FILES)
+
+    if (candidates.length < 2) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "not_needed",
+        ),
+      )
+      return
+    }
+
+    if (!query) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "no_query_terms",
+        ),
+      )
+      return
+    }
+
+    const binary = retrievalRankerBinary()
+
+    if (!binary) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "binary_unavailable",
+        ),
+      )
+      return
+    }
+
+    const started = performance.now()
+
+    let child
+
+    try {
+      child = spawn(binary, [], {
+        cwd: root,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    } catch (error) {
+      resolve(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "spawn_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs:
+              Math.round(
+                (performance.now() - started) * 100,
+              ) / 100,
+          },
+        ),
+      )
+      return
+    }
+
+    let stdout = []
+    let stdoutBytes = 0
+    let stderr = ""
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+
+    const elapsed = () =>
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, RETRIEVAL_RANKER_TIMEOUT_MS)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+
+      if (
+        stdoutBytes >
+        RETRIEVAL_RANKER_MAX_STDOUT_BYTES
+      ) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      stdout.push(Buffer.from(chunk))
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) {
+        stderr += chunk.toString("utf8")
+      }
+    })
+
+    child.on("error", () => {
+      finish(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "spawn_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs: elapsed(),
+          },
+        ),
+      )
+    })
+
+    child.on("close", (code) => {
+      if (settled) return
+
+      if (timedOut) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "timeout",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      if (outputLimited) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "stdout_limit",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      if (code !== 0) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "nonzero_exit",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      let response
+
+      try {
+        response = JSON.parse(
+          Buffer.concat(stdout).toString("utf8"),
+        )
+      } catch {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            "invalid_json",
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      const contract =
+        validateRetrievalRankerResponse(
+          response,
+          candidates,
+        )
+
+      if (!contract.ok) {
+        finish(
+          retrievalRankerFallback(
+            lexicalRankedFiles,
+            contract.reason,
+            {
+              attempted: true,
+              inputFiles: candidates.length,
+              elapsedMs: elapsed(),
+            },
+          ),
+        )
+        return
+      }
+
+      const originalByFile = new Map(
+        candidates.map((entry, index) => [
+          evidenceFileKey(entry.file),
+          {
+            entry,
+            lexicalRank: index + 1,
+          },
+        ]),
+      )
+
+      const reranked = []
+      const rerankedKeys = new Set()
+
+      for (const result of response.results) {
+        const key = evidenceFileKey(result.file)
+        const original = originalByFile.get(key)
+
+        if (!original) continue
+
+        reranked.push({
+          ...original.entry,
+
+          // Routing telemetry only. These fields are never mutation
+          // authority and are not consumed as semantic evidence.
+          retrievalRank: result.rank,
+          retrievalRrfScore:
+            result.rrf_score,
+          retrievalBm25fScore:
+            result.bm25f_score,
+          retrievalLexicalRank:
+            result.exact_rank ?? original.lexicalRank,
+          retrievalBm25Rank:
+            result.bm25_rank ?? null,
+          retrievalStructuralComplete:
+            result.structural_complete === true,
+        })
+
+        rerankedKeys.add(key)
+      }
+
+      /*
+       * A candidate rejected by the ranker (for example >2 MiB) is not
+       * declared irrelevant. Keep it in the candidate universe in its
+       * original relative order after the successfully reranked prefix.
+       */
+      for (const entry of candidates) {
+        const key = evidenceFileKey(entry.file)
+        if (!rerankedKeys.has(key)) {
+          reranked.push(entry)
+        }
+      }
+
+      // Files outside the bounded rerank prefix retain original order.
+      const tail =
+        lexicalRankedFiles.slice(candidates.length)
+
+      finish({
+        attempted: true,
+        ok: true,
+        reason:
+          (response.errors?.length ?? 0) > 0
+            ? "ranked_partial"
+            : "ranked",
+        elapsedMs: elapsed(),
+        inputFiles: candidates.length,
+        outputFiles: response.results.length,
+        degradedFiles:
+          Array.isArray(response.degraded_files)
+            ? response.degraded_files.length
+            : 0,
+        errorFiles:
+          Array.isArray(response.errors)
+            ? response.errors.length
+            : 0,
+        rankedFiles: [
+          ...reranked,
+          ...tail,
+        ],
+      })
+    })
+
+    try {
+      child.stdin.end(
+        JSON.stringify({
+          root,
+          query,
+          files: candidates.map(
+            (entry, index) => ({
+              file: evidenceFileKey(entry.file),
+
+              // retrieval-ranker-v1 calls this exact_rank. In live Scout
+              // this is the deterministic lexical relevance rank.
+              exact_rank: index + 1,
+            }),
+          ),
+          max_results:
+            RETRIEVAL_RANKER_MAX_FILES,
+        }),
+      )
+    } catch {
+      child.kill("SIGKILL")
+
+      finish(
+        retrievalRankerFallback(
+          lexicalRankedFiles,
+          "stdin_error",
+          {
+            attempted: true,
+            inputFiles: candidates.length,
+            elapsedMs: elapsed(),
+          },
+        ),
+      )
+    }
+  })
+}
+
 function selectFairFiles(rankedFiles, queryResults, limit) {
   const selected = new Set()
   const coveredQueries = new Set()
@@ -905,6 +1357,18 @@ function invariantVerifierBinary() {
   return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-invariant-verifier")
 }
 
+function completionAuthorizerBinary() {
+  const home = process.env.HOME
+  if (typeof home !== "string" || home.length === 0) return null
+  return path.join(
+    home,
+    ".local",
+    "libexec",
+    "opencode-cpu-agent",
+    "opencode-completion-authorizer",
+  )
+}
+
 function patchPlanSignature(compiled) {
   return createHash("sha256")
     .update(JSON.stringify({ edits: compiled?.edits ?? [], checks: compiled?.checks ?? [] }))
@@ -1683,7 +2147,116 @@ function runInvariantVerifier(root, request) {
   )
 }
 
-async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment) {
+function runCompletionAuthorizer(root, request) {
+  return runJsonBinary(
+    completionAuthorizerBinary(),
+    root,
+    request,
+    COMPLETION_AUTHORIZER_PROTOCOL,
+    COMPLETION_AUTHORIZER_TIMEOUT_MS,
+    COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES,
+  )
+}
+
+function completionAuthorizationPermitsTerminal(observation) {
+  return (
+    observation?.applicable === true &&
+    observation?.transport_ok === true &&
+    observation?.decision === "CERTIFY" &&
+    typeof observation?.certificate_sha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(observation.certificate_sha256)
+  )
+}
+
+async function observeCompletionAuthorization(
+  root,
+  sessionID,
+  state,
+  persisted,
+  proofAssessment,
+  dispatchOrigin,
+  actionCommit,
+) {
+  const applicable =
+    dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+    actionCommit?.protocol === ACTION_COMMIT_PROTOCOL &&
+    state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
+    state.taskAction.status === "exact" &&
+    state.taskAction.operation === "rename_symbol"
+
+  if (!applicable) {
+    return {
+      applicable: false,
+      transport_ok: false,
+      decision: null,
+      reason: "completion_authorizer_not_applicable",
+      certificate_sha256: null,
+      elapsed_ms: 0,
+    }
+  }
+
+  const request = {
+    protocol: COMPLETION_AUTHORIZER_REQUEST_PROTOCOL,
+    policy: COMPLETION_AUTHORIZER_POLICY,
+    user_turn_id: state.taskTurnID,
+    task_action: state.taskAction,
+    action_commit: actionCommit,
+    patch_receipt_path: persisted.path,
+    patch_receipt_body: JSON.stringify(persisted.receipt, null, 2) + "\n",
+    verification_receipt_path: persisted.verificationPath,
+    verification_receipt_body:
+      JSON.stringify(persisted.verificationReceipt, null, 2) + "\n",
+    proof_assessment: proofAssessment,
+  }
+
+  const result = await runCompletionAuthorizer(root, request)
+  const response = result?.ok === true ? result.response : null
+  const certificateSha256 =
+    response?.decision === "CERTIFY" &&
+    typeof response?.certificate?.certificate_sha256 === "string"
+      ? response.certificate.certificate_sha256
+      : null
+
+  const observation = {
+    applicable: true,
+    transport_ok: result?.ok === true,
+    decision: response?.decision ?? null,
+    reason:
+      response?.reason ??
+      result?.reason ??
+      "completion_authorizer_unknown",
+    certificate_sha256: certificateSha256,
+    elapsed_ms: result?.elapsedMs ?? null,
+  }
+
+  await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+    ts: nowMs(),
+    protocol: AGENT_PROTOCOL,
+    kind: "completion_authorizer",
+    completion_authorizer_protocol: COMPLETION_AUTHORIZER_PROTOCOL,
+    completion_authorizer_policy: COMPLETION_AUTHORIZER_POLICY,
+    completion_authorizer_authority: "terminal_permission",
+    completion_authorizer_applicable: observation.applicable,
+    completion_authorizer_transport_ok: observation.transport_ok,
+    completion_authorizer_decision: observation.decision,
+    completion_authorizer_reason: observation.reason,
+    completion_certificate_sha256: observation.certificate_sha256,
+    completion_authorizer_elapsed_ms: observation.elapsed_ms,
+    sessionID,
+    turnID: state.turnID,
+    task_turn_id: state.taskTurnID,
+    task_sha256: state.taskTextSha256,
+    action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+    patch_receipt: persisted.path,
+    verification_receipt: persisted.verificationPath,
+    patch_sha256: persisted.receipt?.patch_sha256 ?? null,
+    project_root: root,
+  })
+
+  return observation
+}
+
+async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment, dispatch = null) {
   const patch = typeof executorResponse?.patch === "string" ? executorResponse.patch : null
   if (!patch || !sessionID || !state?.turnID) return null
 
@@ -1702,6 +2275,9 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
     verification_receipt: path.relative(root, verificationPath),
     execution_protocol: EXECUTION_LOOP_PROTOCOL,
     mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+    mutation_dispatch_origin: dispatch?.origin ?? "model_tool",
+    action_commit_protocol: dispatch?.actionCommit?.protocol ?? null,
+    action_commit_sha256: dispatch?.actionCommit?.commit_sha256 ?? null,
     mutation_tool: state.activeMutationTool,
     visible_tool_schema_sha256: state.visibleToolSchemaSha256,
     tool_contract_failures: state.contractFailures,
@@ -1785,13 +2361,26 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
       proof_assessment: proofAssessment,
       verifier: verificationResponse,
     }
+    const receiptBody = JSON.stringify(receipt, null, 2) + "\n"
+    const verificationBody = JSON.stringify(verificationReceipt, null, 2) + "\n"
+    const receiptSha256 =
+      createHash("sha256").update(receiptBody).digest("hex")
+    const verificationSha256 =
+      createHash("sha256").update(verificationBody).digest("hex")
     await writeFile(patchTemp, patch, "utf8")
-    await writeFile(receiptTemp, JSON.stringify(receipt, null, 2) + "\n", "utf8")
-    await writeFile(verificationTemp, JSON.stringify(verificationReceipt, null, 2) + "\n", "utf8")
+    await writeFile(receiptTemp, receiptBody, "utf8")
+    await writeFile(verificationTemp, verificationBody, "utf8")
     await rename(patchTemp, patchPath)
     await rename(receiptTemp, receiptPath)
     await rename(verificationTemp, verificationPath)
-    return { path: path.relative(root, receiptPath), verificationPath: path.relative(root, verificationPath), receipt, verificationReceipt }
+    return {
+      path: path.relative(root, receiptPath),
+      verificationPath: path.relative(root, verificationPath),
+      receipt,
+      verificationReceipt,
+      receiptSha256,
+      verificationSha256,
+    }
   } catch {
     await rm(patchTemp, { force: true }).catch(() => {})
     await rm(receiptTemp, { force: true }).catch(() => {})
@@ -1810,347 +2399,4 @@ function impactIndexBinary() {
   const home = process.env.HOME
   if (typeof home !== "string" || home.length === 0) return null
   return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-impact-index")
-}
-
-function runImpactIndexRequest(root, request, timeoutMs) {
-  return new Promise((resolve) => {
-    const binary = impactIndexBinary()
-    if (!binary) {
-      resolve({ ok: false, reason: "binary_path_unavailable", elapsedMs: 0 })
-      return
-    }
-    const started = performance.now()
-    const child = spawn(binary, [], { cwd: root, stdio: ["pipe", "pipe", "pipe"] })
-    const stdout = []
-    const stderr = []
-    let stdoutBytes = 0
-    let stderrBytes = 0
-    let timedOut = false
-    let outputLimited = false
-    let settled = false
-
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
-    }
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, timeoutMs)
-
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length
-      if (stdoutBytes > IMPACT_INDEX_MAX_STDOUT_BYTES) {
-        outputLimited = true
-        child.kill("SIGKILL")
-        return
-      }
-      stdout.push(Buffer.from(chunk))
-    })
-    child.stderr.on("data", (chunk) => {
-      if (stderrBytes >= 4096) return
-      const remaining = 4096 - stderrBytes
-      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
-      stderr.push(Buffer.from(kept))
-      stderrBytes += kept.length
-    })
-    child.stdin.on("error", () => {})
-    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", error: String(error?.message ?? error) }))
-    child.on("close", (code, signal) => {
-      if (settled) return
-      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
-      if (timedOut) return finish({ ok: false, reason: "timeout", error: stderrText || null })
-      if (outputLimited) return finish({ ok: false, reason: "stdout_limit", error: stderrText || null })
-      if (code !== 0) return finish({ ok: false, reason: "exit_error", exitCode: code, signal: signal ?? null, error: stderrText || null })
-      let response
-      try {
-        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
-      } catch (error) {
-        return finish({ ok: false, reason: "invalid_json", error: String(error?.message ?? error) })
-      }
-      if (response?.protocol !== "impact-index-v1") return finish({ ok: false, reason: "protocol_mismatch", response })
-      finish({ ok: true, reason: "ok", response })
-    })
-    try {
-      child.stdin.end(JSON.stringify({ root, ...request }))
-    } catch (error) {
-      child.kill("SIGKILL")
-      finish({ ok: false, reason: "stdin_error", error: String(error?.message ?? error) })
-    }
-  })
-}
-
-function impactIndexShadowStats(result, lexicalFiles) {
-  const lexical = new Set((lexicalFiles ?? []).map((entry) =>
-    evidenceFileKey(typeof entry === "string" ? entry : entry?.file),
-  ))
-  const neighbors = result?.ok && Array.isArray(result?.query?.response?.neighbors)
-    ? result.query.response.neighbors
-    : []
-  const lexicalMisses = neighbors.filter((neighbor) =>
-    typeof neighbor?.file === "string" && !lexical.has(evidenceFileKey(neighbor.file)),
-  )
-  const refresh = result?.refresh?.response ?? null
-  const query = result?.query?.response ?? null
-
-  return {
-    attempted: result?.attempted === true,
-    ok: result?.ok === true,
-    reason: result?.reason ?? "unknown",
-    elapsedMs: result?.elapsedMs ?? 0,
-    refreshDue: result?.refreshDue === true,
-    refreshDeferred: result?.refreshDeferred === true,
-    refreshOk:
-      result?.refresh?.ok === true &&
-      refresh?.mode === "refresh" &&
-      refresh?.ready === true,
-    refreshComplete: query?.coverage_complete ?? refresh?.coverage_complete ?? refresh?.refresh_complete ?? null,
-    partialReason: query?.partial_reason ?? refresh?.partial_reason ?? null,
-    inventoryKind: query?.inventory_kind ?? refresh?.inventory_kind ?? null,
-    refreshReason: result?.refresh?.reason ?? null,
-    refreshElapsedMs: result?.refresh?.elapsedMs ?? null,
-    queryElapsedMs: result?.query?.elapsedMs ?? null,
-    cacheAgeMs: query?.cache_age_ms ?? null,
-    staleSeedFiles: query?.stale_seed_files ?? 0,
-    staleWitnessEdges: query?.stale_witness_edges ?? 0,
-    taskFiltersApplied: query?.task_filters_applied === true,
-    bootstrapCacheHit: false,
-    filesTotal: query?.files_total ?? refresh?.files_total ?? null,
-    filesReused: refresh?.files_reused ?? null,
-    filesReindexed: refresh?.files_reindexed ?? null,
-    filesRemoved: refresh?.files_removed ?? null,
-    importsTotal: query?.imports_total ?? refresh?.imports_total ?? null,
-    edgesTotal: query?.edges_total ?? refresh?.edges_total ?? null,
-    resolvedImports: query?.local_resolved ?? refresh?.local_resolved ?? refresh?.resolved_imports ?? null,
-    unresolvedImports: query?.local_unresolved ?? refresh?.local_unresolved ?? null,
-    ambiguousImports: query?.local_ambiguous ?? refresh?.local_ambiguous ?? null,
-    externalPackages: query?.external_package ?? refresh?.external_package ?? null,
-    unsupportedAliases: query?.unsupported_alias ?? refresh?.unsupported_alias ?? null,
-    unsupportedDynamic: query?.unsupported_dynamic ?? refresh?.unsupported_dynamic ?? null,
-    neighborsTotal: query?.neighbors_total ?? null,
-    neighborsShown: neighbors.length,
-    lexicalMisses: lexicalMisses.length,
-    forwardNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "forward").length,
-    reverseNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "reverse").length,
-    candidates: lexicalMisses.slice(0, IMPACT_INDEX_MAX_NEIGHBORS).map((neighbor) => ({
-      file: neighbor.file,
-      seed: neighbor.seed,
-      direction: neighbor.direction,
-      kind: neighbor.kind,
-      confidence: neighbor.confidence,
-      witness_file: neighbor.witness_file,
-      witness_line: neighbor.witness_line,
-      spec: neighbor.spec,
-      bindings: Array.isArray(neighbor.bindings) ? neighbor.bindings : [],
-      source_symbols: Array.isArray(neighbor.source_symbols) ? neighbor.source_symbols : [],
-      binding_pairs: Array.isArray(neighbor.binding_pairs) ? neighbor.binding_pairs : [],
-      witness: neighbor.witness ?? null,
-    })),
-  }
-}
-
-function impactStatsForTaskQuery(queryResult, lexicalFiles, reason = "impact_task_filtered", refresh = null) {
-  const response = queryResult?.response ?? null
-  const age = Number(response?.cache_age_ms)
-  const ready =
-    queryResult?.ok === true &&
-    response?.mode === "neighbors" &&
-    response?.ready === true &&
-    Array.isArray(response?.neighbors)
-  const staleSeedFiles = Number(response?.stale_seed_files ?? 0)
-  const staleWitnessEdges = Number(response?.stale_witness_edges ?? 0)
-  const refreshDue =
-    queryResult?.ok === true && (
-      !ready ||
-      !Number.isFinite(age) ||
-      age >= IMPACT_INDEX_REFRESH_TTL_MS ||
-      staleSeedFiles > 0 ||
-      staleWitnessEdges > 0
-    )
-  return impactIndexShadowStats({
-    attempted: true,
-    ok: ready,
-    reason: ready ? reason : queryResult?.reason ?? "query_unavailable",
-    elapsedMs: queryResult?.elapsedMs ?? 0,
-    refreshDue,
-    refreshDeferred: ready && refreshDue,
-    refresh,
-    query: queryResult,
-  }, lexicalFiles)
-}
-
-function regexEscape(value) {
-  return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
-
-function impactSymbolArray(values, cap = IMPACT_EDGE_SYMBOL_CAP) {
-  const out = []
-  for (const value of values ?? []) {
-    if (
-      typeof value !== "string" ||
-      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) ||
-      value.length > 80
-    ) continue
-    out.push(value)
-    if (out.length >= cap) break
-  }
-  return out
-}
-
-function impactBindingList(values) {
-  return [...new Set(impactSymbolArray(values, IMPACT_BINDINGS_PER_CANDIDATE))]
-}
-
-function impactRelationPairs(candidate) {
-  const local = impactSymbolArray(candidate?.bindings)
-  const source = impactSymbolArray(candidate?.source_symbols)
-  const explicit = []
-  for (const pair of candidate?.binding_pairs ?? []) {
-    const localName = typeof pair?.local === "string" ? pair.local : null
-    const sourceName = typeof pair?.source === "string" ? pair.source : null
-    if (!localName || !sourceName) continue
-    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(localName) || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sourceName)) continue
-    explicit.push({ local: localName, source: sourceName })
-    if (explicit.length >= IMPACT_EDGE_SYMBOL_CAP) break
-  }
-  if (explicit.length > 0) return { local, source, pairs: explicit }
-
-  // Fail-open only for identity mappings. Old caches are rejected by cache
-  // version, but this keeps helper skew conservative instead of guessing alias
-  // alignment from two independently ordered arrays.
-  const pairs = []
-  if (local.length === source.length && local.every((value, index) => value === source[index])) {
-    for (let i = 0; i < local.length; i += 1) pairs.push({ local: local[i], source: source[i] })
-  }
-  return { local, source, pairs }
-}
-
-function impactLanguage(file) {
-  const base = path.basename(String(file ?? "")).toLowerCase()
-  if (base === "dockerfile" || base.startsWith("dockerfile.") || base.endsWith(".dockerfile")) return "docker"
-  const ext = path.extname(base).slice(1)
-  if (ext === "py") return "python"
-  if (["js", "jsx", "mjs", "cjs"].includes(ext)) return "javascript"
-  if (["ts", "tsx", "mts", "cts"].includes(ext)) return "typescript"
-  if (["html", "htm"].includes(ext)) return "html"
-  if (ext === "css") return "css"
-  if (["xml", "xsd", "xsl", "xslt"].includes(ext)) return "xml"
-  if (ext === "sql") return "sql"
-  return "other"
-}
-
-function impactIdentifiers(text) {
-  const out = new Set()
-  const stop = new Set([
-    "and", "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
-    "def", "default", "do", "else", "except", "export", "extends", "false", "finally", "for",
-    "from", "function", "if", "import", "in", "interface", "let", "new", "none", "null", "of",
-    "pass", "return", "static", "super", "switch", "this", "throw", "true", "try", "type", "var",
-    "while", "with", "yield",
-  ])
-  const pattern = /[A-Za-z_$][A-Za-z0-9_$]*/g
-  for (const match of String(text ?? "").matchAll(pattern)) {
-    const value = match[0]
-    // One-character local aliases are common in Python/JS/TS (for example
-    // `import { handle as h } ...`). Candidate matching remains exact and is
-    // followed by source validation, so retaining them is safer than silently
-    // losing a real dependency edge.
-    if (value.length < 1 || stop.has(value.toLowerCase())) continue
-    out.add(value)
-    if (out.size >= IMPACT_SCOPE_IDENTIFIER_CAP) break
-  }
-  return out
-}
-
-function impactDeclaredSymbols(line, language) {
-  const text = String(line ?? "").trim()
-  const out = new Set()
-  const patterns = language === "python"
-    ? [
-        /^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/,
-        /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/,
-      ]
-    : [
-        /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
-        /^(?:export\s+)?(?:default\s+)?(?:class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
-        /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
-        /^(?:(?:public|private|protected|static|readonly|async|abstract|override|get|set)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;]*\)\s*(?::[^={]+)?\s*\{?/,
-      ]
-  for (const pattern of patterns) {
-    const match = text.match(pattern)
-    if (!match?.[1]) continue
-    const value = match[1]
-    if (!["if", "for", "while", "switch", "catch", "function", "constructor"].includes(value)) out.add(value)
-  }
-  return out
-}
-
-function impactPythonOwnerSymbols(lines, ranges, hitLines) {
-  const owners = new Set()
-  for (const range of ranges ?? []) {
-    const start = Math.max(0, range.start ?? 0)
-    for (const value of impactDeclaredSymbols(lines[start] ?? "", "python")) owners.add(value)
-    const baseIndent = impactIndent(lines[start] ?? "")
-    let ceilingIndent = baseIndent
-    for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
-      const line = lines[i] ?? ""
-      const match = line.match(/^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
-      if (!match) continue
-      const indent = impactIndent(line)
-      if (indent < ceilingIndent) {
-        owners.add(match[1]); ceilingIndent = indent
-        if (indent === 0) break
-      }
-    }
-  }
-  for (const lineNo of hitLines ?? []) {
-    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", "python")) owners.add(value)
-  }
-  return owners
-}
-
-function impactBraceEnclosingOwner(lines, start) {
-  let depth = 0
-  for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
-    const line = lines[i] ?? ""
-    for (let j = line.length - 1; j >= 0; j -= 1) {
-      const ch = line[j]
-      if (ch === "}") depth += 1
-      else if (ch === "{") {
-        if (depth > 0) depth -= 1
-        else {
-          for (const value of impactDeclaredSymbols(line, "typescript")) return value
-        }
-      }
-    }
-  }
-  return null
-}
-
-function impactBraceOwnerSymbols(lines, ranges, hitLines, language) {
-  const owners = new Set()
-  for (const range of ranges ?? []) {
-    const start = Math.max(0, range.start ?? 0)
-    const end = Math.min(lines.length - 1, start + 5)
-    for (let i = Math.max(0, start - 2); i <= end; i += 1) {
-      for (const value of impactDeclaredSymbols(lines[i] ?? "", language)) owners.add(value)
-    }
-    const enclosing = impactBraceEnclosingOwner(lines, start)
-    if (enclosing) owners.add(enclosing)
-  }
-  for (const lineNo of hitLines ?? []) {
-    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", language)) owners.add(value)
-  }
-  return owners
-}
-
-function impactOwnerSymbols(lines, ranges, hitLines, language) {
-  if (!Array.isArray(lines)) return new Set()
-  if (language === "python") return impactPythonOwnerSymbols(lines, ranges, hitLines)
-  if (["javascript", "typescript"].includes(language)) return impactBraceOwnerSymbols(lines, ranges, hitLines, language)
-  return new Set()
-}
-
-function impactIndent(line) {
-  const match = String(line ?? "").match(/^[ \t]*/)
-  return match ? match[0].replace(/\t/g, "    ").length : 0
 }

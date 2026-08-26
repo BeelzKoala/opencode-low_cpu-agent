@@ -2,6 +2,27 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+import {
+  TASK_ACTION_PROTOCOL,
+  compileTaskAction,
+  unresolvedTaskAction,
+} from "./cpu-search-core/task-action-v1.mjs"
+import {
+  TASK_SEARCH_PLAN_PROTOCOL,
+  compileTaskSearchPlanForState,
+} from "./cpu-search-core/task-search-plan-v1.mjs"
+import {
+  ACTION_COMMIT_DISPATCH_ORIGIN,
+  ACTION_COMMIT_PROTOCOL,
+  claimActionCommit,
+  deriveActionCommit,
+} from "./cpu-search-core/action-commit-v1.mjs"
+import {
+  TERMINAL_COMMIT_PROTOCOL,
+  claimTerminalCommit,
+  deriveTerminalCommit,
+  terminalCommitMatchesTask,
+} from "./cpu-search-core/terminal-commit-v1.mjs"
 
 const MAX_QUERIES = 4
 const LINE_HIT_CAP_PER_QUERY = 1000
@@ -156,6 +177,11 @@ const EXECUTION_LOOP_PROTOCOL = "execution-loop-v1"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
 const INVARIANT_VERIFIER_PROTOCOL = "invariant-verifier-v2"
 const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
+const COMPLETION_AUTHORIZER_REQUEST_PROTOCOL = "completion-authorizer-request-v1"
+const COMPLETION_AUTHORIZER_PROTOCOL = "completion-authorizer-v1"
+const COMPLETION_AUTHORIZER_POLICY = "exact-rename-v1"
+const COMPLETION_SAFE_FAIL_PROTOCOL = "completion-safe-fail-v1"
+const COMPLETION_SAFE_FAIL_OUTCOME = "SAFE_FAIL"
 // Wall-clock limits in the deterministic mutation plane are hard liveness
 // watchdogs, not capability or correctness budgets. Actual mutation scope is
 // bounded independently by files, edits, lines, bytes, checks, evidence and
@@ -169,6 +195,12 @@ const PATCH_EXECUTOR_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const PATCH_EXECUTOR_MAX_STDOUT_BYTES = 256 * 1024
 const INVARIANT_VERIFIER_TIMEOUT_MS = PATCH_STAGE_HARD_WATCHDOG_MS
 const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
+// Native completion authorization benchmarks at ~1 ms median / ~1.4 ms p95.
+// This is only a liveness watchdog. Timeout/ABSTAIN withholds terminal
+// optimization; the verified PATCH_READY candidate remains valid and the
+// ordinary agent loop may continue.
+const COMPLETION_AUTHORIZER_TIMEOUT_MS = 500
+const COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES = 64 * 1024
 const MAX_PATCH_ATTEMPTS_PER_TURN = 2
 
 // v2.16-B: deterministic runtime identity.
@@ -193,8 +225,6 @@ const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
 const TASK_CONTEXT_PROTOCOL = "task-context-v1"
 const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
-const TASK_ACTION_PROTOCOL = "task-action-v1"
-const TASK_SEARCH_PLAN_PROTOCOL = "task-search-plan-v1"
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
 const TASK_CONTEXT_MAX_PARTS = 64
 const TASK_CONTEXT_MAX_REPORTED_PART_TYPES = 16
@@ -223,6 +253,12 @@ const MAX_TURN_EVIDENCE_BYTES = 8192
 
 const MAX_MODEL_CALLS_PER_TURN = 4
 const MAX_TURN_WALL_MS = 120_000
+
+// v2.27-C: proof-carrying terminalization. The verifier remains authority;
+// this layer only prevents a redundant provider turn after immutable proof.
+const TERMINAL_ARTIFACT_MAX_BYTES = 512 * 1024
+const TERMINAL_SHORT_CIRCUIT_ENABLED =
+  process.env.OPENCODE_CPU_AGENT_TERMINAL_SHORT_CIRCUIT !== "0"
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000
 const MAX_TRACKED_SESSIONS = 256
@@ -636,6 +672,183 @@ async function writeProjectTrace(root, fileName, record) {
 
 function scoutOpaqueKey(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 20)
+}
+
+function clearTerminalCommitState(state) {
+  if (!state) return
+  state.terminalCommit = null
+  state.terminalCommitSha256 = null
+  state.terminalCommitClaims = 0
+  state.terminalShortCircuitAttemptedSha256 = null
+  state.terminalShortCircuitRequests = 0
+  state.terminalShortCircuits = 0
+  state.terminalShortCircuitFailures = 0
+}
+
+function clearCompletionSafeFailState(state) {
+  if (!state) return
+  state.completionSafeFail = null
+  state.completionSafeFailSha256 = null
+  state.completionSafeFailClaims = 0
+  state.completionSafeFailShortCircuitAttemptedSha256 = null
+  state.completionSafeFailShortCircuitRequests = 0
+  state.completionSafeFailShortCircuits = 0
+  state.completionSafeFailShortCircuitFailures = 0
+}
+
+function completionSafeFailMatchesTask(commit, snapshot) {
+  if (!commit || commit.protocol !== COMPLETION_SAFE_FAIL_PROTOCOL) {
+    return { ok: false, reason: "completion_safe_fail_invalid" }
+  }
+  if (!snapshot?.ok || typeof snapshot.turnID !== "string") {
+    return { ok: false, reason: "completion_safe_fail_task_unresolved" }
+  }
+  if (commit.user_turn_id !== snapshot.turnID) {
+    return { ok: false, reason: "completion_safe_fail_task_turn_changed" }
+  }
+  if (commit.task_sha256 !== snapshot.textSha256) {
+    return { ok: false, reason: "completion_safe_fail_task_text_drift" }
+  }
+  return { ok: true, reason: "completion_safe_fail_task_match" }
+}
+
+function deriveCompletionSafeFail({
+  state,
+  persisted,
+  completionAuthorization,
+}) {
+  if (!state || !persisted || !completionAuthorization) {
+    return { ok: false, reason: "completion_safe_fail_missing_input" }
+  }
+  if (completionAuthorization.applicable !== true) {
+    return { ok: false, reason: "completion_safe_fail_not_applicable" }
+  }
+  if (completionAuthorizationPermitsTerminal(completionAuthorization)) {
+    return { ok: false, reason: "completion_safe_fail_already_certified" }
+  }
+  const patchSha = persisted?.receipt?.patch_sha256
+  const actionCommitSha = persisted?.receipt?.action_commit_sha256
+  if (
+    typeof state.taskTurnID !== "string" ||
+    typeof state.taskTextSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(state.taskTextSha256) ||
+    typeof persisted.path !== "string" ||
+    typeof persisted.verificationPath !== "string" ||
+    typeof persisted.receiptSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(persisted.receiptSha256) ||
+    typeof persisted.verificationSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(persisted.verificationSha256) ||
+    typeof patchSha !== "string" ||
+    !/^[0-9a-f]{64}$/.test(patchSha) ||
+    typeof actionCommitSha !== "string" ||
+    !/^[0-9a-f]{64}$/.test(actionCommitSha)
+  ) {
+    return { ok: false, reason: "completion_safe_fail_identity_invalid" }
+  }
+
+  const canonical = {
+    protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+    outcome: COMPLETION_SAFE_FAIL_OUTCOME,
+    reason: completionAuthorization.reason ?? "completion_authorizer_unavailable",
+    completion_authorizer_transport_ok:
+      completionAuthorization.transport_ok === true,
+    completion_authorizer_decision:
+      completionAuthorization.decision ?? null,
+    user_turn_id: state.taskTurnID,
+    task_sha256: state.taskTextSha256,
+    action_commit_sha256: actionCommitSha,
+    patch_receipt_path: persisted.path,
+    patch_receipt_sha256: persisted.receiptSha256,
+    verification_receipt_path: persisted.verificationPath,
+    verification_receipt_sha256: persisted.verificationSha256,
+    patch_sha256: patchSha,
+  }
+  const commitSha256 = createHash("sha256")
+    .update(JSON.stringify(canonical))
+    .digest("hex")
+  return {
+    ok: true,
+    reason: "completion_safe_fail_ready",
+    commit: { ...canonical, commit_sha256: commitSha256 },
+  }
+}
+
+function claimCompletionSafeFail(state, commit) {
+  if (
+    !state ||
+    commit?.protocol !== COMPLETION_SAFE_FAIL_PROTOCOL ||
+    !/^[0-9a-f]{64}$/.test(commit?.commit_sha256 ?? "")
+  ) {
+    return { ok: false, reason: "completion_safe_fail_invalid" }
+  }
+  if (state.completionSafeFailSha256) {
+    return {
+      ok: state.completionSafeFailSha256 === commit.commit_sha256,
+      reason:
+        state.completionSafeFailSha256 === commit.commit_sha256
+          ? "completion_safe_fail_duplicate"
+          : "completion_safe_fail_conflict",
+    }
+  }
+  state.completionSafeFail = commit
+  state.completionSafeFailSha256 = commit.commit_sha256
+  state.completionSafeFailClaims = 1
+  return { ok: true, reason: "completion_safe_fail_claimed" }
+}
+
+async function terminalArtifactSha256(root, rawPath) {
+  if (
+    !root ||
+    typeof rawPath !== "string" ||
+    rawPath.length < 1 ||
+    rawPath.startsWith("/") ||
+    rawPath.includes("\0")
+  ) {
+    return null
+  }
+
+  const resolved = path.resolve(root, rawPath)
+  if (
+    resolved === root ||
+    !resolved.startsWith(root + path.sep)
+  ) {
+    return null
+  }
+
+  try {
+    const info = await stat(resolved)
+    if (
+      !info.isFile() ||
+      info.size < 1 ||
+      info.size > TERMINAL_ARTIFACT_MAX_BYTES
+    ) {
+      return null
+    }
+    const body = await readFile(resolved)
+    return createHash("sha256").update(body).digest("hex")
+  } catch {
+    return null
+  }
+}
+
+async function validateTerminalCommitArtifacts(root, commit) {
+  const checks = await Promise.all([
+    terminalArtifactSha256(root, commit?.patch_receipt_path),
+    terminalArtifactSha256(root, commit?.verification_receipt_path),
+    terminalArtifactSha256(root, commit?.patch_path),
+  ])
+
+  if (checks[0] !== commit?.patch_receipt_sha256) {
+    return { ok: false, reason: "terminal_patch_receipt_stale" }
+  }
+  if (checks[1] !== commit?.verification_receipt_sha256) {
+    return { ok: false, reason: "terminal_verification_receipt_stale" }
+  }
+  if (checks[2] !== commit?.patch_sha256) {
+    return { ok: false, reason: "terminal_patch_stale" }
+  }
+
+  return { ok: true, reason: "terminal_artifacts_match" }
 }
 
 function scoutFingerprintKey(fingerprint) {
@@ -2051,350 +2264,5 @@ async function attestRenameTargetCapability(
     evidenceLines: selected.evidenceLines,
     exactHitCount: selected.exactHitCount,
     discoveryFiles: selected.discoveryFiles,
-  }
-}
-
-async function attestLocalMutationCapability(
-  root,
-  sessionID,
-  state,
-  scoutHandoff,
-  editCapsule,
-  competitorCheck,
-  targetOverride = null,
-) {
-  const reject = (reason, detail = null) => ({
-    ok: false,
-    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    reason,
-    detail,
-    globalReady: false,
-    replaceNodeReady: false,
-    renameSymbolReady: false,
-    localHandoffPath: null,
-    target: null,
-  })
-
-  if (
-    !root ||
-    !sessionID ||
-    !state ||
-    !scoutHandoff?.path ||
-    editCapsule?.mutationReady !== true ||
-    competitorCheck?.ok !== true
-  ) {
-    return reject("capability_inputs_incomplete")
-  }
-
-  const eligibility = scoutMutationLocalizationEligibility(
-    state,
-    scoutHandoff,
-  )
-  if (!eligibility.eligible) {
-    return reject("localization_not_eligible", eligibility.reason ?? null)
-  }
-
-  const rel = normalizeMutationFile(scoutHandoff.path)
-  if (!rel.startsWith(".opencode/scout-handoffs/")) {
-    return reject("source_handoff_path_invalid")
-  }
-
-  const handoffRoot = path.resolve(root, ".opencode", "scout-handoffs")
-  const absolute = path.resolve(root, rel)
-  if (
-    absolute !== handoffRoot &&
-    !absolute.startsWith(handoffRoot + path.sep)
-  ) {
-    return reject("source_handoff_path_escape")
-  }
-
-  let raw
-  let bundle
-  try {
-    raw = await readFile(absolute)
-    bundle = JSON.parse(raw.toString("utf8"))
-  } catch {
-    return reject("source_handoff_unreadable")
-  }
-
-  if (bundle?.protocol !== SCOUT_HANDOFF_PROTOCOL) {
-    return reject("source_handoff_protocol_mismatch")
-  }
-
-  const blockingReasons = Array.isArray(bundle.blocking_reasons)
-    ? bundle.blocking_reasons
-    : []
-  const partialReasons = Array.isArray(bundle.partial_reasons)
-    ? bundle.partial_reasons
-    : []
-
-  if (blockingReasons.length > 0) {
-    return reject("source_handoff_blocked", blockingReasons.join(","))
-  }
-
-  const globalReady =
-    bundle.status === "ready" && partialReasons.length === 0
-  const localPartialReady =
-    bundle.status === "partial" &&
-    localCapabilityPartialReasonsAllowed(partialReasons)
-
-  if (!globalReady && !localPartialReady) {
-    return reject(
-      "source_handoff_not_locally_sufficient",
-      `${bundle.status ?? "missing"}:${partialReasons.join(",")}`,
-    )
-  }
-
-  const loaded = await readAuthorizedEditCapsule(root, state)
-  if (!loaded.ok) {
-    return reject("edit_capsule_attestation_failed", loaded.reason ?? null)
-  }
-
-  const capsule = loaded.capsule
-  const authorizedScopes = (capsule.scopes ?? []).filter(
-    (scope) =>
-      scope?.mutation_authorized === true &&
-      scope?.context === "full",
-  )
-  if (authorizedScopes.length !== 1) {
-    return reject("authorized_scope_cardinality", String(authorizedScopes.length))
-  }
-
-  const initialTarget = authorizedScopes[0]
-  if (!sameAuthorizedScopeIdentity(initialTarget, capsule.authorized_mutation_scope)) {
-    return reject("authorized_scope_attestation_mismatch")
-  }
-
-  let target = initialTarget
-  let candidateMeta = null
-
-  if (targetOverride) {
-    candidateMeta =
-      (editCapsule?.mutationCandidates ?? [])
-        .find((candidate) =>
-          sameAuthorizedScopeIdentity(candidate, targetOverride),
-        ) ?? null
-
-    if (!candidateMeta) {
-      return reject("mutation_candidate_not_preauthorized")
-    }
-
-    const candidateScope =
-      (editCapsule?.scopeRecords ?? [])
-        .find((scope) =>
-          scope?.context === "full" &&
-          scope?.mutation_candidate === true &&
-          sameAuthorizedScopeIdentity(scope, candidateMeta),
-        ) ?? null
-
-    if (!candidateScope) {
-      return reject("mutation_candidate_scope_missing")
-    }
-
-    if (
-      !globalReady &&
-      !sameAuthorizedScopeIdentity(initialTarget, candidateScope)
-    ) {
-      return reject("partial_candidate_rebind_requires_rescout")
-    }
-
-    target = candidateScope
-  }
-
-  if (
-    typeof target.symbol_name !== "string" ||
-    target.symbol_name.length < 1 ||
-    target.symbol_name === "<module>" ||
-    target.symbol_name === "<evidence>" ||
-    !Number.isInteger(target.start_line) ||
-    !Number.isInteger(target.end_line) ||
-    target.start_line < 1 ||
-    target.end_line < target.start_line
-  ) {
-    return reject("authorized_scope_identity_invalid")
-  }
-
-  const wantedFile = canonicalMutationFile(root, target.file)
-  if (!wantedFile) return reject("authorized_scope_file_invalid")
-
-  const handoffFiles = Array.isArray(bundle.files) ? bundle.files : []
-  const targetFile = handoffFiles.find(
-    (file) => canonicalMutationFile(root, file?.file) === wantedFile,
-  )
-  if (!targetFile) return reject("authorized_file_not_in_handoff")
-
-  if (
-    !globalReady &&
-    !(Array.isArray(targetFile.origins) && targetFile.origins.includes("lexical"))
-  ) {
-    return reject("partial_target_requires_direct_lexical_origin")
-  }
-
-  const fingerprint = targetFile.fingerprint
-  if (
-    fingerprint?.kind !== "sha256" ||
-    fingerprint?.strong !== true ||
-    fingerprint?.evidence_fresh !== true ||
-    typeof fingerprint?.sha256 !== "string" ||
-    !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
-    targetFile.changed_during_scout === true
-  ) {
-    return reject("target_fingerprint_not_strong_current")
-  }
-
-  // Re-read the target now. The derived handoff must carry a current source
-  // hash, not merely trust a prior Scout observation.
-  let currentBody
-  try {
-    currentBody = await readFile(path.resolve(root, wantedFile))
-  } catch {
-    return reject("target_file_unavailable")
-  }
-  const currentSha256 = createHash("sha256").update(currentBody).digest("hex")
-  if (currentSha256 !== fingerprint.sha256) {
-    return reject("target_fingerprint_stale")
-  }
-
-  const attestationTargetFile = {
-    ...targetFile,
-    evidence_lines:
-      [...new Set([
-        ...(targetFile.evidence_lines ?? []),
-        ...(candidateMeta?.evidence_lines ?? []),
-      ])]
-        .filter((line) => Number.isInteger(line) && line > 0)
-        .sort((a, b) => a - b),
-  }
-
-  const attestationCapsule =
-    targetOverride
-      ? {
-          ...editCapsule,
-          mutationReady: true,
-          structuralSource:
-            candidateMeta?.structural_source ??
-            editCapsule?.structuralSource ??
-            "candidate_set",
-          primaryMutationCandidate:
-            mutationCandidateIdentity(target),
-          authorizedMutationScope:
-            mutationCandidateIdentity(target),
-        }
-      : editCapsule
-
-  const ownerAttestation = buildOwnerAttestation(
-    attestationCapsule,
-    target,
-    attestationTargetFile,
-  )
-  if (!ownerAttestation.ok) {
-    return reject(
-      "target_owner_evidence_unavailable",
-      ownerAttestation.reason,
-    )
-  }
-
-  const attestedEvidenceLines = ownerAttestation.evidence_lines
-
-  const sourceHandoffSha256 = createHash("sha256").update(raw).digest("hex")
-  const identity = {
-    file: wantedFile,
-    symbol_kind: target.symbol_kind,
-    symbol_name: target.symbol_name,
-    start_line: target.start_line,
-    end_line: target.end_line,
-  }
-  const identitySha256 = createHash("sha256")
-    .update(JSON.stringify(identity))
-    .digest("hex")
-
-  const capability = {
-    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    operation: "replace_node",
-    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
-    basis: "single_full_source_validated_owner",
-    owner_attestation: ownerAttestation,
-    source_handoff: rel,
-    source_handoff_sha256: sourceHandoffSha256,
-    source_handoff_status: bundle.status,
-    source_partial_reasons: partialReasons,
-    edit_capsule: editCapsule.path,
-    edit_capsule_sha256: editCapsule.sha256,
-    target: identity,
-    target_identity_sha256: identitySha256,
-    target_source_sha256: currentSha256,
-    attested_evidence_lines: attestedEvidenceLines,
-    competitor_confirmation: competitorCheck,
-    global_discovery_complete: globalReady,
-  }
-
-  const localBundle = {
-    protocol: SCOUT_HANDOFF_PROTOCOL,
-    search_protocol: SEARCH_PROTOCOL,
-    session_key: scoutOpaqueKey(sessionID),
-    turn_key: scoutOpaqueKey(state.turnID ?? ""),
-    generated_at_ms: nowMs(),
-    status: "ready",
-    blocking_reasons: [],
-    partial_reasons: [],
-    scope_mode: "local_mutation_capability",
-    capability_protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    allowed_mutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
-    owner_attestation: ownerAttestation,
-    source_handoff: rel,
-    source_handoff_sha256: sourceHandoffSha256,
-    source_handoff_status: bundle.status,
-    source_partial_reasons: partialReasons,
-    edit_capsule: editCapsule.path,
-    edit_capsule_sha256: editCapsule.sha256,
-    capability,
-    budgets: bundle.budgets ?? {},
-    searches: bundle.searches ?? [],
-    files: [
-      {
-        ...targetFile,
-        file: wantedFile,
-        evidence_lines: attestedEvidenceLines,
-        fingerprint: {
-          ...fingerprint,
-          sha256: currentSha256,
-          strong: true,
-          evidence_fresh: true,
-        },
-        changed_during_scout: false,
-      },
-    ],
-  }
-
-  const localHandoffPath = await writeLocalMutationHandoff(
-    root,
-    sessionID,
-    state.turnID,
-    localBundle,
-    targetOverride ? identitySha256 : "primary",
-  )
-  if (!localHandoffPath) {
-    return reject("local_mutation_handoff_write_failed")
-  }
-
-  return {
-    ok: true,
-    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    reason: globalReady
-      ? "global_ready_local_scope_attested"
-      : "partial_global_local_scope_attested",
-    globalReady,
-    replaceNodeReady: true,
-    // Rename authority is a distinct capability derived from exact symbol
-    // identity. A replace-node owner must never implicitly authorize rename.
-    renameSymbolReady: false,
-    sourceHandoffPath: rel,
-    localHandoffPath,
-    target: identity,
-    targetSourceSha256: currentSha256,
-    sourcePartialReasons: partialReasons,
-    competitorCheck,
-    allowedMutations: [...SCOUT_LOCAL_CAPABILITY_ALLOWED_MUTATIONS],
-    ownerAttestation,
   }
 }

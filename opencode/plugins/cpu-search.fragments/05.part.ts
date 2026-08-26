@@ -10,6 +10,877 @@ export default {
 
     const unsubscribeEvents = await subscribeEvents(ctx)
 
+    const executeCapabilityMutationCore = async (
+      rawInput,
+      toolContext,
+      forcedKind,
+      toolName,
+      dispatch = null,
+    ) => {
+      const input = {
+        ...(rawInput ?? {}),
+        kind: forcedKind,
+      }
+        const dispatchOrigin =
+        dispatch?.origin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? ACTION_COMMIT_DISPATCH_ORIGIN
+          : "model_tool"
+      const actionCommit =
+        dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? dispatch?.actionCommit ?? null
+          : null
+      const started = performance.now()
+        const sessionID =
+          typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
+            ? toolContext.sessionID
+            : null
+        const state = getSessionState(sessionID)
+        const root = await rootForTool(ctx, toolContext, sessionID, state)
+        const runtimeIdentity = await runtimeStackIdentity()
+
+        const trace = async (record) => {
+          await writeProjectTrace(root, "executor-trace.jsonl", {
+            ts: nowMs(),
+            protocol: EXECUTION_LOOP_PROTOCOL,
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            mutation_attempt: state?.mutationAttempts ?? null,
+            repair_attempts: state?.repairAttempts ?? null,
+            compiler_runs: state?.compilerRuns ?? null,
+            patch_attempt: state?.patchAttempts ?? null,
+            executor_runs: state?.executorRuns ?? null,
+            executed_patches: state?.executedPatches ?? null,
+            turn_model_calls: state?.modelCalls ?? null,
+            scout_handoff_path: state?.scoutHandoffPath ?? null,
+            edit_capsule_path: state?.editCapsulePath ?? null,
+            bound_mutation_target: state?.boundMutationTarget ?? null,
+            preauthorized_mutation_candidates:
+              state?.localMutationCandidates?.length ?? 0,
+            execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_state: state?.executionState ?? null,
+            execution_reason: state?.executionReason ?? null,
+            mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+            mutation_tool: toolName,
+            semantic_kind: forcedKind,
+            mutation_dispatch_origin: dispatchOrigin,
+            action_commit_protocol: actionCommit?.protocol ?? null,
+            action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+            tool_contract_failures: state?.contractFailures ?? null,
+            ...runtimeIdentity,
+            ...record,
+            tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+          })
+        }
+
+        if (!root || !state) {
+          await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
+          return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
+        }
+        if (
+          dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+          (
+            actionCommit?.protocol !== ACTION_COMMIT_PROTOCOL ||
+            actionCommit?.operation !== "rename_symbol" ||
+            actionCommit?.tool !== toolName ||
+            actionCommit?.task_sha256 !== state.taskTextSha256 ||
+            actionCommit?.new_name !== rawInput?.new_name ||
+            actionCommit?.old_name !==
+              state?.renameMutationCapability?.target?.symbol_name ||
+            actionCommit?.scout_handoff_path !== state.scoutHandoffPath ||
+            actionCommit?.target_identity_sha256 !==
+              state?.renameMutationCapability?.targetIdentitySha256 ||
+            actionCommit?.target_source_sha256 !==
+              state?.renameMutationCapability?.targetSourceSha256 ||
+            actionCommit?.commit_sha256 !== state.actionCommitSha256
+          )
+        ) {
+          applyExecutionEvent(state, "fatal", "action_commit_stale")
+          await trace({ admitted: false, reason: "action_commit_stale", action: "stop" })
+          return {
+            content: "PATCH_STOP reason=action_commit_stale action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "action_commit_stale",
+            },
+          }
+        }
+
+        const exactTaskRename =
+          state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
+          state?.taskAction?.status === "exact" &&
+          state?.taskAction?.operation === "rename_symbol" &&
+          state?.taskAction?.task_sha256 === state?.taskTextSha256
+
+        if (
+          forcedKind === "rename_symbol" &&
+          exactTaskRename &&
+          rawInput?.new_name !== state.taskAction.new_name
+        ) {
+          applyExecutionEvent(state, "fatal", "task_action_argument_mismatch")
+          await trace({
+            admitted: false,
+            reason: "task_action_argument_mismatch",
+            action: "stop",
+          })
+          return {
+            content:
+              "PATCH_STOP reason=task_action_argument_mismatch " +
+              "action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "task_action_argument_mismatch",
+            },
+          }
+        }
+        if (!toolAllowedForExecutionState(state, toolName)) {
+          const next = nextActionForExecutionState(state)
+          const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
+          await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
+          return {
+            content: `${action === "rescout" ? "PATCH_RESCOUT" : "PATCH_STOP"} reason=causal_frontier state=${state.executionState} action=${next}`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action,
+              reason: "causal_frontier",
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              next_action: next,
+            },
+          }
+        }
+        if (!state.scoutHandoffPath) {
+          applyExecutionEvent(state, "patch_rescout", "scout_handoff_missing", { reason: "scout_handoff_missing" })
+          await trace({ admitted: false, reason: "scout_handoff_missing", action: "rescout" })
+          return {
+            content: "PATCH_RESCOUT reason=scout_handoff_missing action=search_first",
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "scout_handoff_missing" },
+          }
+        }
+        if (state.patchAccepted) {
+          applyExecutionEvent(state, "patch_ready", "patch_already_accepted")
+          await trace({ admitted: false, reason: "patch_already_accepted", action: "stop", receipt_path: state.patchReceiptPath })
+          return {
+            content: `PATCH_STOP reason=patch_already_accepted receipt=${state.patchReceiptPath ?? "unknown"} action=use_receipt`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
+          }
+        }
+        if (state.mutationAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
+          applyExecutionEvent(state, "fatal", "mutation_attempt_budget")
+          await trace({
+            admitted: false,
+            reason: "mutation_attempt_budget",
+            action: "stop",
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_attempt_budget ` +
+              `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_attempt_budget",
+            },
+          }
+        }
+
+        const forbiddenRawAuthorityField = [
+          "kind",
+          "file",
+          "symbol",
+          "scope",
+        ].find((field) => mutationFieldPresent(rawInput, field))
+
+        const shape = forbiddenRawAuthorityField
+          ? mutationShapeFailure(
+              forcedKind,
+              `action_tool_forbids_${forbiddenRawAuthorityField}`,
+            )
+          : validateMutationShape(input)
+
+        // Tool-schema/transport violations are not semantic patch attempts.
+        // With action-specific top-level required fields these should be
+        // unreachable under a conforming provider; if they reach runtime,
+        // fail closed without consuming the one semantic repair.
+        if (shape.ok !== true) {
+          state.contractFailures += 1
+          const repeated = state.contractFailureSignatures.has(shape.signature)
+          state.contractFailureSignatures.add(shape.signature)
+          applyExecutionEvent(state, "fatal", "tool_contract_violation")
+
+          await trace({
+            admitted: false,
+            failure_layer: "tool_contract",
+            reason: "tool_contract_violation",
+            contract_detail: shape.detail,
+            contract_signature: shape.signature,
+            repeated_contract_failure: repeated,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+
+          return {
+            content:
+              `PATCH_STOP reason=tool_contract_violation ` +
+              `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `contract_failures=${state.contractFailures} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "tool_contract_violation",
+              detail: shape.detail,
+              failure_layer: "tool_contract",
+              semantic_attempt_consumed: false,
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        if (
+          state.activeMutationTool &&
+          state.activeMutationTool !== toolName
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_action_changed_during_attempt")
+          await trace({
+            admitted: false,
+            failure_layer: "orchestrator_contract",
+            reason: "mutation_action_changed_during_attempt",
+            previous_tool: state.activeMutationTool,
+            attempted_tool: toolName,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_action_changed_during_attempt ` +
+              `expected=${state.activeMutationTool} got=${toolName} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_action_changed_during_attempt",
+              failure_layer: "orchestrator_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        state.activeMutationTool = toolName
+
+        if (state.executionState === EXEC_STATE_REPAIR) {
+          state.repairAttempts += 1
+        }
+
+        state.mutationAttempts += 1
+        state.lastSeen = nowMs()
+
+        const authorization =
+          await materializeCapabilityBoundMutation(
+            root,
+            state,
+            input,
+          )
+
+        if (authorization.ok !== true) {
+          const reason =
+            typeof authorization.reason === "string"
+              ? authorization.reason
+              : "mutation_scope_unavailable"
+
+          const detail =
+            typeof authorization.detail === "string"
+              ? authorization.detail
+              : reason
+
+          const canRetryAuthorization =
+            authorization.repairable === true &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+
+          if (canRetryAuthorization) {
+            applyExecutionEvent(
+              state,
+              "patch_retry",
+              reason,
+            )
+
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "retry",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_RETRY reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=revise_semantic_owner_binding`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "retry",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          if (authorization.rescout === true) {
+            applyExecutionEvent(
+              state,
+              "patch_rescout",
+              reason,
+              {
+                reason,
+                detail,
+              },
+            )
+
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "rescout",
+              compiler_run: false,
+              executor_run: false,
+            })
+
+            return {
+              content:
+                `PATCH_RESCOUT reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=refine_search`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "rescout",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+
+          applyExecutionEvent(
+            state,
+            "fatal",
+            reason,
+          )
+
+          await trace({
+            admitted: false,
+            failure_layer: "internal_contract",
+            reason,
+            scope_detail: detail,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+
+          return {
+            content:
+              `PATCH_STOP reason=${reason} ` +
+              `detail=${detail} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason,
+              detail,
+              failure_layer: "internal_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        const mutation =
+          authorization.mutation
+
+        const mutations = [mutation]
+
+        const activeMutationHandoffPath =
+          authorization.handoff_path
+
+        if (
+          typeof activeMutationHandoffPath !== "string" ||
+          activeMutationHandoffPath.length < 1
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_handoff_unavailable")
+          await trace({
+            admitted: false,
+            reason: "mutation_handoff_unavailable",
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              "PATCH_STOP reason=mutation_handoff_unavailable action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_handoff_unavailable",
+            },
+          }
+        }
+
+        state.activeMutationHandoffPath = activeMutationHandoffPath
+        state.compilerRuns += 1
+
+        const compiled = await runPatchCompiler(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mutation_protocol: PATCH_MUTATION_PROTOCOL,
+          mutations,
+        })
+        if (!compiled.ok) {
+          const reason = `compiler_${compiled.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", compiler_elapsed_ms: compiled.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+        const compilerResponse = compiled.response
+        if (compilerResponse?.ok !== true) {
+          const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
+          const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
+          const canRetry =
+            PATCH_COMPILER_RETRY_REASONS.has(reason) &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+          const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+          if (needsRescout) {
+            applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
+          } else if (canRetry) {
+            applyExecutionEvent(state, "patch_retry", reason)
+          } else {
+            applyExecutionEvent(state, "fatal", reason)
+          }
+          await trace({
+            admitted: false,
+            reason,
+            action,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutation_index: compilerResponse?.mutation_index ?? null,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            executor_run: false,
+          })
+          if (needsRescout) {
+            return {
+              content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
+            }
+          }
+          if (canRetry) {
+            return {
+              content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+            }
+          }
+          return {
+            content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        state.patchAttempts += 1
+
+        const signature = patchPlanSignature(compilerResponse)
+        if (state.patchSignatures.has(signature)) {
+          applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
+          await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
+          return {
+            content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
+          }
+        }
+        state.patchSignatures.add(signature)
+        state.executorRuns += 1
+        state.executedPatches += 1
+
+        const result = await runPatchExecutor(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mode: "guarded",
+          edit_protocol: PATCH_EDIT_PROTOCOL,
+          edits: compilerResponse?.edits ?? [],
+          checks: compilerResponse?.checks ?? [],
+        })
+
+        if (!result.ok) {
+          const reason = `executor_${result.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        const response = result.response
+        if (response?.admitted === true) {
+          const proofObligations = proofObligationsForMutations(mutations)
+          state.proofObligations = proofObligations
+          const verified = await runInvariantVerifier(root, {
+            root,
+            handoff: activeMutationHandoffPath,
+            patch: response?.patch ?? "",
+            compiler_protocol: PATCH_COMPILER_PROTOCOL,
+            mutation_protocol: PATCH_MUTATION_PROTOCOL,
+            mutations,
+            changed_files: compilerResponse?.changed_files ?? [],
+            edits: compilerResponse?.edits ?? [],
+          })
+          if (!verified.ok) {
+            const reason = `verifier_${verified.reason}`
+            applyExecutionEvent(state, "fatal", reason)
+            await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=${reason} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+          const verificationResponse = verified.response
+          const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
+          if (!proofAssessment.ok) {
+            const failedProofs = compactProofFailure(proofAssessment)
+            const canRepair =
+              proofAssessment.disposition === "repair" &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+            if (proofAssessment.disposition === "rescout") {
+              applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
+                reason: "proof_obligation_failed",
+                failed: proofAssessment.failed,
+              })
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "rescout", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RESCOUT reason=proof_obligation_failed failed=${failedProofs} action=refine_search`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            if (canRepair) {
+              applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            applyExecutionEvent(state, "fatal", "proof_obligation_failed")
+            await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+            }
+          }
+          const persisted = await writePatchReceipt(
+            root,
+            sessionID,
+            state,
+            response,
+            compilerResponse,
+            verificationResponse,
+            proofAssessment,
+            { origin: dispatchOrigin, actionCommit },
+          )
+          if (!persisted) {
+            applyExecutionEvent(state, "fatal", "receipt_write_failed")
+            await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+            return {
+              content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
+            }
+          }
+          const completionAuthorization =
+            await observeCompletionAuthorization(
+              root,
+              sessionID,
+              state,
+              persisted,
+              proofAssessment,
+              dispatchOrigin,
+              actionCommit,
+            )
+
+          state.patchAccepted = true
+          state.patchReceiptPath = persisted.path
+          applyExecutionEvent(state, "patch_ready", "verification_passed")
+
+          // Native CompletionAuthorizer is the only permission to create a
+          // TerminalCommit. ABSTAIN/transport failure withholds only the
+          // terminal optimization; the verified patch remains PATCH_READY and
+          // the ordinary agent loop may continue.
+          const completionAuthorized =
+            completionAuthorizationPermitsTerminal(
+              completionAuthorization,
+            )
+          let completionSafeFail = null
+          let completionSafeFailClaim = null
+          if (!completionAuthorized) {
+            const completionSafeFailResult = deriveCompletionSafeFail({
+              state,
+              persisted,
+              completionAuthorization,
+            })
+            if (completionSafeFailResult.ok === true) {
+              completionSafeFailClaim = claimCompletionSafeFail(
+                state,
+                completionSafeFailResult.commit,
+              )
+              if (completionSafeFailClaim.ok === true) {
+                completionSafeFail = completionSafeFailResult.commit
+                await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                  ts: nowMs(),
+                  protocol: AGENT_PROTOCOL,
+                  kind: "completion_safe_fail_commit",
+                  completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+                  completion_safe_fail_sha256:
+                    completionSafeFail.commit_sha256,
+                  completion_safe_fail_reason: completionSafeFail.reason,
+                  completion_authorizer_transport_ok:
+                    completionAuthorization.transport_ok,
+                  completion_authorizer_decision:
+                    completionAuthorization.decision,
+                  sessionID,
+                  turnID: state.turnID,
+                  task_turn_id: state.taskTurnID,
+                  task_sha256: state.taskTextSha256,
+                  action_commit_sha256:
+                    completionSafeFail.action_commit_sha256,
+                  patch_receipt: completionSafeFail.patch_receipt_path,
+                  verification_receipt:
+                    completionSafeFail.verification_receipt_path,
+                  patch_sha256: completionSafeFail.patch_sha256,
+                  project_root: root,
+                })
+              }
+            }
+          }
+
+          const terminalCommitResult = completionAuthorized
+            ? deriveTerminalCommit({
+                state,
+                persisted,
+                proofAssessment,
+              })
+            : {
+                ok: false,
+                reason:
+                  completionAuthorization.applicable !== true
+                    ? "completion_authorizer_not_applicable"
+                    : completionAuthorization.transport_ok !== true
+                      ? "completion_authorizer_unavailable"
+                      : completionAuthorization.decision !== "CERTIFY"
+                        ? "completion_authorizer_abstain"
+                        : "completion_certificate_invalid",
+              }
+          let terminalCommit = null
+          let terminalClaim = null
+          if (terminalCommitResult.ok === true) {
+            terminalClaim = claimTerminalCommit(
+              state,
+              terminalCommitResult.commit,
+            )
+            if (terminalClaim.ok === true) {
+              terminalCommit = terminalCommitResult.commit
+              await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                ts: nowMs(),
+                protocol: AGENT_PROTOCOL,
+                kind: "terminal_commit",
+                terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                terminal_commit_sha256: terminalCommit.commit_sha256,
+                completion_authorizer_protocol:
+                  COMPLETION_AUTHORIZER_PROTOCOL,
+                completion_authorizer_authority:
+                  "terminal_permission",
+                completion_authorizer_permits_terminal:
+                  completionAuthorized,
+                completion_certificate_sha256:
+                  completionAuthorization.certificate_sha256,
+                sessionID,
+                turnID: state.turnID,
+                task_turn_id: state.taskTurnID,
+                task_sha256: state.taskTextSha256,
+                project_root: root,
+                proof_disposition: "pass",
+                patch_receipt: terminalCommit.patch_receipt_path,
+                verification_receipt:
+                  terminalCommit.verification_receipt_path,
+                patch_sha256: terminalCommit.patch_sha256,
+              })
+            }
+          }
+
+          await trace({
+            admitted: true,
+            reason: null,
+            action: "ready",
+            plan_signature: signature,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
+            compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+            executor_elapsed_ms: result.elapsedMs,
+            verifier_elapsed_ms: verified.elapsedMs,
+            invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+            invariants_total: verificationResponse?.invariants_total ?? 0,
+            invariants_passed: verificationResponse?.invariants_passed ?? 0,
+            proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+            proof_obligations: proofAssessment.obligations.map((item) => item.id),
+            proof_disposition: proofAssessment.disposition,
+            terminal_commit_protocol:
+              terminalCommit?.protocol ?? null,
+            terminal_commit_sha256:
+              terminalCommit?.commit_sha256 ?? null,
+            terminal_commit_reason:
+              terminalCommitResult.reason,
+            terminal_commit_claim_reason:
+              terminalClaim?.reason ?? null,
+            completion_safe_fail_protocol:
+              completionSafeFail?.protocol ?? null,
+            completion_safe_fail_sha256:
+              completionSafeFail?.commit_sha256 ?? null,
+            completion_safe_fail_claim_reason:
+              completionSafeFailClaim?.reason ?? null,
+            completion_authorizer_protocol:
+              COMPLETION_AUTHORIZER_PROTOCOL,
+            completion_authorizer_authority:
+              "terminal_permission",
+            completion_authorizer_permits_terminal:
+              completionAuthorized,
+            completion_authorizer_applicable:
+              completionAuthorization.applicable,
+            completion_authorizer_transport_ok:
+              completionAuthorization.transport_ok,
+            completion_authorizer_decision:
+              completionAuthorization.decision,
+            completion_authorizer_reason:
+              completionAuthorization.reason,
+            completion_certificate_sha256:
+              completionAuthorization.certificate_sha256,
+            completion_authorizer_elapsed_ms:
+              completionAuthorization.elapsed_ms,
+            verification_receipt: persisted.verificationPath,
+            receipt_path: persisted.path,
+            patch_path: persisted.receipt.patch_path,
+            patch_sha256: persisted.receipt.patch_sha256,
+            changed_files: response.changed_files ?? [],
+            changed_lines: response.changed_lines ?? 0,
+            patch_bytes: response.patch_bytes ?? 0,
+            structural_edits: response.structural_edits ?? 0,
+            repo_mutated: response.repo_mutated === true,
+          })
+          return {
+            content:
+              `PATCH_READY receipt=${persisted.path} changed_files=${(response.changed_files ?? []).length} ` +
+              `changed_lines=${response.changed_lines ?? 0} semantic_mutations=${compilerResponse?.mutations_effective ?? 0} ` +
+              `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
+              `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
+              `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
+              `capsule=${state.editCapsulePath ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "ready",
+              receipt_protocol: PATCH_RECEIPT_PROTOCOL,
+              receipt_path: persisted.path,
+              verification_receipt: persisted.verificationPath,
+              verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
+              terminal_commit_protocol:
+                terminalCommit?.protocol ?? null,
+              terminal_commit_sha256:
+                terminalCommit?.commit_sha256 ?? null,
+              terminal_commit_reason:
+                terminalCommitResult.reason,
+              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+              invariants_total: verificationResponse?.invariants_total ?? 0,
+              invariants_passed: verificationResponse?.invariants_passed ?? 0,
+              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+              proof_obligations: proofAssessment.obligations,
+              edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
+              edit_capsule_path: state.editCapsulePath,
+              edit_capsule_sha256: state.editCapsuleHash,
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              compiler_protocol: PATCH_COMPILER_PROTOCOL,
+              mutation_protocol: PATCH_MUTATION_PROTOCOL,
+                patch_tool_protocol: PATCH_TOOL_PROTOCOL,
+              mutation_dispatch_origin: dispatchOrigin,
+              action_commit_protocol: actionCommit?.protocol ?? null,
+              action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+              semantic_mutations: compilerResponse?.mutations_effective ?? 0,
+              lowered_edits: compilerResponse?.lowered_edits ?? 0,
+              changed_files: response.changed_files ?? [],
+              changed_lines: response.changed_lines ?? 0,
+              patch_bytes: response.patch_bytes ?? 0,
+              truncated: false,
+            },
+          }
+        }
+
+        const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
+        const canRetry =
+          PATCH_RETRY_REASONS.has(reason) &&
+          state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+        const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
+        const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+        if (needsRescout) {
+          applyExecutionEvent(state, "patch_rescout", reason, { reason, allowed_files: response?.allowed_files ?? [] })
+        } else if (canRetry) {
+          applyExecutionEvent(state, "patch_retry", reason)
+        } else {
+          applyExecutionEvent(state, "fatal", reason)
+        }
+        await trace({
+          admitted: false,
+          reason,
+          action,
+          plan_signature: signature,
+          compiler_elapsed_ms: compiled.elapsedMs,
+          compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+          executor_elapsed_ms: result.elapsedMs,
+          executor_diagnostic:
+            result.diagnostic ?? null,
+          allowed_files: response?.allowed_files ?? [],
+          changed_files: response?.changed_files ?? [],
+        })
+
+        if (needsRescout) {
+          return {
+            content: `PATCH_RESCOUT reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
+          }
+        }
+        if (canRetry) {
+          return {
+            content: `PATCH_RETRY reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+          }
+        }
+        return {
+          content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+          metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+        }
+    }
+
     await track(ctx.tool.transform((tools) => {
       tools.add({
         name: "search",
@@ -180,6 +1051,7 @@ export default {
             requestedQueries,
             requestedPath,
             modelRequestedGlob,
+            buildLanguageGlob("**/*", SOURCE_LANGUAGE_EXTENSIONS),
           )
           queries = taskSearchPlan.effective_queries
 
@@ -699,911 +1571,3 @@ export default {
           let focusedAttempted = false
           let focusedReason = "not_needed"
           let focusedSupplementBytes = null
-          let focusedScopeCandidates = null
-          let focusedSelectedScopes = null
-          let focusedReusedScopes = null
-          let focusedFullScopes = null
-          let focusedPartialScopes = null
-          let focusedRadius = null
-          let focusedCanonicalSavedBytes = null
-          let focusedFacts = new Set()
-          let focusedContextualizedHitLines = new Set()
-
-          focusedCandidate =
-            selectedScanComplete &&
-            selectedEvidenceComplete &&
-            hits.size > 0 &&
-            hits.size <= FOCUSED_PROBE_MAX_LINE_HITS &&
-            pressure.maxHitsPerFile <= FOCUSED_PROBE_MAX_HITS_PER_FILE &&
-            spansComplete &&
-            distillInput.length > 0 &&
-            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
-
-          const shouldDistill = pressure.active || focusedCandidate
-
-          if (!selectedScanComplete) distillReason = "selected_scan_incomplete"
-          else if (!shouldDistill) distillReason = "not_needed"
-          else if (!spansComplete) distillReason = "span_capture_incomplete"
-          else if (distillInput.length < 1) distillReason = "no_exact_spans"
-          else {
-            distillAttempted = true
-
-            const distill = await runDistiller(root, distillInput)
-            distillElapsedMs = distill.elapsedMs
-
-            if (!distill.ok) {
-              distillReason = distill.reason
-              if (focusedCandidate) focusedReason = `distill_${distill.reason}`
-              distillIrComplete = distill.response?.ir_complete ?? false
-              distillWitnessComplete = distill.response?.witness_complete ?? false
-              v2GroupingPreserved = distill.response?.v2_grouping_preserved ?? null
-            } else {
-              distillIrComplete = true
-              distillWitnessComplete = true
-              v2GroupingPreserved = true
-              distillGroupsForIndex = distill.response.groups
-              variantDiversity = Number.isFinite(distill.response?.variant_diversity)
-                ? distill.response.variant_diversity
-                : null
-              distillerElapsedMs = Number.isFinite(distill.response?.elapsed_ms)
-                ? distill.response.elapsed_ms
-                : null
-
-              const hybridRendered = await renderHybridEvidence(
-                root,
-                distill.response.groups,
-                bodyBudget,
-              )
-
-              hybridGroups = hybridRendered.shownGroups
-              hybridVariants = hybridRendered.shownVariants
-              hybridBodyBytes = hybridRendered.bodyBytes
-              hybridCoreBytes = hybridRendered.coreBytes
-              hybridContextSamples = hybridRendered.contextSamples
-              hybridFacts = hybridRendered.facts ?? new Set()
-
-              if (!hybridRendered.complete) {
-                distillReason = hybridRendered.reason ?? "hybrid_render_incomplete"
-              } else {
-                const contextSampled = hybridRendered.contextSamples > 0
-                const publicHybridRepresentation = routingActive
-                  ? "ranked_hybrid"
-                  : "hybrid"
-                const hybridHeader = [
-                  `SEARCH representation=${publicHybridRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} selected_witnesses_complete=true context_complete=false context_sampled=${contextSampled} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
-                  ...querySummary,
-                ]
-
-                if (routingActive) {
-                  hybridHeader.push(
-                    `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
-                  )
-                }
-
-                const hybridContent = [
-                  ...hybridHeader,
-                  ...(routeRendered.body.length > 0
-                    ? ["", ...routeRendered.body]
-                    : []),
-                  "",
-                  ...hybridRendered.body,
-                ].join("\n")
-                const hybridResultBytes = bytes(hybridContent)
-                hybridRatio = rawResultBytes > 0
-                  ? Math.round((hybridResultBytes / rawResultBytes) * 1000) / 1000
-                  : null
-
-                const materiallySmaller =
-                  rawResultBytes > 0 &&
-                  hybridResultBytes <= rawResultBytes * HYBRID_MIN_SAVINGS_RATIO
-
-                const hybridBeneficial =
-                  pressure.active &&
-                  (!selectedEvidenceComplete || materiallySmaller)
-
-                if (hybridResultBytes > callBudgetBytes) {
-                  distillReason = "hybrid_output_budget"
-                } else if (!hybridBeneficial) {
-                  distillReason = "no_material_size_reduction"
-                } else {
-                  representation = "hybrid"
-                  content = hybridContent
-                  resultBytes = hybridResultBytes
-                  bodyBytes = hybridRendered.bodyBytes
-                  shownHits = hits.size
-                  evidenceComplete = scanComplete && allDiscoveredFilesSelected
-                  complete = scanComplete && allDiscoveredFilesSelected
-                  distillReason = "selected"
-                }
-              }
-
-              if (representation !== "raw" && focusedCandidate) {
-                focusedReason = "superseded_by_hybrid"
-              }
-
-              if (representation === "raw" && focusedCandidate) {
-                focusedAttempted = true
-                const supplementBudget = Math.min(
-                  FOCUSED_SUPPLEMENT_MAX_BYTES,
-                  Math.max(0, bodyBudget - rawRendered.bodyBytes),
-                )
-                const focusedRendered = await renderFocusedSupplement(
-                  root,
-                  distill.response.groups,
-                  supplementBudget,
-                  hits,
-                  state?.evidenceLedger ?? null,
-                  state?.contextualizedHitLines ?? null,
-                )
-
-                focusedSupplementBytes = focusedRendered.bodyBytes
-                focusedScopeCandidates = focusedRendered.scopeCount
-                focusedSelectedScopes = focusedRendered.selectedScopeCount
-                focusedReusedScopes = focusedRendered.reusedScopeCount
-                focusedFullScopes = focusedRendered.fullScopes
-                focusedPartialScopes = focusedRendered.partialScopes
-                focusedRadius = focusedRendered.radius
-
-                if (!focusedRendered.complete) {
-                  focusedReason = focusedRendered.reason ?? "supplement_incomplete"
-                } else {
-                  const uncoveredHits = new Map(
-                    [...hits.entries()].filter(
-                      ([key]) => !focusedRendered.coveredHitKeys.has(key),
-                    ),
-                  )
-                  const seenForRaw = new Set(state?.evidenceLedger ?? [])
-
-                  for (const fact of focusedRendered.facts ?? []) {
-                    seenForRaw.add(fact)
-                  }
-
-                  const rawRemainingBudget = Math.max(
-                    0,
-                    bodyBudget - focusedRendered.bodyBytes,
-                  )
-                  const rawUncovered = await renderNovelRawEvidence(
-                    root,
-                    uncoveredHits,
-                    rawRemainingBudget,
-                    seenForRaw,
-                    focusedRendered.coveredRangesByFile,
-                    state?.contextualizedHitLines ?? null,
-                  )
-                  const uncoveredComplete = [...uncoveredHits.entries()].every(
-                    ([key, hit]) =>
-                      rawUncovered.shown.has(key) ||
-                      hitFactsAlreadySeen(hit, state?.evidenceLedger),
-                  )
-
-                  if (!uncoveredComplete) {
-                    focusedReason = "canonical_raw_budget"
-                  } else {
-                    const focusedBody = []
-
-                    if (rawUncovered.body.length > 0) {
-                      focusedBody.push(...rawUncovered.body)
-                    }
-
-                    if (
-                      rawUncovered.body.length > 0 &&
-                      focusedRendered.body.length > 0
-                    ) {
-                      focusedBody.push("")
-                    }
-
-                    focusedBody.push(...focusedRendered.body)
-
-                    const shownNow = new Set([
-                      ...rawUncovered.shown,
-                      ...focusedRendered.shownHitKeys,
-                    ])
-                    const priorHits = countHitsAlreadySeen(
-                      hits,
-                      state?.evidenceLedger,
-                    )
-                    const publicFocusedRepresentation = routingActive
-                      ? "ranked_focused"
-                      : "focused"
-                    const focusedHeader = [
-                      `SEARCH representation=${publicFocusedRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} context_complete=false context_mode=scope_guided_dedup candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${shownNow.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawUncovered.skippedPriorLines > 0} full_scopes=${focusedRendered.fullScopes} partial_scopes=${focusedRendered.partialScopes}`,
-                      ...querySummary,
-                    ]
-
-                    if (routingActive) {
-                      focusedHeader.push(
-                        `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
-                      )
-                    }
-                    const focusedContent = [
-                      ...focusedHeader,
-                      ...(routeRendered.body.length > 0
-                        ? ["", ...routeRendered.body]
-                        : []),
-                      "",
-                      ...focusedBody,
-                    ].join("\n")
-                    const focusedResultBytes = bytes(focusedContent)
-
-                    const focusedCostLimit = Math.min(
-                      rawResultBytes + FOCUSED_MAX_OVERHEAD_BYTES,
-                      Math.ceil(rawResultBytes * FOCUSED_MAX_OVERHEAD_RATIO),
-                    )
-                    const focusedCostAccepted =
-                      focusedResultBytes <= focusedCostLimit
-
-                    if (focusedResultBytes > callBudgetBytes) {
-                      focusedReason = "focused_output_budget"
-                    } else if (!focusedCostAccepted) {
-                      focusedReason = "cost_guard"
-                    } else {
-                      representation = "focused"
-                      content = focusedContent
-                      resultBytes = focusedResultBytes
-                      bodyBytes =
-                        rawUncovered.bodyBytes + focusedRendered.bodyBytes
-                      shownHits = shownNow.size
-                      evidenceComplete = scanComplete && allDiscoveredFilesSelected
-                      complete = scanComplete && allDiscoveredFilesSelected
-                      distillReason = "ir_complete"
-                      focusedReason = "selected"
-                      focusedFacts = new Set([
-                        ...rawUncovered.facts,
-                        ...focusedRendered.facts,
-                      ])
-                      focusedContextualizedHitLines =
-                        focusedRendered.contextualizedHitLines
-                      focusedCanonicalSavedBytes = Math.max(
-                        0,
-                        rawRendered.bodyBytes +
-                          focusedRendered.bodyBytes -
-                          bodyBytes,
-                      )
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-
-          // Dense evidence that cannot fit RAW is routed one level deeper
-          // inside the selected file(s). This is intentionally sampled and
-          // marked incomplete, but it gives the model concrete function/scope
-          // context without forcing an INDEX -> model -> narrower-search loop.
-          if (
-            representation === "raw" &&
-            selectedScanComplete &&
-            !selectedEvidenceComplete &&
-            Array.isArray(distillGroupsForIndex) &&
-            distillGroupsForIndex.length > 0
-          ) {
-            regionAttempted = true
-            const regionRendered = await renderRegionEvidence(
-              root,
-              distillGroupsForIndex,
-              bodyBudget,
-              hits,
-            )
-
-            regionReason = regionRendered.reason ?? "selected"
-            regionScopes = regionRendered.scopeCount
-            regionSampledScopes = regionRendered.sampledScopes
-            regionSampledHits = regionRendered.sampledHits
-            regionRetainedHits = regionRendered.retainedHits
-
-            if (regionRendered.complete) {
-              const publicRegionRepresentation = routingActive
-                ? "ranked_region"
-                : "region"
-              const regionHeader = [
-                `SEARCH representation=${publicRegionRepresentation} complete=false scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=false selected_evidence_complete=false matches_complete=${scanComplete} region_sampled=true refinement_required=false candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} sampled_hits=${regionRendered.sampledHits} retained_hits=${regionRendered.retainedHits} scopes=${regionRendered.sampledScopes}`,
-                ...querySummary,
-                `EVIDENCE_SAMPLED reason=dense_region_router exact_match_locations_preserved=true`,
-              ]
-
-              if (routingActive) {
-                regionHeader.push(
-                  `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete,region_sampled" : !allDiscoveredFilesProbed ? "probe_subset,region_sampled" : "budgeted_emit_subset,region_sampled"}`,
-                )
-              } else {
-                regionHeader.push("INCOMPLETE reasons=region_sampled")
-              }
-
-              const regionContent = [
-                ...regionHeader,
-                ...(routeRendered.body.length > 0
-                  ? ["", ...routeRendered.body]
-                  : []),
-                "",
-                ...regionRendered.body,
-              ].join("\n")
-              const regionResultBytes = bytes(regionContent)
-
-              if (regionResultBytes <= callBudgetBytes) {
-                representation = "region"
-                content = regionContent
-                resultBytes = regionResultBytes
-                bodyBytes = regionRendered.bodyBytes
-                shownHits = regionRendered.sampledHits
-                evidenceComplete = false
-                complete = false
-                refinementRequired = false
-                regionReason = "selected"
-                regionFacts = regionRendered.facts ?? new Set()
-              } else {
-                regionReason = "region_output_budget"
-              }
-            }
-          }
-
-          // INDEX is not a compressed substitute for code evidence. It is a
-          // bounded routing map used only when the normal evidence cannot be
-          // complete. It tells the model where to refine and explicitly
-          // forbids absence conclusions from an incomplete discovery.
-          if (
-            representation === "raw" &&
-            !routingActive &&
-            (!scanComplete || !selectedEvidenceComplete)
-          ) {
-            const indexRendered = renderSearchIndex(
-              results,
-              distillGroupsForIndex,
-              bodyBudget,
-            )
-
-            const lineDiscoveryComplete = scanComplete
-            const absenceNotProven = !lineDiscoveryComplete
-            const indexHeader = [
-              `SEARCH representation=index complete=false scan_complete=${scanComplete} evidence_complete=false index_render_complete=${indexRendered.complete} refinement_required=true absence_not_proven=${absenceNotProven} collected_line_hits=${hits.size} exact_matches=${exactSpanHits} indexed_files=${indexRendered.fileCount}`,
-              ...querySummary,
-              `REFINE_REQUIRED action=prefer_route_match_or_narrow_file routing=match_facets`,
-            ]
-
-            if (absenceNotProven) {
-              indexHeader.push(
-                "ABSENCE_NOT_PROVEN reason=line_scan_incomplete do_not_conclude_no_other_matches",
-              )
-              indexReason = "line_scan_incomplete"
-            } else {
-              indexHeader.push(
-                "EVIDENCE_SUMMARIZED reason=raw_output_budget inspect_focused_evidence_before_code_level_conclusions",
-              )
-              indexReason = "raw_output_budget"
-            }
-
-            const indexContent = [
-              ...indexHeader,
-              "",
-              ...indexRendered.body,
-            ].join("\n")
-            const indexResultBytes = bytes(indexContent)
-
-            if (indexResultBytes <= callBudgetBytes) {
-              representation = "index"
-              content = indexContent
-              resultBytes = indexResultBytes
-              bodyBytes = indexRendered.bodyBytes
-              shownHits = indexRendered.sampleCount
-              evidenceComplete = false
-              complete = false
-              refinementRequired = true
-              indexRenderComplete = indexRendered.complete
-              indexFiles = indexRendered.fileCount
-              indexSamples = indexRendered.sampleCount
-              indexStructuralGroups = indexRendered.structuralGroupsShown
-              indexDiscriminativeFacets =
-                indexRendered.discriminativeFacetsShown
-              indexFacts = indexRendered.facts ?? new Set()
-            }
-          }
-
-          // Final RAW packing is turn-aware. Prior source/context remains in
-          // conversation history, so only novel lines or newly-matched spans
-          // need to be emitted again.
-          let rawNovelFacts = new Set()
-          let rawNovelEmittedLines = null
-          let rawPriorHits = null
-          let rawSkippedPriorLines = null
-          let rawSuppressedContextAnchors = null
-
-          if (representation === "raw") {
-            const rawNovel = await renderNovelRawEvidence(
-              root,
-              hits,
-              bodyBudget,
-              state?.evidenceLedger ?? null,
-              new Map(),
-              state?.contextualizedHitLines ?? null,
-            )
-            const priorHits = countHitsAlreadySeen(
-              hits,
-              state?.evidenceLedger,
-            )
-            const accountedHits = [...hits.entries()].every(
-              ([key, hit]) =>
-                rawNovel.shown.has(key) ||
-                hitFactsAlreadySeen(hit, state?.evidenceLedger),
-            )
-            const selectedTurnEvidenceComplete =
-              selectedEvidenceComplete && accountedHits
-            const turnEvidenceComplete =
-              scanComplete &&
-              allDiscoveredFilesSelected &&
-              selectedTurnEvidenceComplete
-            const turnComplete = scanComplete && turnEvidenceComplete
-            const rawNovelReasons = []
-
-            if (!discoveryComplete) {
-              rawNovelReasons.push("lexical_discovery_incomplete")
-            } else if (!allDiscoveredFilesProbed) {
-              rawNovelReasons.push("probe_subset")
-            } else if (!selectedScanComplete) {
-              rawNovelReasons.push("scan_incomplete")
-            } else if (!allDiscoveredFilesSelected) {
-              rawNovelReasons.push("budgeted_emit_subset")
-            }
-            if (!selectedTurnEvidenceComplete) {
-              rawNovelReasons.push("output_budget")
-            }
-
-            const publicRawRepresentation = routingActive
-              ? "ranked_raw"
-              : "raw"
-            const rawNovelHeader = [
-              `SEARCH representation=${publicRawRepresentation} complete=${turnComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${turnEvidenceComplete} selected_evidence_complete=${selectedTurnEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawNovel.shown.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawNovel.skippedPriorLines > 0}`,
-              ...querySummary,
-            ]
-
-            if (rawNovelReasons.length) {
-              rawNovelHeader.push(
-                `INCOMPLETE reasons=${rawNovelReasons.join(",")}`,
-              )
-            }
-
-            const rawNovelContent = [
-              ...rawNovelHeader,
-              ...(routeRendered.body.length > 0
-                ? ["", ...routeRendered.body]
-                : []),
-              "",
-              ...rawNovel.body,
-            ].join("\n")
-            const rawNovelResultBytes = bytes(rawNovelContent)
-
-            if (rawNovelResultBytes <= callBudgetBytes) {
-              content = rawNovelContent
-              resultBytes = rawNovelResultBytes
-              bodyBytes = rawNovel.bodyBytes
-              shownHits = rawNovel.shown.size
-              evidenceComplete = turnEvidenceComplete
-              complete = turnComplete
-              rawNovelFacts = rawNovel.facts
-              rawNovelEmittedLines = rawNovel.emittedLines
-              rawPriorHits = priorHits
-              rawSkippedPriorLines = rawNovel.skippedPriorLines
-              rawSuppressedContextAnchors =
-                rawNovel.suppressedContextAnchors
-            } else {
-              // Safe fallback: the original bounded RAW body is already known
-              // to fit. Positive hit facts are still ledgered; context-line
-              // dedup simply becomes conservative for this one result.
-              rawNovelFacts = positiveFactsForHits(hits)
-            }
-          }
-
-          const sourceRepresentation = representation
-          const finalFacts = new Set()
-
-          if (representation === "raw") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of rawNovelFacts) finalFacts.add(fact)
-          } else if (representation === "focused") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of focusedFacts) finalFacts.add(fact)
-          } else if (representation === "hybrid") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of hybridFacts) finalFacts.add(fact)
-          } else if (representation === "region") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of regionFacts) finalFacts.add(fact)
-          } else if (representation === "index") {
-            for (const fact of indexFacts) finalFacts.add(fact)
-          }
-
-          for (const fact of negativeFactsForDiscoveryResults(
-            discoveryResults,
-            target,
-            glob,
-          )) {
-            finalFacts.add(fact)
-          }
-
-          for (const fact of impactEvidenceFactsForSelected(selectedFiles)) {
-            finalFacts.add(fact)
-          }
-
-          const routeFacts = routeFactsForRanking(
-            rankedFiles,
-            selectedLexicalFileSet,
-            discoveryComplete,
-            target,
-            glob,
-          )
-          const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
-          const novelty = novelEvidenceFacts(state, finalFacts)
-          const routeNovelty = novelRouteFacts(state, routeFacts)
-          const meaningfulRouteProgress =
-            routingActive && routeNovelty.novel.size > 0
-          const novelFactStats = summarizeEvidenceFacts(novelty.novel)
-          let ledgerFactsAdded = 0
-          let routeFactsAdded = 0
-          let noProgress = false
-          let noProgressBlocked = false
-
-          const priorEvidenceReused = novelty.prior > 0
-          const noMeaningfulProgress =
-            novelty.novel.size < 1 && !meaningfulRouteProgress
-
-          if (state && noMeaningfulProgress) {
-            state.consecutiveNoProgress += 1
-            noProgress = true
-            noProgressBlocked =
-              state.consecutiveNoProgress >= MAX_CONSECUTIVE_NO_PROGRESS
-
-            const noProgressReason = priorEvidenceReused
-              ? "evidence_already_seen"
-              : "evidence_unavailable"
-
-            if (noProgressBlocked) {
-              content =
-                `SEARCH_BLOCKED reason=no_progress_loop ` +
-                `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
-                `action=use_prior_or_change_search_dimension`
-            } else {
-              content =
-                `SEARCH_NO_PROGRESS reason=${noProgressReason} ` +
-                `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
-                `action=use_prior_or_change_search_dimension`
-            }
-
-            representation = "no_progress"
-            resultBytes = bytes(content)
-            bodyBytes = 0
-            shownHits = 0
-          } else if (state) {
-            state.consecutiveNoProgress = 0
-            const remembered = rememberEvidenceFacts(state, finalFacts)
-            const rememberedRoutes = rememberRouteFacts(state, routeFacts)
-            ledgerFactsAdded = remembered.added
-            routeFactsAdded = rememberedRoutes.added
-
-            if (sourceRepresentation === "focused") {
-              rememberContextualizedHitLines(
-                state,
-                focusedContextualizedHitLines,
-              )
-            }
-          }
-
-          if (
-            !noProgress &&
-            routingActive &&
-            (representation === "raw" ||
-              representation === "focused" ||
-              representation === "hybrid" ||
-              representation === "region")
-          ) {
-            representation = `ranked_${representation}`
-          }
-
-          if (state) {
-            state.evidenceBytes += resultBytes
-            state.lastSeen = nowMs()
-          }
-
-          const scoutHandoff = await updateScoutHandoff(root, sessionID, state, {
-            attemptIndex,
-            queries,
-            target,
-            glob,
-            representation,
-            sourceRepresentation,
-            selectedFiles,
-            hits,
-            discoveryComplete,
-            scanComplete,
-            selectedScanComplete,
-            evidenceComplete,
-            selectedEvidenceComplete,
-            refinementRequired,
-            retainedUnreadFiles: Math.max(0, rankedFiles.length - probeFileSet.size),
-            retainedUnemittedFiles: routeRendered.retained,
-            impactIndexCoverageComplete: impactIndexShadow.refreshComplete,
-            noProgress,
-            noProgressBlocked,
-          })
-
-          const mutationLocalization =
-            scoutMutationLocalizationEligibility(
-              state,
-              scoutHandoff,
-            )
-
-          // First reuse structural groups produced by the normal exact-span
-          // Evidence IR path, if available.
-          const existingExactStructuralGroups =
-            Array.isArray(distillGroupsForIndex) &&
-            distillGroupsForIndex.length > 0
-              ? distillGroupsForIndex
-              : null
-
-          // If model-facing evidence did not need distillation, perform a
-          // separate strict exact-span probe solely for EditCapsule structural
-          // ownership. This closes the spansComplete=true / shouldDistill=false
-          // dead zone without changing search representation.
-          if (
-            mutationLocalization.eligible &&
-            !existingExactStructuralGroups &&
-            spansComplete &&
-            distillInput.length > 0 &&
-            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
-          ) {
-            capsuleExactProbeAttempted = true
-
-            const exactProbe =
-              await runDistiller(root, distillInput)
-
-            capsuleExactProbeElapsedMs =
-              exactProbe.elapsedMs
-
-            if (
-              exactProbe.ok === true &&
-              exactProbe.response?.ir_complete === true &&
-              exactProbe.response?.location_complete === true &&
-              exactProbe.response?.anchor_complete === true &&
-              exactProbe.response?.witness_complete === true &&
-              exactProbe.response?.distill_complete === true &&
-              exactProbe.response?.truncated === false &&
-              Array.isArray(exactProbe.response?.groups) &&
-              exactProbe.response.groups.length > 0
-            ) {
-              capsuleExactProbeGroups =
-                exactProbe.response.groups
-              capsuleExactProbeReason =
-                "exact_structural_groups_observed"
-            } else {
-              capsuleExactProbeReason =
-                exactProbe.reason ??
-                "exact_structural_probe_rejected"
-            }
-          } else if (
-            !mutationLocalization.eligible
-          ) {
-            capsuleExactProbeReason =
-              mutationLocalization.reason
-          } else if (existingExactStructuralGroups) {
-            capsuleExactProbeReason =
-              "reused_existing_evidence_ir"
-          } else if (!spansComplete) {
-            capsuleExactProbeReason =
-              "exact_spans_incomplete"
-          } else if (distillInput.length < 1) {
-            capsuleExactProbeReason =
-              "no_exact_spans"
-          } else if (
-            distillInput.length >
-            FOCUSED_PROBE_MAX_EXACT_MATCHES
-          ) {
-            capsuleExactProbeReason =
-              "exact_input_cap"
-          }
-
-          const exactGroupsForCapsule =
-            existingExactStructuralGroups ??
-            capsuleExactProbeGroups
-
-          // Line-only recovery is the fallback when no exact structural
-          // ownership is available. It no longer depends directly on
-          // spansComplete: exact spans may exist yet fail structural parsing.
-          if (
-            mutationLocalization.eligible &&
-            !exactGroupsForCapsule
-          ) {
-            if (ownerRecoveryInput.length < 1) {
-              ownerRecoveryReason = "no_line_hits"
-            } else if (
-              ownerRecoveryInput.length > FOCUSED_PROBE_MAX_LINE_HITS
-            ) {
-              ownerRecoveryReason = "input_cap"
-            } else {
-              ownerRecoveryAttempted = true
-
-              const ownerRecoveryByFile = new Map()
-
-              for (const hit of ownerRecoveryInput) {
-                const batch =
-                  ownerRecoveryByFile.get(hit.file) ?? []
-                batch.push(hit)
-                ownerRecoveryByFile.set(hit.file, batch)
-              }
-
-              const ownerRecoveryBatches =
-                [...ownerRecoveryByFile.entries()]
-                  .sort(([a], [b]) => a.localeCompare(b))
-
-              ownerRecoveryFilesAttempted =
-                ownerRecoveryBatches.length
-
-              let elapsedTotal = 0
-              let mappedTotal = 0
-              let exactSpanTotal = 0
-              let groupTotal = 0
-              let allLocationIncomplete = true
-              let allIrIncomplete = true
-
-              const acceptedGroups = []
-              const rejectedFiles = []
-
-              for (const [file, fileHits] of ownerRecoveryBatches) {
-                const ownerProbe = await runDistiller(
-                  root,
-                  fileHits,
-                )
-
-                elapsedTotal +=
-                  Number.isFinite(ownerProbe.elapsedMs)
-                    ? ownerProbe.elapsedMs
-                    : 0
-
-                const response = ownerProbe.response
-
-                if (Number.isInteger(response?.mapped_hits)) {
-                  mappedTotal += response.mapped_hits
-                }
-
-                if (Number.isInteger(response?.exact_span_hits)) {
-                  exactSpanTotal += response.exact_span_hits
-                }
-
-                if (Array.isArray(response?.groups)) {
-                  groupTotal += response.groups.length
-                }
-
-                if (response?.location_complete !== false) {
-                  allLocationIncomplete = false
-                }
-
-                if (response?.ir_complete !== false) {
-                  allIrIncomplete = false
-                }
-
-                const fileOwnerSafe =
-                  ownerProbe.ok === false &&
-                  ownerProbe.reason === "unsafe_ir" &&
-                  response?.protocol === "evidence-distiller-v3" &&
-                  response?.representation === "evidence_ir" &&
-                  response?.raw_hits === fileHits.length &&
-                  response?.mapped_hits === fileHits.length &&
-                  response?.exact_span_hits === 0 &&
-                  response?.location_complete === false &&
-                  response?.anchor_complete === true &&
-                  response?.witness_complete === true &&
-                  response?.distill_complete === true &&
-                  response?.ir_complete === false &&
-                  response?.v2_grouping_preserved === true &&
-                  response?.truncated === false &&
-                  Array.isArray(response?.groups) &&
-                  response.groups.length > 0 &&
-                  response?.groups_shown ===
-                    response.groups.length &&
-                  response?.variants_shown ===
-                    response?.variants_total
-
-                if (fileOwnerSafe) {
-                  ownerRecoveryFilesAccepted += 1
-                  acceptedGroups.push(...response.groups)
-                } else {
-                  ownerRecoveryFilesRejected += 1
-
-                  rejectedFiles.push({
-                    file,
-                    input_hits: fileHits.length,
-                    reason:
-                      ownerProbe.reason ??
-                      "owner_contract_rejected",
-                    mapped_hits:
-                      Number.isInteger(response?.mapped_hits)
-                        ? response.mapped_hits
-                        : null,
-                    unsupported:
-                      Array.isArray(response?.unsupported_files)
-                        ? response.unsupported_files.length
-                        : null,
-                    errors:
-                      Array.isArray(response?.errors)
-                        ? response.errors.length
-                        : null,
-                  })
-                }
-              }
-
-              ownerRecoveryElapsedMs =
-                Math.round(elapsedTotal * 100) / 100
-              ownerRecoveryMappedHits = mappedTotal
-              ownerRecoveryExactSpanHits = exactSpanTotal
-              ownerRecoveryGroupCount = groupTotal
-
-              ownerRecoveryLocationComplete =
-                ownerRecoveryFilesAttempted > 0
-                  ? !allLocationIncomplete
-                  : null
-
-              ownerRecoveryIrComplete =
-                ownerRecoveryFilesAttempted > 0
-                  ? !allIrIncomplete
-                  : null
-
-              ownerRecoveryDistillComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryAnchorComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryWitnessComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryRejectedFiles =
-                rejectedFiles.slice(0, 16)
-
-              if (acceptedGroups.length > 0) {
-                ownerRecoveryObserved = true
-                ownerRecoveryGroups = acceptedGroups
-
-                ownerRecoveryReason =
-                  ownerRecoveryFilesRejected > 0
-                    ? "partial_diagnostic_groups_observed"
-                    : "diagnostic_groups_observed"
-
-                const owners = new Map()
-
-                for (const group of acceptedGroups) {
-                  const file =
-                    typeof group?.file === "string"
-                      ? group.file
-                      : null
-                  const symbolKind =
-                    typeof group?.symbol_kind === "string"
-                      ? group.symbol_kind
-                      : null
-                  const symbolName =
-                    typeof group?.symbol_name === "string"
-                      ? group.symbol_name
-                      : null
-                  const startLine =
-                    Number.isInteger(group?.start_line)
-                      ? group.start_line
-                      : null
-                  const endLine =
-                    Number.isInteger(group?.end_line)
-                      ? group.end_line
-                      : null
-
-                  if (
-                    !file ||
-                    !symbolKind ||
-                    !symbolName ||
-                    !startLine ||
-                    !endLine
-                  ) {
-                    continue
-                  }
-
-                  const key =
-                    `${file}\0${symbolKind}\0${symbolName}` +
-                    `\0${startLine}\0${endLine}`

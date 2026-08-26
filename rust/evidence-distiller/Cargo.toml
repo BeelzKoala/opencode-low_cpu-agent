@@ -45,3 +45,7 @@ path = "src/retrieval_ranker.rs"
 [[bin]]
 name = "opencode-semantic-resolver"
 path = "src/semantic_resolver.rs"
+
+[[bin]]
+name = "opencode-completion-authorizer"
+path = "src/completion_authorizer.rs"

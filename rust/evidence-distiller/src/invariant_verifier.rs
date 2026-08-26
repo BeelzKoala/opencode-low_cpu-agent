@@ -153,6 +153,8 @@ struct Response {
     replace_node_confinement: bool,
     rename_identifier_delta: bool,
     rename_global_closure: bool,
+    rename_destination_fresh: bool,
+    rename_reflective_builtin_safe: bool,
     worktree_cleaned: bool,
     elapsed_ms: f64,
     differential_observations: Vec<DifferentialObservation>,
@@ -211,6 +213,14 @@ impl Response {
             .iter()
             .filter(|c| c.kind == "rename_global_closure")
             .all(|c| c.pass);
+        let rename_destination_fresh = checks
+            .iter()
+            .filter(|c| c.kind == "rename_destination_fresh")
+            .all(|c| c.pass);
+        let rename_reflective_builtin_safe = checks
+            .iter()
+            .filter(|c| c.kind == "rename_reflective_builtin_safe")
+            .all(|c| c.pass);
         let ok =
             reason.is_none() && invariants_failed == 0 && worktree_cleaned && candidate_hygiene;
         Self {
@@ -238,6 +248,8 @@ impl Response {
             replace_node_confinement,
             rename_identifier_delta,
             rename_global_closure,
+            rename_destination_fresh,
+            rename_reflective_builtin_safe,
             worktree_cleaned,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             differential_observations: Vec::new(),
@@ -424,6 +436,79 @@ fn structural_identifier_files(root: &Path, symbol: &str) -> Result<BTreeSet<Str
             files.insert(rel);
         }
     }
+    Ok(files)
+}
+
+fn python_reflective_builtin_hazard(
+    path: &Path,
+    source: &str,
+    symbol: &str,
+) -> Result<bool> {
+    let Some(lang) = SupportLang::from_path(path) else {
+        return Ok(false);
+    };
+    if !matches!(lang, SupportLang::Python) {
+        return Ok(false);
+    }
+
+    let ast = lang.ast_grep(source);
+    let root = ast.root();
+
+    anyhow::ensure!(
+        !root
+            .clone()
+            .dfs()
+            .any(|node| node.is_error() || node.is_missing()),
+        "reflective_source_syntax_invalid"
+    );
+
+    for node in root.dfs().filter(|node| node.is_named()) {
+        if node.kind().as_ref() != "call" {
+            continue;
+        }
+
+        let Some(function) = node.field("function") else {
+            continue;
+        };
+        let function_name = function.text();
+        let function_name = function_name.as_ref().trim();
+
+        if !matches!(
+            function_name,
+            "getattr" | "setattr" | "hasattr" | "delattr"
+        ) {
+            continue;
+        }
+
+        if node.clone().dfs().any(|child| {
+            child.kind().as_ref() == "string_content"
+                && child.text().as_ref() == symbol
+        }) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn python_reflective_builtin_files(root: &Path, symbol: &str) -> Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+
+    for rel in git_grep_files(root, symbol)? {
+        let path = root.join(&rel);
+        let Some(lang) = SupportLang::from_path(&path) else {
+            continue;
+        };
+        if !matches!(lang, SupportLang::Python) {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path).context("reflective_source_not_utf8")?;
+        if python_reflective_builtin_hazard(&path, &source, symbol)? {
+            files.insert(rel);
+        }
+    }
+
     Ok(files)
 }
 
@@ -1374,6 +1459,52 @@ fn verify(request: &Request) -> Result<Response> {
                 };
 
                 /*
+                 * Destination-name capture guard.
+                 *
+                 * Restrict the conservative freshness check to the proven
+                 * source closure rather than the whole repository. This may
+                 * SAFE_FAIL on an unrelated same-spelling identifier inside a
+                 * closure file, but it cannot silently accept lexical capture.
+                 */
+                let closure_files = baseline_closure
+                    .files
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let destination_files = structural_identifier_files(&root, new_name)?
+                    .intersection(&closure_files)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+
+                checks.push(Check {
+                    kind: "rename_destination_fresh".to_string(),
+                    pass: destination_files.is_empty(),
+                    file: Some(file.clone()),
+                    detail: Some(format!(
+                        "baseline_files={}",
+                        destination_files.into_iter().collect::<Vec<_>>().join(",")
+                    )),
+                });
+
+                /*
+                 * Independent baseline scan for Python reflective builtins.
+                 * This is intentionally root-wide over tracked lexical hits:
+                 * reflection may live outside the structural symbol closure.
+                 */
+                let reflective_files =
+                    python_reflective_builtin_files(&root, &mutation.symbol)?;
+
+                checks.push(Check {
+                    kind: "rename_reflective_builtin_safe".to_string(),
+                    pass: reflective_files.is_empty(),
+                    file: Some(file.clone()),
+                    detail: Some(format!(
+                        "baseline_files={}",
+                        reflective_files.into_iter().collect::<Vec<_>>().join(",")
+                    )),
+                });
+
+                /*
                  * Resolve the renamed symbol independently against the actual
                  * patched worktree. We compare dependency topology, not raw
                  * identifier spelling.
@@ -1561,6 +1692,27 @@ mod tests {
     fn identifier_leaf_count_ignores_string_and_comment_contents() {
         let source = "def alpha():\n    note = \"alpha\"\n    return 1  # alpha\n";
         assert_eq!(identifier_leaf_count(Path::new("x.py"), source, "alpha"), 1);
+    }
+
+    #[test]
+    fn reflective_builtin_hazard_detects_getattr_but_ignores_plain_string() {
+        let dynamic = "def f(module):\n    return getattr(module, \"alpha\")\n";
+        let plain = "def f():\n    note = \"alpha\"\n    return note  # alpha\n";
+
+        assert!(
+            python_reflective_builtin_hazard(Path::new("x.py"), dynamic, "alpha")
+                .expect("valid dynamic fixture")
+        );
+        assert!(
+            !python_reflective_builtin_hazard(Path::new("x.py"), plain, "alpha")
+                .expect("valid plain fixture")
+        );
+    }
+
+    #[test]
+    fn identifier_leaf_count_detects_destination_binding() {
+        let source = "def caller():\n    beta = lambda: 2\n    return beta()\n";
+        assert_eq!(identifier_leaf_count(Path::new("x.py"), source, "beta"), 2);
     }
 
     #[test]

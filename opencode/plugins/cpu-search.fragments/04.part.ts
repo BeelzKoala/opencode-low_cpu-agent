@@ -1,4 +1,258 @@
 
+async function renderFocusedSupplement(
+  root,
+  groups,
+  maxBytes,
+  hits,
+  seenFacts = null,
+  contextualizedHitLines = null,
+) {
+  const budget = Math.min(FOCUSED_SUPPLEMENT_MAX_BYTES, Math.max(0, maxBytes))
+  const allCandidateScopes = focusedScopesFromGroups(groups)
+  const reusableScopes = []
+  const eligibleScopes = []
+
+  for (const scope of allCandidateScopes) {
+    const scopeAlreadySeen = factSeen(seenFacts, scopeFact(scope))
+    const hasUncontextualizedHit = [...scope.hitLines].some(
+      (line) =>
+        !(contextualizedHitLines instanceof Set) ||
+        !contextualizedHitLines.has(
+          contextualizedHitLineKey(scope.file, line),
+        ),
+    )
+
+    if (scopeAlreadySeen || !hasUncontextualizedHit) {
+      reusableScopes.push(scope)
+      continue
+    }
+
+    eligibleScopes.push(scope)
+  }
+
+  const scopes = eligibleScopes.slice(0, FOCUSED_MAX_SCOPES)
+
+  if (budget < FOCUSED_MIN_SUPPLEMENT_BYTES || scopes.length < 1) {
+    let reason = "supplement_budget"
+
+    if (allCandidateScopes.length < 1) reason = "no_behavior_scope"
+    else if (eligibleScopes.length < 1) reason = "scope_already_contextualized"
+
+    return {
+      body: [],
+      facts: new Set(),
+      bodyBytes: 0,
+      complete: false,
+      scopeCount: allCandidateScopes.length,
+      selectedScopeCount: scopes.length,
+      reusedScopeCount: reusableScopes.length,
+      fullScopes: 0,
+      partialScopes: 0,
+      radius: null,
+      coveredRangesByFile: new Map(),
+      coveredHitKeys: new Set(),
+      shownHitKeys: new Set(),
+      contextualizedHitLines: new Set(),
+      emittedLines: 0,
+      reason,
+    }
+  }
+
+  const cache = new Map()
+  const hitLookup = hitLookupByFileLine(hits)
+
+  async function build({ allowFull, radius }) {
+    const body = []
+    const facts = new Set()
+    const coveredRangesByFile = new Map()
+    const coveredHitKeys = new Set()
+    const shownHitKeys = new Set()
+    const contextualized = new Set()
+    let bodyBytes = 0
+    let fullScopes = 0
+    let partialScopes = 0
+    let emittedLines = 0
+
+    function push(line) {
+      const cost = bytes(line + "\n")
+      if (bodyBytes + cost > budget) return false
+      body.push(line)
+      bodyBytes += cost
+      return true
+    }
+
+    for (const scope of scopes) {
+      const lines = await loadLines(root, scope.file, cache)
+      if (!lines || lines.length < 1) {
+        return { complete: false, reason: "file_unavailable" }
+      }
+
+      const start = Math.max(1, Math.min(scope.start, lines.length))
+      const end = Math.max(start, Math.min(scope.end, lines.length))
+      const useFull = allowFull && end - start + 1 <= FOCUSED_FULL_SCOPE_MAX_LINES
+      const anchors = [...scope.anchors].slice(0, 4)
+      const scopeKey = scopeFact(scope)
+      const fileKey = evidenceFileKey(scope.file)
+      const byLine = hitLookup.get(fileKey) ?? new Map()
+
+      let ranges
+      if (useFull) {
+        ranges = [{ start, end }]
+      } else {
+        const headerEnd = Math.min(end, start + FOCUSED_SCOPE_HEADER_LINES - 1)
+        ranges = mergeLineRanges([
+          { start, end: headerEnd },
+          ...[...scope.hitLines].map((line) => ({
+            start: Math.max(start, line - radius),
+            end: Math.min(end, line + radius),
+          })),
+        ])
+      }
+
+      const selectedLines = []
+
+      for (const range of ranges) {
+        for (let n = range.start; n <= range.end; n++) {
+          const hit = byLine.get(n)
+          const lineNovel = !factSeen(seenFacts, sourceLineFact(scope.file, n))
+          const hitNovel = hit ? hitHasNovelPositiveFact(hit, seenFacts) : false
+
+          if (lineNovel || hitNovel) selectedLines.push(n)
+        }
+      }
+
+      const selectedRanges = lineNumbersToRanges(selectedLines)
+      const priorLinesOmitted =
+        ranges.reduce((total, range) => total + range.end - range.start + 1, 0) -
+        selectedLines.length
+
+      if (!push(
+        `SCOPE_CONTEXT ${scope.file}:${start}-${end} ` +
+          `symbol=${JSON.stringify(scope.symbolName)} kind=${scope.symbolKind} ` +
+          `hits=${scope.hitLines.size} context=${useFull ? "full_turn" : `window±${radius}`}` +
+          ` prior_lines_omitted=${Math.max(0, priorLinesOmitted)}` +
+          (anchors.length > 0 ? ` anchors=${JSON.stringify(anchors)}` : ""),
+      )) {
+        return { complete: false, reason: "supplement_budget" }
+      }
+
+      facts.add(scopeKey)
+
+      if (useFull) fullScopes += 1
+      else partialScopes += 1
+
+      let previousEnd = null
+
+      for (const range of selectedRanges) {
+        if (previousEnd !== null && range.start > previousEnd + 1) {
+          const omitted = range.start - previousEnd - 1
+          if (!push(`  … prior/unsampled scope context omitted ${omitted} lines …`)) {
+            return { complete: false, reason: "supplement_budget" }
+          }
+        }
+
+        for (let n = range.start; n <= range.end; n++) {
+          const hit = byLine.get(n)
+          let prefix = " "
+
+          if (hit) {
+            const q = [...hit.queries]
+              .sort((a, b) => a - b)
+              .map((x) => `Q${x + 1}`)
+              .join(",")
+            prefix = `>[${q}]`
+          }
+
+          if (!push(
+            `  ${prefix.padEnd(9)} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`,
+          )) {
+            return { complete: false, reason: "supplement_budget" }
+          }
+
+          addLineRange(coveredRangesByFile, scope.file, n, n)
+          facts.add(sourceLineFact(scope.file, n))
+          emittedLines += 1
+
+          if (hit) {
+            coveredHitKeys.add(hit.key)
+            shownHitKeys.add(hit.key)
+            for (const fact of positiveFactsForHit(hit)) facts.add(fact)
+          }
+        }
+
+        previousEnd = range.end
+      }
+
+      for (const [hitKey, hit] of byLine) {
+        if (hit.line < start || hit.line > end) continue
+
+        coveredHitKeys.add(hit.key)
+        contextualized.add(contextualizedHitLineKey(hit.file, hit.line))
+      }
+    }
+
+    for (const [file, ranges] of coveredRangesByFile) {
+      coveredRangesByFile.set(file, mergeLineRanges(ranges))
+    }
+
+    return {
+      body,
+      facts,
+      bodyBytes,
+      complete: true,
+      scopeCount: allCandidateScopes.length,
+      selectedScopeCount: scopes.length,
+      reusedScopeCount: reusableScopes.length,
+      fullScopes,
+      partialScopes,
+      radius,
+      coveredRangesByFile,
+      coveredHitKeys,
+      shownHitKeys,
+      contextualizedHitLines: contextualized,
+      emittedLines,
+      reason: null,
+    }
+  }
+
+  const strategies = [
+    { allowFull: true, radius: FOCUSED_WINDOW_RADII[0] },
+    ...FOCUSED_WINDOW_RADII.map((radius) => ({ allowFull: false, radius })),
+  ]
+  let fallback = null
+
+  for (const strategy of strategies) {
+    const rendered = await build(strategy)
+    fallback = rendered
+
+    if (
+      rendered.complete &&
+      rendered.bodyBytes >= FOCUSED_MIN_SUPPLEMENT_BYTES
+    ) {
+      return rendered
+    }
+  }
+
+  return {
+    body: fallback?.body ?? [],
+    facts: fallback?.facts ?? new Set(),
+    bodyBytes: fallback?.bodyBytes ?? 0,
+    complete: false,
+    scopeCount: allCandidateScopes.length,
+    selectedScopeCount: scopes.length,
+    reusedScopeCount: reusableScopes.length,
+    fullScopes: fallback?.fullScopes ?? 0,
+    partialScopes: fallback?.partialScopes ?? 0,
+    radius: fallback?.radius ?? null,
+    coveredRangesByFile: fallback?.coveredRangesByFile ?? new Map(),
+    coveredHitKeys: fallback?.coveredHitKeys ?? new Set(),
+    shownHitKeys: fallback?.shownHitKeys ?? new Set(),
+    contextualizedHitLines: fallback?.contextualizedHitLines ?? new Set(),
+    emittedLines: fallback?.emittedLines ?? 0,
+    reason: fallback?.reason ?? "supplement_budget",
+  }
+}
+
 
 function sampleScopeHitLines(scope, limit = REGION_SAMPLE_HITS_PER_SCOPE) {
   const lines = [...(scope?.hitLines ?? [])]
@@ -770,116 +1024,6 @@ function classifyMutationIntent(text) {
   }
 }
 
-function taskActionIdentifier(value) {
-  const text = String(value ?? "").trim()
-  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text)
-    ? text
-    : null
-}
-
-function unresolvedTaskAction(reason, taskSha256 = null) {
-  return {
-    protocol: TASK_ACTION_PROTOCOL,
-    status: "unresolved",
-    operation: null,
-    old_name: null,
-    new_name: null,
-    task_sha256:
-      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
-        ? taskSha256
-        : null,
-    reason,
-  }
-}
-
-function exactRenameTaskAction(oldName, newName, taskSha256, reason) {
-  const oldIdentifier = taskActionIdentifier(oldName)
-  const newIdentifier = taskActionIdentifier(newName)
-
-  if (!oldIdentifier || !newIdentifier || oldIdentifier === newIdentifier) {
-    return unresolvedTaskAction("task_action_identifier_invalid", taskSha256)
-  }
-
-  return {
-    protocol: TASK_ACTION_PROTOCOL,
-    status: "exact",
-    operation: "rename_symbol",
-    old_name: oldIdentifier,
-    new_name: newIdentifier,
-    task_sha256:
-      typeof taskSha256 === "string" && /^[0-9a-f]{64}$/.test(taskSha256)
-        ? taskSha256
-        : null,
-    reason,
-  }
-}
-
-function compileTaskAction(value, taskSha256 = null) {
-  const text = String(value ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
-  if (!text) return unresolvedTaskAction("task_action_text_empty", taskSha256)
-
-  const negativeRename =
-    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
-    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(text) ||
-    /(?:^|\s)(?:не|без)\s+переимен/iu.test(text)
-
-  if (negativeRename) {
-    return unresolvedTaskAction("task_action_negative_rename", taskSha256)
-  }
-
-  const ident = "[`'\"]?([A-Za-z_$][A-Za-z0-9_$]*)[`'\"]?"
-  const patterns = [
-    new RegExp(
-      "(?:^|[.!?]\\s*)(?:please\\s+)?rename\\b.{0,140}?" +
-      ident +
-      "\\s+(?:to|as|->|→)\\s*" +
-      ident,
-      "giu",
-    ),
-    new RegExp(
-      "(?:^|[.!?]\\s*)change\\s+(?:the\\s+)?(?:name|identifier)\\s+of\\s+" +
-      ident +
-      ".{0,40}?\\b(?:to|as)\\b\\s*" +
-      ident,
-      "giu",
-    ),
-    new RegExp(
-      "(?:^|[.!?]\\s*)(?:пожалуйста[,\\s]+)?переимен(?:уй|уйте)" +
-      "(?=\\s|$|[,:;.!?]).{0,140}?" +
-      ident +
-      "(?:\\s*[:,]?\\s*)(?:в|на|->|→)\\s*" +
-      ident,
-      "giu",
-    ),
-  ]
-
-  const pairs = new Map()
-
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      const oldName = taskActionIdentifier(match[1])
-      const newName = taskActionIdentifier(match[2])
-      if (!oldName || !newName || oldName === newName) continue
-      pairs.set(`${oldName}\u0000${newName}`, { oldName, newName })
-    }
-  }
-
-  if (pairs.size < 1) {
-    return unresolvedTaskAction("task_action_not_exact", taskSha256)
-  }
-
-  if (pairs.size > 1) {
-    return unresolvedTaskAction("task_action_multiple_rename_pairs", taskSha256)
-  }
-
-  const pair = [...pairs.values()][0]
-  return exactRenameTaskAction(
-    pair.oldName,
-    pair.newName,
-    taskSha256,
-    "exact_rename_pair",
-  )
-}
 
 function userTurnSnapshotFromContext(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : []

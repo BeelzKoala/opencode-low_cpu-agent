@@ -1,4 +1,347 @@
 
+function runImpactIndexRequest(root, request, timeoutMs) {
+  return new Promise((resolve) => {
+    const binary = impactIndexBinary()
+    if (!binary) {
+      resolve({ ok: false, reason: "binary_path_unavailable", elapsedMs: 0 })
+      return
+    }
+    const started = performance.now()
+    const child = spawn(binary, [], { cwd: root, stdio: ["pipe", "pipe", "pipe"] })
+    const stdout = []
+    const stderr = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
+    }
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, timeoutMs)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+      if (stdoutBytes > IMPACT_INDEX_MAX_STDOUT_BYTES) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+      stdout.push(Buffer.from(chunk))
+    })
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= 4096) return
+      const remaining = 4096 - stderrBytes
+      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
+      stderr.push(Buffer.from(kept))
+      stderrBytes += kept.length
+    })
+    child.stdin.on("error", () => {})
+    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", error: String(error?.message ?? error) }))
+    child.on("close", (code, signal) => {
+      if (settled) return
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
+      if (timedOut) return finish({ ok: false, reason: "timeout", error: stderrText || null })
+      if (outputLimited) return finish({ ok: false, reason: "stdout_limit", error: stderrText || null })
+      if (code !== 0) return finish({ ok: false, reason: "exit_error", exitCode: code, signal: signal ?? null, error: stderrText || null })
+      let response
+      try {
+        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
+      } catch (error) {
+        return finish({ ok: false, reason: "invalid_json", error: String(error?.message ?? error) })
+      }
+      if (response?.protocol !== "impact-index-v1") return finish({ ok: false, reason: "protocol_mismatch", response })
+      finish({ ok: true, reason: "ok", response })
+    })
+    try {
+      child.stdin.end(JSON.stringify({ root, ...request }))
+    } catch (error) {
+      child.kill("SIGKILL")
+      finish({ ok: false, reason: "stdin_error", error: String(error?.message ?? error) })
+    }
+  })
+}
+
+function impactIndexShadowStats(result, lexicalFiles) {
+  const lexical = new Set((lexicalFiles ?? []).map((entry) =>
+    evidenceFileKey(typeof entry === "string" ? entry : entry?.file),
+  ))
+  const neighbors = result?.ok && Array.isArray(result?.query?.response?.neighbors)
+    ? result.query.response.neighbors
+    : []
+  const lexicalMisses = neighbors.filter((neighbor) =>
+    typeof neighbor?.file === "string" && !lexical.has(evidenceFileKey(neighbor.file)),
+  )
+  const refresh = result?.refresh?.response ?? null
+  const query = result?.query?.response ?? null
+
+  return {
+    attempted: result?.attempted === true,
+    ok: result?.ok === true,
+    reason: result?.reason ?? "unknown",
+    elapsedMs: result?.elapsedMs ?? 0,
+    refreshDue: result?.refreshDue === true,
+    refreshDeferred: result?.refreshDeferred === true,
+    refreshOk:
+      result?.refresh?.ok === true &&
+      refresh?.mode === "refresh" &&
+      refresh?.ready === true,
+    refreshComplete: query?.coverage_complete ?? refresh?.coverage_complete ?? refresh?.refresh_complete ?? null,
+    partialReason: query?.partial_reason ?? refresh?.partial_reason ?? null,
+    inventoryKind: query?.inventory_kind ?? refresh?.inventory_kind ?? null,
+    refreshReason: result?.refresh?.reason ?? null,
+    refreshElapsedMs: result?.refresh?.elapsedMs ?? null,
+    queryElapsedMs: result?.query?.elapsedMs ?? null,
+    cacheAgeMs: query?.cache_age_ms ?? null,
+    staleSeedFiles: query?.stale_seed_files ?? 0,
+    staleWitnessEdges: query?.stale_witness_edges ?? 0,
+    taskFiltersApplied: query?.task_filters_applied === true,
+    bootstrapCacheHit: false,
+    filesTotal: query?.files_total ?? refresh?.files_total ?? null,
+    filesReused: refresh?.files_reused ?? null,
+    filesReindexed: refresh?.files_reindexed ?? null,
+    filesRemoved: refresh?.files_removed ?? null,
+    importsTotal: query?.imports_total ?? refresh?.imports_total ?? null,
+    edgesTotal: query?.edges_total ?? refresh?.edges_total ?? null,
+    resolvedImports: query?.local_resolved ?? refresh?.local_resolved ?? refresh?.resolved_imports ?? null,
+    unresolvedImports: query?.local_unresolved ?? refresh?.local_unresolved ?? null,
+    ambiguousImports: query?.local_ambiguous ?? refresh?.local_ambiguous ?? null,
+    externalPackages: query?.external_package ?? refresh?.external_package ?? null,
+    unsupportedAliases: query?.unsupported_alias ?? refresh?.unsupported_alias ?? null,
+    unsupportedDynamic: query?.unsupported_dynamic ?? refresh?.unsupported_dynamic ?? null,
+    neighborsTotal: query?.neighbors_total ?? null,
+    neighborsShown: neighbors.length,
+    lexicalMisses: lexicalMisses.length,
+    forwardNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "forward").length,
+    reverseNeighbors: neighbors.filter((neighbor) => neighbor?.direction === "reverse").length,
+    candidates: lexicalMisses.slice(0, IMPACT_INDEX_MAX_NEIGHBORS).map((neighbor) => ({
+      file: neighbor.file,
+      seed: neighbor.seed,
+      direction: neighbor.direction,
+      kind: neighbor.kind,
+      confidence: neighbor.confidence,
+      witness_file: neighbor.witness_file,
+      witness_line: neighbor.witness_line,
+      spec: neighbor.spec,
+      bindings: Array.isArray(neighbor.bindings) ? neighbor.bindings : [],
+      source_symbols: Array.isArray(neighbor.source_symbols) ? neighbor.source_symbols : [],
+      binding_pairs: Array.isArray(neighbor.binding_pairs) ? neighbor.binding_pairs : [],
+      witness: neighbor.witness ?? null,
+    })),
+  }
+}
+
+function impactStatsForTaskQuery(queryResult, lexicalFiles, reason = "impact_task_filtered", refresh = null) {
+  const response = queryResult?.response ?? null
+  const age = Number(response?.cache_age_ms)
+  const ready =
+    queryResult?.ok === true &&
+    response?.mode === "neighbors" &&
+    response?.ready === true &&
+    Array.isArray(response?.neighbors)
+  const staleSeedFiles = Number(response?.stale_seed_files ?? 0)
+  const staleWitnessEdges = Number(response?.stale_witness_edges ?? 0)
+  const refreshDue =
+    queryResult?.ok === true && (
+      !ready ||
+      !Number.isFinite(age) ||
+      age >= IMPACT_INDEX_REFRESH_TTL_MS ||
+      staleSeedFiles > 0 ||
+      staleWitnessEdges > 0
+    )
+  return impactIndexShadowStats({
+    attempted: true,
+    ok: ready,
+    reason: ready ? reason : queryResult?.reason ?? "query_unavailable",
+    elapsedMs: queryResult?.elapsedMs ?? 0,
+    refreshDue,
+    refreshDeferred: ready && refreshDue,
+    refresh,
+    query: queryResult,
+  }, lexicalFiles)
+}
+
+function regexEscape(value) {
+  return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function impactSymbolArray(values, cap = IMPACT_EDGE_SYMBOL_CAP) {
+  const out = []
+  for (const value of values ?? []) {
+    if (
+      typeof value !== "string" ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value) ||
+      value.length > 80
+    ) continue
+    out.push(value)
+    if (out.length >= cap) break
+  }
+  return out
+}
+
+function impactBindingList(values) {
+  return [...new Set(impactSymbolArray(values, IMPACT_BINDINGS_PER_CANDIDATE))]
+}
+
+function impactRelationPairs(candidate) {
+  const local = impactSymbolArray(candidate?.bindings)
+  const source = impactSymbolArray(candidate?.source_symbols)
+  const explicit = []
+  for (const pair of candidate?.binding_pairs ?? []) {
+    const localName = typeof pair?.local === "string" ? pair.local : null
+    const sourceName = typeof pair?.source === "string" ? pair.source : null
+    if (!localName || !sourceName) continue
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(localName) || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sourceName)) continue
+    explicit.push({ local: localName, source: sourceName })
+    if (explicit.length >= IMPACT_EDGE_SYMBOL_CAP) break
+  }
+  if (explicit.length > 0) return { local, source, pairs: explicit }
+
+  // Fail-open only for identity mappings. Old caches are rejected by cache
+  // version, but this keeps helper skew conservative instead of guessing alias
+  // alignment from two independently ordered arrays.
+  const pairs = []
+  if (local.length === source.length && local.every((value, index) => value === source[index])) {
+    for (let i = 0; i < local.length; i += 1) pairs.push({ local: local[i], source: source[i] })
+  }
+  return { local, source, pairs }
+}
+
+function impactLanguage(file) {
+  const base = path.basename(String(file ?? "")).toLowerCase()
+  if (base === "dockerfile" || base.startsWith("dockerfile.") || base.endsWith(".dockerfile")) return "docker"
+  const ext = path.extname(base).slice(1)
+  if (ext === "py") return "python"
+  if (["js", "jsx", "mjs", "cjs"].includes(ext)) return "javascript"
+  if (["ts", "tsx", "mts", "cts"].includes(ext)) return "typescript"
+  if (["html", "htm"].includes(ext)) return "html"
+  if (ext === "css") return "css"
+  if (["xml", "xsd", "xsl", "xslt"].includes(ext)) return "xml"
+  if (ext === "sql") return "sql"
+  return "other"
+}
+
+function impactIdentifiers(text) {
+  const out = new Set()
+  const stop = new Set([
+    "and", "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+    "def", "default", "do", "else", "except", "export", "extends", "false", "finally", "for",
+    "from", "function", "if", "import", "in", "interface", "let", "new", "none", "null", "of",
+    "pass", "return", "static", "super", "switch", "this", "throw", "true", "try", "type", "var",
+    "while", "with", "yield",
+  ])
+  const pattern = /[A-Za-z_$][A-Za-z0-9_$]*/g
+  for (const match of String(text ?? "").matchAll(pattern)) {
+    const value = match[0]
+    // One-character local aliases are common in Python/JS/TS (for example
+    // `import { handle as h } ...`). Candidate matching remains exact and is
+    // followed by source validation, so retaining them is safer than silently
+    // losing a real dependency edge.
+    if (value.length < 1 || stop.has(value.toLowerCase())) continue
+    out.add(value)
+    if (out.size >= IMPACT_SCOPE_IDENTIFIER_CAP) break
+  }
+  return out
+}
+
+function impactDeclaredSymbols(line, language) {
+  const text = String(line ?? "").trim()
+  const out = new Set()
+  const patterns = language === "python"
+    ? [
+        /^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/,
+        /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=/,
+      ]
+    : [
+        /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:export\s+)?(?:default\s+)?(?:class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+        /^(?:(?:public|private|protected|static|readonly|async|abstract|override|get|set)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;]*\)\s*(?::[^={]+)?\s*\{?/,
+      ]
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match?.[1]) continue
+    const value = match[1]
+    if (!["if", "for", "while", "switch", "catch", "function", "constructor"].includes(value)) out.add(value)
+  }
+  return out
+}
+
+function impactPythonOwnerSymbols(lines, ranges, hitLines) {
+  const owners = new Set()
+  for (const range of ranges ?? []) {
+    const start = Math.max(0, range.start ?? 0)
+    for (const value of impactDeclaredSymbols(lines[start] ?? "", "python")) owners.add(value)
+    const baseIndent = impactIndent(lines[start] ?? "")
+    let ceilingIndent = baseIndent
+    for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+      const line = lines[i] ?? ""
+      const match = line.match(/^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
+      if (!match) continue
+      const indent = impactIndent(line)
+      if (indent < ceilingIndent) {
+        owners.add(match[1]); ceilingIndent = indent
+        if (indent === 0) break
+      }
+    }
+  }
+  for (const lineNo of hitLines ?? []) {
+    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", "python")) owners.add(value)
+  }
+  return owners
+}
+
+function impactBraceEnclosingOwner(lines, start) {
+  let depth = 0
+  for (let i = start - 1; i >= Math.max(0, start - IMPACT_SCOPE_MAX_LINES); i -= 1) {
+    const line = lines[i] ?? ""
+    for (let j = line.length - 1; j >= 0; j -= 1) {
+      const ch = line[j]
+      if (ch === "}") depth += 1
+      else if (ch === "{") {
+        if (depth > 0) depth -= 1
+        else {
+          for (const value of impactDeclaredSymbols(line, "typescript")) return value
+        }
+      }
+    }
+  }
+  return null
+}
+
+function impactBraceOwnerSymbols(lines, ranges, hitLines, language) {
+  const owners = new Set()
+  for (const range of ranges ?? []) {
+    const start = Math.max(0, range.start ?? 0)
+    const end = Math.min(lines.length - 1, start + 5)
+    for (let i = Math.max(0, start - 2); i <= end; i += 1) {
+      for (const value of impactDeclaredSymbols(lines[i] ?? "", language)) owners.add(value)
+    }
+    const enclosing = impactBraceEnclosingOwner(lines, start)
+    if (enclosing) owners.add(enclosing)
+  }
+  for (const lineNo of hitLines ?? []) {
+    for (const value of impactDeclaredSymbols(lines[Math.max(0, lineNo - 1)] ?? "", language)) owners.add(value)
+  }
+  return owners
+}
+
+function impactOwnerSymbols(lines, ranges, hitLines, language) {
+  if (!Array.isArray(lines)) return new Set()
+  if (language === "python") return impactPythonOwnerSymbols(lines, ranges, hitLines)
+  if (["javascript", "typescript"].includes(language)) return impactBraceOwnerSymbols(lines, ranges, hitLines, language)
+  return new Set()
+}
+
+function impactIndent(line) {
+  const match = String(line ?? "").match(/^[ \t]*/)
+  return match ? match[0].replace(/\t/g, "    ").length : 0
+}
+
 function impactWindowRange(lines, lineNo, radius = IMPACT_SCOPE_WINDOW_RADIUS) {
   const center = Math.max(0, Math.min(lines.length - 1, lineNo - 1))
   return {
@@ -2024,259 +2367,5 @@ const fileEntriesByCanonical =
     bytes: usedBytes,
     truncated: auxiliaryTruncated,
     text: [header, ...rendered].join("\n"),
-  }
-}
-
-async function renderFocusedSupplement(
-  root,
-  groups,
-  maxBytes,
-  hits,
-  seenFacts = null,
-  contextualizedHitLines = null,
-) {
-  const budget = Math.min(FOCUSED_SUPPLEMENT_MAX_BYTES, Math.max(0, maxBytes))
-  const allCandidateScopes = focusedScopesFromGroups(groups)
-  const reusableScopes = []
-  const eligibleScopes = []
-
-  for (const scope of allCandidateScopes) {
-    const scopeAlreadySeen = factSeen(seenFacts, scopeFact(scope))
-    const hasUncontextualizedHit = [...scope.hitLines].some(
-      (line) =>
-        !(contextualizedHitLines instanceof Set) ||
-        !contextualizedHitLines.has(
-          contextualizedHitLineKey(scope.file, line),
-        ),
-    )
-
-    if (scopeAlreadySeen || !hasUncontextualizedHit) {
-      reusableScopes.push(scope)
-      continue
-    }
-
-    eligibleScopes.push(scope)
-  }
-
-  const scopes = eligibleScopes.slice(0, FOCUSED_MAX_SCOPES)
-
-  if (budget < FOCUSED_MIN_SUPPLEMENT_BYTES || scopes.length < 1) {
-    let reason = "supplement_budget"
-
-    if (allCandidateScopes.length < 1) reason = "no_behavior_scope"
-    else if (eligibleScopes.length < 1) reason = "scope_already_contextualized"
-
-    return {
-      body: [],
-      facts: new Set(),
-      bodyBytes: 0,
-      complete: false,
-      scopeCount: allCandidateScopes.length,
-      selectedScopeCount: scopes.length,
-      reusedScopeCount: reusableScopes.length,
-      fullScopes: 0,
-      partialScopes: 0,
-      radius: null,
-      coveredRangesByFile: new Map(),
-      coveredHitKeys: new Set(),
-      shownHitKeys: new Set(),
-      contextualizedHitLines: new Set(),
-      emittedLines: 0,
-      reason,
-    }
-  }
-
-  const cache = new Map()
-  const hitLookup = hitLookupByFileLine(hits)
-
-  async function build({ allowFull, radius }) {
-    const body = []
-    const facts = new Set()
-    const coveredRangesByFile = new Map()
-    const coveredHitKeys = new Set()
-    const shownHitKeys = new Set()
-    const contextualized = new Set()
-    let bodyBytes = 0
-    let fullScopes = 0
-    let partialScopes = 0
-    let emittedLines = 0
-
-    function push(line) {
-      const cost = bytes(line + "\n")
-      if (bodyBytes + cost > budget) return false
-      body.push(line)
-      bodyBytes += cost
-      return true
-    }
-
-    for (const scope of scopes) {
-      const lines = await loadLines(root, scope.file, cache)
-      if (!lines || lines.length < 1) {
-        return { complete: false, reason: "file_unavailable" }
-      }
-
-      const start = Math.max(1, Math.min(scope.start, lines.length))
-      const end = Math.max(start, Math.min(scope.end, lines.length))
-      const useFull = allowFull && end - start + 1 <= FOCUSED_FULL_SCOPE_MAX_LINES
-      const anchors = [...scope.anchors].slice(0, 4)
-      const scopeKey = scopeFact(scope)
-      const fileKey = evidenceFileKey(scope.file)
-      const byLine = hitLookup.get(fileKey) ?? new Map()
-
-      let ranges
-      if (useFull) {
-        ranges = [{ start, end }]
-      } else {
-        const headerEnd = Math.min(end, start + FOCUSED_SCOPE_HEADER_LINES - 1)
-        ranges = mergeLineRanges([
-          { start, end: headerEnd },
-          ...[...scope.hitLines].map((line) => ({
-            start: Math.max(start, line - radius),
-            end: Math.min(end, line + radius),
-          })),
-        ])
-      }
-
-      const selectedLines = []
-
-      for (const range of ranges) {
-        for (let n = range.start; n <= range.end; n++) {
-          const hit = byLine.get(n)
-          const lineNovel = !factSeen(seenFacts, sourceLineFact(scope.file, n))
-          const hitNovel = hit ? hitHasNovelPositiveFact(hit, seenFacts) : false
-
-          if (lineNovel || hitNovel) selectedLines.push(n)
-        }
-      }
-
-      const selectedRanges = lineNumbersToRanges(selectedLines)
-      const priorLinesOmitted =
-        ranges.reduce((total, range) => total + range.end - range.start + 1, 0) -
-        selectedLines.length
-
-      if (!push(
-        `SCOPE_CONTEXT ${scope.file}:${start}-${end} ` +
-          `symbol=${JSON.stringify(scope.symbolName)} kind=${scope.symbolKind} ` +
-          `hits=${scope.hitLines.size} context=${useFull ? "full_turn" : `window±${radius}`}` +
-          ` prior_lines_omitted=${Math.max(0, priorLinesOmitted)}` +
-          (anchors.length > 0 ? ` anchors=${JSON.stringify(anchors)}` : ""),
-      )) {
-        return { complete: false, reason: "supplement_budget" }
-      }
-
-      facts.add(scopeKey)
-
-      if (useFull) fullScopes += 1
-      else partialScopes += 1
-
-      let previousEnd = null
-
-      for (const range of selectedRanges) {
-        if (previousEnd !== null && range.start > previousEnd + 1) {
-          const omitted = range.start - previousEnd - 1
-          if (!push(`  … prior/unsampled scope context omitted ${omitted} lines …`)) {
-            return { complete: false, reason: "supplement_budget" }
-          }
-        }
-
-        for (let n = range.start; n <= range.end; n++) {
-          const hit = byLine.get(n)
-          let prefix = " "
-
-          if (hit) {
-            const q = [...hit.queries]
-              .sort((a, b) => a - b)
-              .map((x) => `Q${x + 1}`)
-              .join(",")
-            prefix = `>[${q}]`
-          }
-
-          if (!push(
-            `  ${prefix.padEnd(9)} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`,
-          )) {
-            return { complete: false, reason: "supplement_budget" }
-          }
-
-          addLineRange(coveredRangesByFile, scope.file, n, n)
-          facts.add(sourceLineFact(scope.file, n))
-          emittedLines += 1
-
-          if (hit) {
-            coveredHitKeys.add(hit.key)
-            shownHitKeys.add(hit.key)
-            for (const fact of positiveFactsForHit(hit)) facts.add(fact)
-          }
-        }
-
-        previousEnd = range.end
-      }
-
-      for (const [hitKey, hit] of byLine) {
-        if (hit.line < start || hit.line > end) continue
-
-        coveredHitKeys.add(hit.key)
-        contextualized.add(contextualizedHitLineKey(hit.file, hit.line))
-      }
-    }
-
-    for (const [file, ranges] of coveredRangesByFile) {
-      coveredRangesByFile.set(file, mergeLineRanges(ranges))
-    }
-
-    return {
-      body,
-      facts,
-      bodyBytes,
-      complete: true,
-      scopeCount: allCandidateScopes.length,
-      selectedScopeCount: scopes.length,
-      reusedScopeCount: reusableScopes.length,
-      fullScopes,
-      partialScopes,
-      radius,
-      coveredRangesByFile,
-      coveredHitKeys,
-      shownHitKeys,
-      contextualizedHitLines: contextualized,
-      emittedLines,
-      reason: null,
-    }
-  }
-
-  const strategies = [
-    { allowFull: true, radius: FOCUSED_WINDOW_RADII[0] },
-    ...FOCUSED_WINDOW_RADII.map((radius) => ({ allowFull: false, radius })),
-  ]
-  let fallback = null
-
-  for (const strategy of strategies) {
-    const rendered = await build(strategy)
-    fallback = rendered
-
-    if (
-      rendered.complete &&
-      rendered.bodyBytes >= FOCUSED_MIN_SUPPLEMENT_BYTES
-    ) {
-      return rendered
-    }
-  }
-
-  return {
-    body: fallback?.body ?? [],
-    facts: fallback?.facts ?? new Set(),
-    bodyBytes: fallback?.bodyBytes ?? 0,
-    complete: false,
-    scopeCount: allCandidateScopes.length,
-    selectedScopeCount: scopes.length,
-    reusedScopeCount: reusableScopes.length,
-    fullScopes: fallback?.fullScopes ?? 0,
-    partialScopes: fallback?.partialScopes ?? 0,
-    radius: fallback?.radius ?? null,
-    coveredRangesByFile: fallback?.coveredRangesByFile ?? new Map(),
-    coveredHitKeys: fallback?.coveredHitKeys ?? new Set(),
-    shownHitKeys: fallback?.shownHitKeys ?? new Set(),
-    contextualizedHitLines: fallback?.contextualizedHitLines ?? new Set(),
-    emittedLines: fallback?.emittedLines ?? 0,
-    reason: fallback?.reason ?? "supplement_budget",
   }
 }

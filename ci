@@ -12,9 +12,16 @@ quick() {
   python3 benchmarks/runtime/v2.25-stabilization-action-routing.py
   python3 benchmarks/runtime/v2.25-task-context-v1.py
   python3 benchmarks/runtime/v2.27-task-action-fastpath.py
+  python3 benchmarks/runtime/v2.27-b-action-commitment.py
+  python3 benchmarks/runtime/v2.27-c-terminal-short-circuit.py
   python3 benchmarks/corpus/v1/check.py
   python3 benchmarks/corpus/v2/check.py
   node --check opencode/plugins/cpu-search.ts
+  node --check opencode/plugins/cpu-search-core/task-action-v1.mjs
+  node --check opencode/plugins/cpu-search-core/task-search-plan-v1.mjs
+  node --check opencode/plugins/cpu-search-core/action-commit-v1.mjs
+  node --check opencode/plugins/cpu-search-core/terminal-commit-v1.mjs
+  bash -n scripts/install-plugin-stack.sh
   echo "PASS ci quick"
 }
 
