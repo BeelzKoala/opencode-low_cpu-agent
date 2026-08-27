@@ -14,10 +14,56 @@ quick() {
   python3 benchmarks/runtime/v2.27-task-action-fastpath.py
   python3 benchmarks/runtime/v2.27-b-action-commitment.py
   python3 benchmarks/runtime/v2.27-c-terminal-short-circuit.py
+  python3 benchmarks/runtime/v2.28-a-foundation-contracts.py
+  python3 benchmarks/runtime/v2.28-a4-task-requirements-polarity.py
+  python3 benchmarks/runtime/v2.28-a4.1-role-context-hardening.py
+  python3 benchmarks/runtime/v2.28-b-repo-capability-graph.py
+  python3 benchmarks/runtime/v2.28-c-framework-adapters.py
+  python3 benchmarks/runtime/v2.28-c2-framework-resource-routing.py
+  python3 benchmarks/runtime/v2.28-d1-resource-adapters.py
+  python3 benchmarks/runtime/v2.28-d2-fg-evidence-coverage.py
+  python3 benchmarks/runtime/v2.28-e0-task-causal-shadow.py
+  python3 benchmarks/runtime/v2.28-e1-additive-localization-contract.py
+  python3 benchmarks/runtime/v2.28-e1.1-task-shape.py
+  python3 benchmarks/runtime/v2.28-e1.1-task-shape-adversarial.py
+  python3 benchmarks/runtime/v2.28-e1.2-additive-shadow-runtime.py
+  python3 benchmarks/runtime/v2.28-e1.3-composite-host-shadow.py
+  python3 benchmarks/runtime/v2.28-e1.4-r2-composite-frontier.py
+  python3 benchmarks/runtime/v2.28-e1.4-r3-route-conditioned-frontier.py
+  python3 benchmarks/runtime/v2.28-e1.4-r4-reverse-include-witnesses.py
+  python3 benchmarks/runtime/v2.28-e1.5-task-bound-localization-layer.py
+  python3 scripts/check-plugin-import-closure.py --plugin-root opencode/plugins --entry cpu-search.ts --manifest scripts/install-plugin-stack.sh
   python3 benchmarks/corpus/v1/check.py
   python3 benchmarks/corpus/v2/check.py
   node --check opencode/plugins/cpu-search.ts
   node --check opencode/plugins/cpu-search-core/task-action-v1.mjs
+  node --check opencode/plugins/cpu-search-core/task-requirements-v1.mjs
+  node --check opencode/plugins/cpu-search-core/evidence-authority-v1.mjs
+  node --check opencode/plugins/cpu-search-core/localization-decision-v1.mjs
+  node --check opencode/plugins/cpu-search-core/repo-capability-v1.mjs
+  node --check opencode/plugins/cpu-search-core/resource-graph-v1.mjs
+  node --check opencode/plugins/cpu-search-core/framework-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/flask-jinja-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/fastapi-pydantic-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/django-orm-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/typescript-web-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/framework-resource-bridge-v1.mjs
+  node --check opencode/plugins/cpu-search-core/resource-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/generic-html-js-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/react-jsx-router-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/vue-sfc-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/sql-resource-adapter-v1.mjs
+  node --check opencode/plugins/cpu-search-core/observed-resource-resolver-v1.mjs
+  node --check opencode/plugins/cpu-search-core/resource-adapter-bridge-v1.mjs
+  node --check opencode/plugins/cpu-search-core/evidence-tier-v1.mjs
+  node --check opencode/plugins/cpu-search-core/obligation-coverage-v1.mjs
+  node --check opencode/plugins/cpu-search-core/task-anchor-v1.mjs
+  node --check opencode/plugins/cpu-search-core/task-causal-shadow-v1.mjs
+  node --check opencode/plugins/cpu-search-core/additive-localization-plan-v1.mjs
+  node --check opencode/plugins/cpu-search-core/host-integration-shadow-v1.mjs
+  node --check opencode/plugins/cpu-search-core/anchor-resolution-frontier-v1.mjs
+  node --check opencode/plugins/cpu-search-core/host-resource-closure-v2.mjs
+  node --check opencode/plugins/cpu-search-core/task-shape-v1.mjs
   node --check opencode/plugins/cpu-search-core/task-search-plan-v1.mjs
   node --check opencode/plugins/cpu-search-core/action-commit-v1.mjs
   node --check opencode/plugins/cpu-search-core/terminal-commit-v1.mjs

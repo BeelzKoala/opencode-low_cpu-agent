@@ -1,4 +1,976 @@
 
+function ownerRecoveryResponseSafe(response, probe, inputCount) {
+  return (
+    probe?.ok === false &&
+    probe?.reason === "unsafe_ir" &&
+    response?.protocol === "evidence-distiller-v3" &&
+    response?.representation === "evidence_ir" &&
+    response?.raw_hits === inputCount &&
+    response?.mapped_hits === inputCount &&
+    response?.exact_span_hits === 0 &&
+    response?.location_complete === false &&
+    response?.anchor_complete === true &&
+    response?.witness_complete === true &&
+    response?.distill_complete === true &&
+    response?.ir_complete === false &&
+    response?.v2_grouping_preserved === true &&
+    response?.truncated === false &&
+    Array.isArray(response?.groups) &&
+    response.groups.length > 0 &&
+    response?.groups_shown === response.groups.length &&
+    response?.variants_shown === response?.variants_total
+  )
+}
+
+function mutationCandidateIdentity(scope) {
+  if (!scope) return null
+  return {
+    file: normalizeMutationFile(scope.file),
+    symbol_kind: scope.symbol_kind,
+    symbol_name: scope.symbol_name,
+    start_line: scope.start_line,
+    end_line: scope.end_line,
+  }
+}
+
+function normalizeMutationCandidateEol(value) {
+  return String(value ?? "")
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+}
+
+function mutationCandidateStrictAncestor(outer, inner) {
+  if (!outer || !inner) return false
+  const outerFile = normalizeMutationFile(outer.file)
+  const innerFile = normalizeMutationFile(inner.file)
+  if (!outerFile || outerFile !== innerFile) return false
+  if (
+    !Number.isInteger(outer.start_line) ||
+    !Number.isInteger(outer.end_line) ||
+    !Number.isInteger(inner.start_line) ||
+    !Number.isInteger(inner.end_line)
+  ) return false
+
+  const contains =
+    outer.start_line <= inner.start_line &&
+    outer.end_line >= inner.end_line
+  const strict =
+    outer.start_line < inner.start_line ||
+    outer.end_line > inner.end_line
+  return contains && strict
+}
+
+function reduceMostSpecificMutationCandidates(candidates) {
+  const values = Array.isArray(candidates) ? candidates : []
+  return values.filter(
+    (candidate) =>
+      !values.some(
+        (other) =>
+          other !== candidate &&
+          mutationCandidateStrictAncestor(candidate, other),
+      ),
+  )
+}
+
+function normalizeMutationCandidateSlice(value) {
+  return normalizeMutationCandidateEol(value).trim()
+}
+
+function mutationCandidateContainsBefore(candidate, before) {
+  if (
+    !candidate ||
+    typeof candidate.live_source !== "string" ||
+    typeof before !== "string" ||
+    before.length < 1
+  ) return false
+
+  const wanted = normalizeMutationCandidateSlice(before)
+  if (wanted.length < 1) return false
+
+  const source = normalizeMutationCandidateSlice(candidate.live_source)
+  if (source.includes(wanted)) return true
+
+  const sourceLines = source.split("\n")
+  const wantedLines = wanted.split("\n")
+  const width = wantedLines.length
+
+  for (let start = 0; start + width <= sourceLines.length; start++) {
+    const slice = sourceLines.slice(start, start + width).join("\n")
+    if (normalizeMutationCandidateSlice(slice) === wanted) return true
+  }
+
+  return false
+}
+
+function selectExactMutationCandidate(candidates, before, boundTarget = null) {
+  const values = Array.isArray(candidates) ? candidates : []
+
+  if (boundTarget) {
+    const bound =
+      values.find((entry) =>
+        sameAuthorizedScopeIdentity(entry.target, boundTarget),
+      ) ?? null
+
+    if (!bound || !mutationCandidateContainsBefore(bound, before)) {
+      return {
+        ok: false,
+        reason: "mutation_owner_repair_target_mismatch",
+        repairable: false,
+        candidate: null,
+        matches: [],
+      }
+    }
+
+    return {
+      ok: true,
+      reason: "mutation_owner_sticky_exact_match",
+      repairable: false,
+      candidate: bound,
+      matches: [bound],
+    }
+  }
+
+  const exact =
+    values.filter((entry) =>
+      mutationCandidateContainsBefore(entry, before),
+    )
+
+  if (exact.length < 1) {
+    return {
+      ok: false,
+      reason: "mutation_owner_no_exact_match",
+      repairable: true,
+      candidate: null,
+      matches: [],
+    }
+  }
+
+  const mostSpecific =
+    reduceMostSpecificMutationCandidates(
+      exact.map((entry) => entry.target),
+    )
+
+  if (mostSpecific.length !== 1) {
+    return {
+      ok: false,
+      reason: "mutation_owner_ambiguous_exact_match",
+      repairable: true,
+      candidate: null,
+      matches: mostSpecific,
+    }
+  }
+
+  const selectedTarget = mostSpecific[0]
+  const selected =
+    exact.find((entry) =>
+      sameAuthorizedScopeIdentity(entry.target, selectedTarget),
+    ) ?? null
+
+  return {
+    ok: selected !== null,
+    reason:
+      selected !== null
+        ? "mutation_owner_unique_exact_match"
+        : "mutation_owner_ambiguous_exact_match",
+    repairable: selected === null,
+    candidate: selected,
+    matches: mostSpecific,
+  }
+}
+
+function validatedImpactMutationCandidateHits(selectedImpactFiles) {
+  const unique = new Map()
+
+  for (const entry of selectedImpactFiles ?? []) {
+    if (
+      entry?.origin !== "impact" ||
+      entry?.impact?.validationKind !== "forward_scope_definition"
+    ) continue
+
+    const file = evidenceFileKey(entry?.file)
+    const line = entry?.impact?.sample?.line
+    if (!file || !Number.isInteger(line) || line < 1) continue
+
+    const queryIndex =
+      [...(entry?.queries ?? [])]
+        .filter((value) => Number.isInteger(value) && value >= 0)
+        .sort((a, b) => a - b)[0]
+
+    if (!Number.isInteger(queryIndex)) continue
+
+    const key = `${file}\\0${line}\\0${queryIndex}`
+    if (!unique.has(key)) {
+      unique.set(key, {
+        file,
+        line,
+        query: queryIndex + 1,
+      })
+    }
+  }
+
+  return [...unique.values()].sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.line - b.line ||
+      a.query - b.query,
+  )
+}
+
+async function recoverValidatedImpactMutationCandidateGroups(
+  root,
+  selectedImpactFiles,
+) {
+  const hits = validatedImpactMutationCandidateHits(selectedImpactFiles)
+
+  if (hits.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_validated_forward_impact_candidate",
+      groups: [],
+      hits: 0,
+      files: 0,
+      rejected_files: [],
+    }
+  }
+
+  if (hits.length > FOCUSED_PROBE_MAX_LINE_HITS) {
+    return {
+      attempted: false,
+      ok: false,
+      reason: "impact_candidate_hit_budget_exceeded",
+      groups: [],
+      hits: hits.length,
+      files: 0,
+      rejected_files: [],
+    }
+  }
+
+  const byFile = new Map()
+  for (const hit of hits) {
+    const batch = byFile.get(hit.file) ?? []
+    batch.push(hit)
+    byFile.set(hit.file, batch)
+  }
+
+  const groups = []
+  const rejected = []
+
+  for (
+    const [file, fileHits]
+    of [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b))
+  ) {
+    const probe = await runDistiller(root, fileHits)
+    const response = probe?.response
+
+    if (!ownerRecoveryResponseSafe(response, probe, fileHits.length)) {
+      rejected.push({
+        file,
+        reason:
+          probe?.reason ??
+          "impact_candidate_structural_validation_failed",
+      })
+      continue
+    }
+
+    for (const group of response.groups ?? []) {
+      if (
+        typeof group?.symbol_kind !== "string" ||
+        typeof group?.symbol_name !== "string" ||
+        group.symbol_kind === "module" ||
+        group.symbol_name === "<module>" ||
+        group.symbol_name === "<evidence>"
+      ) continue
+
+      groups.push({
+        ...group,
+        mutation_candidate_basis:
+          "validated_forward_impact_definition",
+      })
+    }
+  }
+
+  return {
+    attempted: true,
+    ok: rejected.length === 0,
+    reason:
+      rejected.length === 0
+        ? "validated_forward_impact_candidates_recovered"
+        : "impact_candidate_structural_validation_partial",
+    groups: rejected.length === 0 ? groups : [],
+    hits: hits.length,
+    files: byFile.size,
+    rejected_files: rejected.slice(0, 16),
+  }
+}
+
+async function loadLivePreauthorizedMutationCandidates(root, state) {
+  const loaded = await readAuthorizedEditCapsule(root, state)
+  if (!loaded.ok) return { ...loaded, candidates: [] }
+
+  const capsule = loaded.capsule
+  const preauthorized =
+    Array.isArray(state?.localMutationCandidates)
+      ? state.localMutationCandidates
+      : []
+
+  if (
+    capsule?.mutation_candidate_protocol !== MUTATION_CANDIDATE_SET_PROTOCOL ||
+    !Number.isInteger(capsule?.mutation_candidate_count) ||
+    capsule.mutation_candidate_count < 1 ||
+    capsule.mutation_candidate_count > MUTATION_CANDIDATE_MAX ||
+    !Array.isArray(capsule?.mutation_candidates) ||
+    capsule.mutation_candidates.length !== capsule.mutation_candidate_count ||
+    preauthorized.length < 1 ||
+    preauthorized.length > MUTATION_CANDIDATE_MAX
+  ) {
+    return {
+      ok: false,
+      reason: "mutation_candidate_set_contract_invalid",
+      candidates: [],
+    }
+  }
+
+  const sealed = capsule.mutation_candidates
+  const candidates = []
+  const bodies = new Map()
+
+  for (const entry of preauthorized) {
+    const capability = entry?.capability
+    const target = entry?.target
+    if (
+      capability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
+      capability?.replaceNodeReady !== true ||
+      !Array.isArray(capability?.allowedMutations) ||
+      !capability.allowedMutations.includes("replace_node") ||
+      typeof capability?.localHandoffPath !== "string" ||
+      !target
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_capability_invalid",
+        candidates: [],
+      }
+    }
+
+    const metadata =
+      sealed.find((candidate) =>
+        sameAuthorizedScopeIdentity(candidate, target),
+      ) ?? null
+
+    if (!metadata) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_not_sealed",
+        candidates: [],
+      }
+    }
+
+    const file = canonicalMutationFile(root, target.file)
+    if (!file) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_file_invalid",
+        candidates: [],
+      }
+    }
+
+    let body = bodies.get(file)
+    if (!body) {
+      try {
+        body = await readFile(path.resolve(root, file))
+      } catch {
+        return {
+          ok: false,
+          reason: "mutation_candidate_file_unavailable",
+          candidates: [],
+        }
+      }
+      bodies.set(file, body)
+    }
+
+    const currentSha256 =
+      createHash("sha256").update(body).digest("hex")
+
+    if (
+      currentSha256 !== metadata.source_sha256 ||
+      currentSha256 !== capability.targetSourceSha256
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_source_stale",
+        candidates: [],
+      }
+    }
+
+    const lines =
+      normalizeMutationCandidateEol(
+        body.toString("utf8"),
+      ).split("\n")
+
+    if (
+      !Number.isInteger(target.start_line) ||
+      !Number.isInteger(target.end_line) ||
+      target.start_line < 1 ||
+      target.end_line < target.start_line ||
+      target.end_line > lines.length
+    ) {
+      return {
+        ok: false,
+        reason: "mutation_candidate_live_range_invalid",
+        candidates: [],
+      }
+    }
+
+    candidates.push({
+      target,
+      capability,
+      live_source:
+        lines.slice(target.start_line - 1, target.end_line).join("\n"),
+    })
+  }
+
+  return {
+    ok: true,
+    capsule,
+    candidates,
+  }
+}
+
+async function bindReplaceNodeMutationCandidate(root, state, before) {
+  const loaded =
+    await loadLivePreauthorizedMutationCandidates(root, state)
+
+  if (!loaded.ok) {
+    return {
+      ...loaded,
+      repairable: false,
+      candidate: null,
+    }
+  }
+
+  const selected =
+    selectExactMutationCandidate(
+      loaded.candidates,
+      before,
+      state?.boundMutationTarget ?? null,
+    )
+
+  return {
+    ...selected,
+    candidate_count: loaded.candidates.length,
+  }
+}
+
+async function confirmLocalMutationCompetitors(
+  root,
+  state,
+  scoutHandoff,
+  editCapsule,
+  rankedFiles,
+  discoveryResults,
+  queries,
+  glob,
+) {
+  const reject = (reason, detail = null, extra = {}) => ({
+    ok: false,
+    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    reason,
+    detail,
+    checked_files: 0,
+    ...extra,
+  })
+
+  if (scoutHandoff?.status === "ready") {
+    return {
+      ok: true,
+      protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+      reason: "global_handoff_ready",
+      checked_files: 0,
+      competing_owners: [],
+    }
+  }
+
+  const target = editCapsule?.authorizedMutationScope
+  const targetFile = canonicalMutationFile(root, target?.file)
+  if (!targetFile) return reject("competitor_target_invalid")
+
+  const targetStateFile = [...(state?.scoutFiles?.values?.() ?? [])]
+    .find((entry) =>
+      canonicalMutationFile(root, entry?.file) === targetFile,
+    )
+
+  const observedTargetQueries = [...(targetStateFile?.queries ?? [])]
+    .filter((value) => Number.isInteger(value) && value >= 0)
+
+  if (observedTargetQueries.length < 1) {
+    return reject("competitor_query_provenance_missing")
+  }
+
+  // Compare against the most discriminative direct provenance first.
+  // Generic task terms (configuration/database/etc.) must not make every
+  // incidental source file a mutation competitor.
+  const queryFileCounts = new Map(
+    (discoveryResults ?? []).map((result) => [
+      result.queryIndex,
+      new Set(
+        (result?.files ?? [])
+          .map((file) => canonicalMutationFile(root, file))
+          .filter(Boolean),
+      ).size,
+    ]),
+  )
+  const rankedTargetQueries = observedTargetQueries
+    .map((queryIndex) => ({
+      queryIndex,
+      files: queryFileCounts.get(queryIndex) ?? Number.MAX_SAFE_INTEGER,
+    }))
+    .sort((a, b) => a.files - b.files || a.queryIndex - b.queryIndex)
+
+  const minimumQueryFiles = rankedTargetQueries[0]?.files
+  const targetQueries = new Set(
+    rankedTargetQueries
+      .filter((entry) => entry.files === minimumQueryFiles)
+      .map((entry) => entry.queryIndex),
+  )
+
+  const targetIsTest = likelyTestFile(targetFile)
+  const candidates = (rankedFiles ?? []).filter((entry) => {
+    const file = canonicalMutationFile(root, entry?.file)
+    if (!file || file === targetFile) return false
+    if (!targetIsTest && likelyTestFile(file)) return false
+    for (const query of entry?.queries ?? []) {
+      if (targetQueries.has(query)) return true
+    }
+    return false
+  })
+
+  if (candidates.length > SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES) {
+    return reject(
+      "competitor_budget_exceeded",
+      `${candidates.length}>${SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES}`,
+      { candidate_files: candidates.map((entry) => entry.file).slice(0, 16) },
+    )
+  }
+
+  if (candidates.length < 1) {
+    return {
+      ok: true,
+      protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+      reason: "no_query_provenance_competitors",
+      checked_files: 0,
+      competing_owners: [],
+    }
+  }
+
+  const results = []
+
+  for (const queryIndex of [...targetQueries].sort((a, b) => a - b)) {
+    const targets = candidates
+      .filter((entry) => entry?.queries?.has?.(queryIndex))
+      .map((entry) => entry.file)
+      .sort()
+
+    if (targets.length < 1) continue
+
+    const discovery = (discoveryResults ?? []).find(
+      (entry) => entry?.queryIndex === queryIndex,
+    )
+    const requestedQuery = queries?.[queryIndex]
+
+    if (!discovery || typeof requestedQuery !== "string") {
+      return reject("competitor_query_plan_missing", String(queryIndex))
+    }
+
+    let result
+    if (discovery.compiledProbe) {
+      result = restrictProbeResultToTargets(
+        discovery.compiledProbe,
+        targets,
+      )
+    } else {
+      const raw = await runQuery(
+        root,
+        discovery.effectiveQuery ?? requestedQuery,
+        queryIndex,
+        targets,
+        glob,
+      )
+      result = queryCompilerProbeResult(
+        raw,
+        requestedQuery,
+        discovery.matchMode ?? "exact",
+      )
+    }
+
+    if (
+      result?.scanComplete !== true ||
+      result?.timedOut === true ||
+      result?.scanCapped === true ||
+      result?.error
+    ) {
+      return reject(
+        "competitor_scan_incomplete",
+        `query_${queryIndex + 1}`,
+      )
+    }
+
+    results.push(result)
+  }
+
+  const competitorHits = mergeHits(results)
+  const recoveryHits = ownerRecoveryHitsFromMerged(competitorHits)
+  const byFile = new Map()
+
+  for (const hit of recoveryHits) {
+    const file = canonicalMutationFile(root, hit.file)
+    if (!file) continue
+    const batch = byFile.get(file) ?? []
+    batch.push({ ...hit, file })
+    byFile.set(file, batch)
+  }
+
+  const competingOwners = []
+
+  for (const entry of candidates) {
+    const file = canonicalMutationFile(root, entry.file)
+    if (!file) return reject("competitor_file_invalid", entry.file)
+
+    const fileHits = byFile.get(file) ?? []
+    if (fileHits.length < 1) continue
+
+    const probe = await runDistiller(root, fileHits)
+    const response = probe?.response
+
+    if (!ownerRecoveryResponseSafe(response, probe, fileHits.length)) {
+      return reject(
+        "competitor_structural_validation_failed",
+        file,
+        { checked_files: byFile.size },
+      )
+    }
+
+    for (const group of response.groups ?? []) {
+      const symbolKind = group?.symbol_kind
+      const symbolName = group?.symbol_name
+      if (
+        typeof symbolKind !== "string" ||
+        typeof symbolName !== "string" ||
+        symbolKind === "module" ||
+        symbolName === "<module>" ||
+        symbolName === "<evidence>"
+      ) {
+        continue
+      }
+
+      competingOwners.push({
+        file,
+        symbol_kind: symbolKind,
+        symbol_name: symbolName,
+        start_line: group.start_line ?? null,
+        end_line: group.end_line ?? null,
+      })
+    }
+  }
+
+  if (competingOwners.length > 0) {
+    return reject(
+      "competing_structural_owner",
+      `${competingOwners[0].file}:${competingOwners[0].symbol_name}`,
+      {
+        checked_files: candidates.length,
+        competing_owners: competingOwners.slice(0, 8),
+      },
+    )
+  }
+
+  return {
+    ok: true,
+    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
+    reason: "bounded_competitor_confirmation_passed",
+    checked_files: candidates.length,
+    competing_owners: [],
+  }
+}
+
+function simpleRenameIdentifierQuery(value) {
+  const query = String(value ?? "")
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(query)
+    ? query
+    : null
+}
+
+function selectRenameTargetFromExactEvidence(
+  root,
+  queries,
+  discoveryResults,
+  exactStructuralGroups,
+  handoffFiles,
+) {
+  const reject = (reason, detail = null) => ({
+    ok: false,
+    reason,
+    detail,
+    target: null,
+  })
+
+  if (
+    typeof root !== "string" ||
+    !Array.isArray(queries) ||
+    !Array.isArray(discoveryResults) ||
+    !Array.isArray(exactStructuralGroups) ||
+    !Array.isArray(handoffFiles)
+  ) {
+    return reject("rename_target_inputs_incomplete")
+  }
+
+  const handoffFileKeys = new Set(
+    handoffFiles
+      .map((entry) => canonicalMutationFile(root, entry?.file))
+      .filter(Boolean),
+  )
+  const candidates = new Map()
+
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+    const identifier = simpleRenameIdentifierQuery(queries[queryIndex])
+    if (!identifier) continue
+
+    const result = discoveryResults[queryIndex]
+    if (
+      result?.scanComplete !== true ||
+      result?.timedOut === true ||
+      result?.scanCapped === true ||
+      result?.error ||
+      result?.queryFormulation != null
+    ) {
+      continue
+    }
+
+    const discoveryFiles = [
+      ...new Set(
+        (result.files ?? [])
+          .map((file) => canonicalMutationFile(root, file))
+          .filter(Boolean),
+      ),
+    ].sort()
+
+    // A global rename target is not bound from an emitted subset. Every file
+    // discovered for the exact identifier query must survive into the sealed
+    // complete handoff; otherwise later closure validation would start from
+    // incomplete source evidence.
+    if (
+      discoveryFiles.length < 1 ||
+      discoveryFiles.some((file) => !handoffFileKeys.has(file))
+    ) {
+      continue
+    }
+
+    const queryNumber = queryIndex + 1
+    const definitions = new Map()
+
+    for (const group of exactStructuralGroups) {
+      if (!validateEvidenceGroup(group)) continue
+      if (group.role !== "definition") continue
+      if (group.symbol_name !== identifier) continue
+      if (!(group.queries ?? []).includes(queryNumber)) continue
+
+      const file = canonicalMutationFile(root, group.file)
+      if (!file || !discoveryFiles.includes(file)) continue
+      if (
+        !Number.isInteger(group.start_line) ||
+        !Number.isInteger(group.end_line) ||
+        group.start_line < 1 ||
+        group.end_line < group.start_line
+      ) {
+        continue
+      }
+
+      const identity = {
+        file,
+        symbol_kind: group.symbol_kind,
+        symbol_name: identifier,
+        start_line: group.start_line,
+        end_line: group.end_line,
+      }
+      const key = JSON.stringify(identity)
+
+      if (!definitions.has(key)) {
+        definitions.set(key, {
+          target: identity,
+          queryIndex,
+          queryNumber,
+          identifier,
+          evidenceLines: [...new Set(group.hit_lines ?? [])]
+            .filter((line) => Number.isInteger(line) && line > 0)
+            .sort((a, b) => a - b),
+          discoveryFiles,
+          exactHitCount: Number.isInteger(group.hit_count)
+            ? group.hit_count
+            : 0,
+        })
+      }
+    }
+
+    if (definitions.size > 1) {
+      return reject(
+        "rename_target_ambiguous_definition",
+        `query_${queryNumber}:${identifier}:definitions_${definitions.size}`,
+      )
+    }
+
+    if (definitions.size === 1) {
+      const candidate = [...definitions.values()][0]
+      candidates.set(JSON.stringify(candidate.target), candidate)
+    }
+  }
+
+  if (candidates.size < 1) {
+    return reject("rename_target_not_proven")
+  }
+  if (candidates.size > 1) {
+    return reject(
+      "rename_target_multiple_exact_definitions",
+      `targets_${candidates.size}`,
+    )
+  }
+
+  return {
+    ok: true,
+    reason: "unique_exact_identifier_definition",
+    ...[...candidates.values()][0],
+  }
+}
+
+async function attestRenameTargetCapability(
+  root,
+  state,
+  queries,
+  discoveryResults,
+  exactStructuralGroups,
+) {
+  const reject = (reason, detail = null) => ({
+    ok: false,
+    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
+    reason,
+    detail,
+    ready: false,
+    globalReady: false,
+    target: null,
+  })
+
+  const rel = normalizeMutationFile(state?.scoutHandoffPath)
+  if (!rel.startsWith(".opencode/scout-handoffs/")) {
+    return reject("rename_target_handoff_unavailable")
+  }
+
+  const handoffRoot = path.resolve(root, ".opencode", "scout-handoffs")
+  const absolute = path.resolve(root, rel)
+  if (
+    absolute !== handoffRoot &&
+    !absolute.startsWith(handoffRoot + path.sep)
+  ) {
+    return reject("rename_target_handoff_escape")
+  }
+
+  let raw
+  let bundle
+  try {
+    raw = await readFile(absolute)
+    bundle = JSON.parse(raw.toString("utf8"))
+  } catch {
+    return reject("rename_target_handoff_unreadable")
+  }
+
+  const blockingReasons = Array.isArray(bundle?.blocking_reasons)
+    ? bundle.blocking_reasons
+    : []
+  const partialReasons = Array.isArray(bundle?.partial_reasons)
+    ? bundle.partial_reasons
+    : []
+
+  if (
+    bundle?.protocol !== SCOUT_HANDOFF_PROTOCOL ||
+    bundle?.status !== "ready" ||
+    blockingReasons.length > 0 ||
+    partialReasons.length > 0
+  ) {
+    return reject(
+      "rename_target_requires_complete_handoff",
+      `${bundle?.status ?? "missing"}:${[
+        ...blockingReasons,
+        ...partialReasons,
+      ].join(",")}`,
+    )
+  }
+
+  const handoffFiles = Array.isArray(bundle.files) ? bundle.files : []
+  const selected = selectRenameTargetFromExactEvidence(
+    root,
+    queries,
+    discoveryResults,
+    exactStructuralGroups,
+    handoffFiles,
+  )
+  if (selected.ok !== true) {
+    return reject(selected.reason, selected.detail ?? null)
+  }
+
+  const target = selected.target
+  const targetFile = handoffFiles.find(
+    (entry) => canonicalMutationFile(root, entry?.file) === target.file,
+  )
+  const fingerprint = targetFile?.fingerprint
+  if (
+    fingerprint?.kind !== "sha256" ||
+    fingerprint?.strong !== true ||
+    fingerprint?.evidence_fresh !== true ||
+    typeof fingerprint?.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
+    targetFile?.changed_during_scout === true
+  ) {
+    return reject("rename_target_fingerprint_not_strong_current")
+  }
+
+  let body
+  try {
+    body = await readFile(path.resolve(root, target.file))
+  } catch {
+    return reject("rename_target_file_unavailable")
+  }
+
+  const currentSha256 = createHash("sha256").update(body).digest("hex")
+  if (currentSha256 !== fingerprint.sha256) {
+    return reject("rename_target_fingerprint_stale")
+  }
+
+  const targetIdentitySha256 = createHash("sha256")
+    .update(JSON.stringify(target))
+    .digest("hex")
+  const sourceHandoffSha256 = createHash("sha256")
+    .update(raw)
+    .digest("hex")
+
+  return {
+    ok: true,
+    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
+    operation: "rename_symbol",
+    reason: selected.reason,
+    ready: true,
+    globalReady: true,
+    sourceHandoffPath: rel,
+    sourceHandoffSha256,
+    target,
+    targetIdentitySha256,
+    targetSourceSha256: currentSha256,
+    queryIndex: selected.queryIndex,
+    queryNumber: selected.queryNumber,
+    identifier: selected.identifier,
+    evidenceLines: selected.evidenceLines,
+    exactHitCount: selected.exactHitCount,
+    discoveryFiles: selected.discoveryFiles,
+  }
+}
+
 async function attestLocalMutationCapability(
   root,
   sessionID,
@@ -459,6 +1431,11 @@ function getSessionState(sessionID) {
       sourceInventoryCache: new Map(),
       evidenceLedger: new Set(),
       routeLedger: new Set(),
+      taskAnchors: null,
+      taskShape: null,
+      additiveLocalizationPlan: null,
+      frameworkResourceEdges: new Map(),
+      resourceAdapterEdges: new Map(),
       contextualizedHitLines: new Set(),
       consecutiveNoProgress: 0,
       ledgerSaturated: false,
@@ -494,6 +1471,8 @@ function getSessionState(sessionID) {
       taskContextReason: "unresolved",
       taskContextDrift: false,
       taskAction: null,
+      taskRequirements: null,
+      taskRoleEvidence: [],
       actionCommitSha256: null,
       actionCommitDispatches: 0,
       terminalCommit: null,
@@ -544,6 +1523,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.sourceInventoryCache.clear()
   state.evidenceLedger.clear()
   state.routeLedger.clear()
+  state.frameworkResourceEdges = new Map()
+  state.resourceAdapterEdges = new Map()
   state.contextualizedHitLines.clear()
   state.consecutiveNoProgress = 0
   state.ledgerSaturated = false
@@ -579,6 +1560,11 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskContextReason = "unresolved"
   state.taskContextDrift = false
   state.taskAction = null
+  state.taskRequirements = null
+  state.taskAnchors = null
+  state.taskShape = null
+  state.additiveLocalizationPlan = null
+  state.taskRoleEvidence = []
   state.actionCommitSha256 = null
   state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
@@ -1572,1247 +2558,4 @@ function queryFormulationAtoms(fragment) {
   }
 
   return atoms
-}
-
-function buildQueryFormulationPlan(query) {
-  const rawBranches = splitTopLevelRegexAlternatives(query)
-  if (
-    !Array.isArray(rawBranches) ||
-    rawBranches.length < 1 ||
-    rawBranches.length > QUERY_FORMULATION_MAX_BRANCHES
-  ) {
-    return null
-  }
-
-  const branches = []
-  const atoms = []
-  const seen = new Set()
-
-  for (const raw of rawBranches) {
-    const branchAtoms = queryFormulationAtoms(raw)
-
-    if (
-      branchAtoms.length < 1 ||
-      branchAtoms.length > QUERY_FORMULATION_MAX_ATOMS_PER_BRANCH
-    ) {
-      return null
-    }
-
-    branches.push({ raw, atoms: branchAtoms })
-
-    for (const atom of branchAtoms) {
-      if (seen.has(atom)) continue
-      seen.add(atom)
-      atoms.push(atom)
-      if (atoms.length > QUERY_FORMULATION_MAX_ATOMS) return null
-    }
-  }
-
-  if (
-    atoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
-    !atoms.some((atom) => /[a-z]/.test(atom))
-  ) {
-    return null
-  }
-
-  return {
-    protocol: QUERY_FORMULATION_PROTOCOL,
-    branches,
-    atoms,
-  }
-}
-
-function queryFormulationLineHasAtom(text, atom) {
-  const line = String(text ?? "").toLowerCase()
-  if (!line || !atom) return false
-
-  if (/^\d+$/.test(atom)) {
-    const escaped = escapeRegexLiteral(atom)
-    return new RegExp(`(?:^|\\D)${escaped}(?=\\D|$)`).test(line)
-  }
-
-  return line.includes(atom)
-}
-
-async function runQueryFormulationDiscovery(
-  root,
-  query,
-  queryIndex,
-  target,
-  glob,
-  plan = null,
-) {
-  const formulation = plan ?? buildQueryFormulationPlan(query)
-  if (!formulation) return null
-
-  const anchorQuery =
-    `(?i:${formulation.atoms.map(escapeRegexLiteral).join("|")})`
-
-  const probe = await runQuery(
-    root,
-    anchorQuery,
-    queryIndex,
-    [target],
-    glob,
-  )
-
-  if (
-    probe.scanComplete !== true ||
-    probe.timedOut === true ||
-    probe.scanCapped === true ||
-    probe.error
-  ) {
-    return null
-  }
-
-  const atomsByFile = new Map()
-  const globalObserved = new Set()
-
-  for (const match of probe.matches ?? []) {
-    const file = evidenceFileKey(match?.file)
-    if (!file) continue
-
-    let fileAtoms = atomsByFile.get(file)
-    if (!fileAtoms) {
-      fileAtoms = new Set()
-      atomsByFile.set(file, fileAtoms)
-    }
-
-    for (const atom of formulation.atoms) {
-      if (!queryFormulationLineHasAtom(match?.text, atom)) continue
-      fileAtoms.add(atom)
-      globalObserved.add(atom)
-    }
-  }
-
-  const scoreByFile = new Map()
-  const branchEvidence = []
-
-  formulation.branches.forEach((branch, branchIndex) => {
-    const sourceBackedAtoms = branch.atoms.filter((atom) =>
-      globalObserved.has(atom),
-    )
-
-    if (
-      sourceBackedAtoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
-      !sourceBackedAtoms.some((atom) => /[a-z]/.test(atom))
-    ) {
-      return
-    }
-
-    const requiredAtoms = Math.max(
-      QUERY_FORMULATION_MIN_FILE_ATOMS,
-      Math.ceil(
-        sourceBackedAtoms.length * QUERY_FORMULATION_MIN_COVERAGE_RATIO,
-      ),
-    )
-
-    branchEvidence.push({
-      branchIndex,
-      sourceBackedAtoms,
-      requiredAtoms,
-    })
-
-    for (const [file, observedAtoms] of atomsByFile.entries()) {
-      const matchedAtoms = sourceBackedAtoms.filter((atom) =>
-        observedAtoms.has(atom),
-      )
-
-      if (matchedAtoms.length < requiredAtoms) continue
-
-      const ratio = matchedAtoms.length / sourceBackedAtoms.length
-      const prior = scoreByFile.get(file) ?? {
-        file,
-        maxAtoms: 0,
-        maxRatio: 0,
-        matchedBranches: 0,
-      }
-
-      prior.maxAtoms = Math.max(prior.maxAtoms, matchedAtoms.length)
-      prior.maxRatio = Math.max(prior.maxRatio, ratio)
-      prior.matchedBranches += 1
-      scoreByFile.set(file, prior)
-    }
-  })
-
-  const ranked = [...scoreByFile.values()].sort(
-    (a, b) =>
-      b.maxAtoms - a.maxAtoms ||
-      b.maxRatio - a.maxRatio ||
-      b.matchedBranches - a.matchedBranches ||
-      a.file.localeCompare(b.file),
-  )
-
-  if (
-    ranked.length < 1 ||
-    ranked.length > QUERY_FORMULATION_MAX_FILES
-  ) {
-    return null
-  }
-
-  const files = ranked.map((entry) => entry.file)
-  const allowed = new Set(files)
-  const matches = (probe.matches ?? [])
-    .filter((match) => allowed.has(evidenceFileKey(match?.file)))
-    .map((match) => ({
-      ...match,
-      exactSpans: [],
-      matchTexts: [],
-    }))
-
-  if (matches.length < 1) return null
-
-  const compiledProbe = {
-    ...probe,
-    query,
-    requestedQuery: query,
-    matchMode: "token_file_cooccurrence",
-    matches,
-  }
-
-  return {
-    query,
-    requestedQuery: query,
-    effectiveQuery: anchorQuery,
-    cacheQuery: `token-file:${formulation.branches
-      .map((branch) => branch.atoms.join("&"))
-      .join("||")}`,
-    queryIndex,
-    files,
-    timedOut: false,
-    scanCapped: false,
-    error: null,
-    scanComplete: true,
-    matchMode: "token_file_cooccurrence",
-    compilerTokens: formulation.atoms,
-    compiledProbe,
-    queryFormulation: {
-      protocol: QUERY_FORMULATION_PROTOCOL,
-      branches: formulation.branches.map((branch) => branch.atoms),
-      source_backed_branches: branchEvidence.map((entry) => ({
-        branch_index: entry.branchIndex,
-        atoms: entry.sourceBackedAtoms,
-        required_atoms: entry.requiredAtoms,
-      })),
-      selected_files: files.length,
-    },
-  }
-}
-
-function queryCompilerProbeResult(
-  result,
-  requestedQuery,
-  matchMode,
-) {
-  const fallback = matchMode !== "exact"
-
-  return {
-    ...result,
-    query: requestedQuery,
-    matchMode,
-    matches: (result?.matches ?? []).map((match) => ({
-      ...match,
-
-      // A fallback hit is real source evidence, but it is NOT an exact
-      // match for the model-supplied regex. Never allow it to masquerade
-      // as exact structural replacement evidence.
-      exactSpans: fallback ? [] : (match.exactSpans ?? []),
-      matchTexts: fallback ? [] : (match.matchTexts ?? []),
-    })),
-  }
-}
-
-function restrictProbeResultToTargets(result, targets) {
-  const allowed = new Set(
-    (targets ?? []).map((file) => evidenceFileKey(file)),
-  )
-
-  return {
-    ...result,
-    matches: (result?.matches ?? []).filter((match) =>
-      allowed.has(evidenceFileKey(match.file)),
-    ),
-  }
-}
-
-async function runCompiledDiscovery(
-  root,
-  query,
-  queryIndex,
-  target,
-  glob,
-) {
-  const exact = await runFileDiscovery(
-    root,
-    query,
-    queryIndex,
-    target,
-    glob,
-  )
-
-  const exactResult = {
-    ...exact,
-    query,
-    requestedQuery: query,
-    effectiveQuery: query,
-    cacheQuery: `exact:${query}`,
-    matchMode: "exact",
-    compilerTokens: [],
-    compiledProbe: null,
-  }
-
-  const exactCompleteZero =
-    exact.scanComplete === true &&
-    exact.timedOut !== true &&
-    exact.scanCapped !== true &&
-    !exact.error &&
-    (exact.files?.length ?? 0) === 0
-
-  if (
-    !exactCompleteZero ||
-    !queryCompilerEligible(query)
-  ) {
-    return exactResult
-  }
-
-  // Stage 1: preserve regex semantics and only relax case.
-  const foldedQuery = queryCompilerCasefoldRegex(query)
-
-  const folded = await runFileDiscovery(
-    root,
-    foldedQuery,
-    queryIndex,
-    target,
-    glob,
-  )
-
-  if ((folded.files?.length ?? 0) > 0) {
-    return {
-      ...folded,
-      query,
-      requestedQuery: query,
-      effectiveQuery: foldedQuery,
-      cacheQuery: `casefold:${foldedQuery}`,
-      matchMode: "casefold",
-      compilerTokens: queryCompilerTokens(query),
-      compiledProbe: null,
-    }
-  }
-
-  // Do not build stronger routing claims on top of an incomplete fallback.
-  const foldedCompleteZero =
-    folded.scanComplete === true &&
-    folded.timedOut !== true &&
-    folded.scanCapped !== true &&
-    !folded.error &&
-    (folded.files?.length ?? 0) === 0
-
-  if (!foldedCompleteZero) {
-    return exactResult
-  }
-
-  const formulationPlan = buildQueryFormulationPlan(query)
-
-  // Stage 2a: top-level alternation is usually a set of independent search
-  // hypotheses. Requiring every token from every alternative on one line is
-  // structurally impossible, so try bounded same-file co-occurrence first.
-  if ((formulationPlan?.branches?.length ?? 0) > 1) {
-    const formulated = await runQueryFormulationDiscovery(
-      root,
-      query,
-      queryIndex,
-      target,
-      glob,
-      formulationPlan,
-    )
-    if (formulated) return formulated
-  }
-
-  // Stage 2b: order-independent recovery, but only when ALL significant
-  // query tokens occur on the SAME physical source line.
-  //
-  // One longest token is used as a cheap rg anchor; JS then validates
-  // complete co-occurrence. This avoids permutations/lookaheads and keeps
-  // the operation bounded to one additional rg scan.
-  const tokens = queryCompilerTokens(query)
-
-  if (tokens.length < QUERY_COMPILER_MIN_TOKENS) {
-    return exactResult
-  }
-
-  const anchorToken = queryCompilerAnchorToken(tokens)
-  if (!anchorToken) return exactResult
-
-  const anchorQuery =
-    `(?i:${escapeRegexLiteral(anchorToken)})`
-
-  const anchorProbe = await runQuery(
-    root,
-    anchorQuery,
-    queryIndex,
-    [target],
-    glob,
-  )
-
-  if (
-    anchorProbe.scanComplete !== true ||
-    anchorProbe.timedOut === true ||
-    anchorProbe.scanCapped === true ||
-    anchorProbe.error
-  ) {
-    return exactResult
-  }
-
-  const matches = (anchorProbe.matches ?? [])
-    .filter((match) => {
-      const line = String(match?.text ?? "").toLowerCase()
-      return tokens.every((token) => line.includes(token))
-    })
-    .map((match) => ({
-      ...match,
-      exactSpans: [],
-      matchTexts: [],
-    }))
-
-  if (matches.length < 1) {
-    const formulated = await runQueryFormulationDiscovery(
-      root,
-      query,
-      queryIndex,
-      target,
-      glob,
-      formulationPlan,
-    )
-    return formulated ?? exactResult
-  }
-
-  const files = [
-    ...new Set(
-      matches
-        .map((match) => match.file)
-        .filter((file) => typeof file === "string" && file.length > 0),
-    ),
-  ]
-
-  const compiledProbe = {
-    ...anchorProbe,
-    query,
-    requestedQuery: query,
-    matchMode: "token_line_cooccurrence",
-    matches,
-  }
-
-  return {
-    query,
-    requestedQuery: query,
-    effectiveQuery: anchorQuery,
-    cacheQuery: `token-line:${tokens.join("|")}`,
-    queryIndex,
-    files,
-    timedOut: false,
-    scanCapped: false,
-    error: null,
-    scanComplete: true,
-    matchMode: "token_line_cooccurrence",
-    compilerTokens: tokens,
-    compiledProbe,
-  }
-}
-
-function pathAffinity(file, queryIndices, queryTokensByIndex) {
-  const normalized = evidenceFileKey(file).toLowerCase()
-  const base = path.posix.basename(normalized)
-  const stem = base.replace(/\.[^.]+$/, "")
-  let score = 0
-
-  for (const queryIndex of queryIndices ?? []) {
-    for (const token of queryTokensByIndex.get(queryIndex) ?? []) {
-      if (stem === token) score += 4
-      else if (stem.includes(token)) score += 2
-      else if (normalized.includes(token)) score += 1
-    }
-  }
-
-  return score
-}
-
-function rankDiscoveredFiles(discoveryResults) {
-  const byFile = new Map()
-  const queryFileCounts = new Map()
-  const queryTokensByIndex = new Map(
-    (discoveryResults ?? []).map((result) => [
-      result.queryIndex,
-      queryPathTokens(result.query),
-    ]),
-  )
-
-  for (const result of discoveryResults ?? []) {
-    const unique = [...new Set(result?.files ?? [])]
-    queryFileCounts.set(result.queryIndex, unique.length)
-
-    for (const file of unique) {
-      let entry = byFile.get(file)
-
-      if (!entry) {
-        entry = {
-          file,
-          queries: new Set(),
-          coverage: 0,
-          pathAffinity: 0,
-          rarity: 0,
-        }
-        byFile.set(file, entry)
-      }
-
-      entry.queries.add(result.queryIndex)
-    }
-  }
-
-  for (const entry of byFile.values()) {
-    entry.coverage = entry.queries.size
-    entry.pathAffinity = pathAffinity(
-      entry.file,
-      entry.queries,
-      queryTokensByIndex,
-    )
-    entry.rarity = [...entry.queries].reduce((score, queryIndex) => {
-      const count = Math.max(1, queryFileCounts.get(queryIndex) ?? 1)
-      return score + 1 / count
-    }, 0)
-  }
-
-  // Relevance stays separate from fairness.
-  //
-  // Query specificity is intentionally only a tertiary tie-break:
-  //
-  //   coverage > path affinity > provenance specificity > stable path
-  //
-  // Therefore a weak rare query can never outrank stronger multi-query
-  // coverage or a better path match. It only replaces the previous
-  // arbitrary filename tie-break when lexical evidence is otherwise equal.
-  //
-  // The signal is free: discovery already measured the number of files
-  // matched by every query, so this adds no repository scan or model call.
-  return [...byFile.values()].sort(
-    (a, b) =>
-      b.coverage - a.coverage ||
-      b.pathAffinity - a.pathAffinity ||
-      b.rarity - a.rarity ||
-      a.file.localeCompare(b.file),
-  )
-}
-
-
-
-function semanticResolverBinary() {
-  const override = process.env.OPENCODE_SEMANTIC_RESOLVER
-  if (typeof override === "string" && override.length > 0) {
-    return override
-  }
-
-  const dir = runtimeStackDirectory()
-  if (!dir) return null
-
-  return path.join(dir, "opencode-semantic-resolver")
-}
-
-function semanticLanguageForFile(file) {
-  const lower = String(file ?? "").toLowerCase()
-
-  if (lower.endsWith(".py") || lower.endsWith(".pyi")) {
-    return "python"
-  }
-
-  if (
-    lower.endsWith(".ts") ||
-    lower.endsWith(".tsx") ||
-    lower.endsWith(".mts") ||
-    lower.endsWith(".cts")
-  ) {
-    return "typescript"
-  }
-
-  if (
-    lower.endsWith(".js") ||
-    lower.endsWith(".jsx") ||
-    lower.endsWith(".mjs") ||
-    lower.endsWith(".cjs")
-  ) {
-    return "javascript"
-  }
-
-  return null
-}
-
-function semanticExpectedImpactTarget(relation) {
-  if (relation?.direction === "forward") {
-    return evidenceFileKey(relation?.file)
-  }
-
-  if (relation?.direction === "reverse") {
-    return evidenceFileKey(relation?.seed)
-  }
-
-  return ""
-}
-
-function semanticSpecCursorOffset(spec) {
-  const value = String(spec ?? "")
-  if (!value) return 0
-
-  const slash = Math.max(
-    value.lastIndexOf("/"),
-    value.lastIndexOf("\\"),
-  )
-
-  if (slash >= 0 && slash + 1 < value.length) {
-    return slash + 1
-  }
-
-  const dot = value.lastIndexOf(".")
-  if (dot >= 0 && dot + 1 < value.length) {
-    return dot + 1
-  }
-
-  return 0
-}
-
-function semanticLineWindow(text, oneBasedLine, maxLines) {
-  if (
-    !Number.isInteger(oneBasedLine) ||
-    oneBasedLine < 1 ||
-    !Number.isInteger(maxLines) ||
-    maxLines < 1
-  ) {
-    return null
-  }
-
-  let line = 1
-  let start = 0
-
-  while (line < oneBasedLine) {
-    const next = text.indexOf("\n", start)
-    if (next < 0) return null
-    start = next + 1
-    line += 1
-  }
-
-  let end = start
-
-  for (let index = 0; index < maxLines; index += 1) {
-    const next = text.indexOf("\n", end)
-    if (next < 0) {
-      end = text.length
-      break
-    }
-
-    end = next + 1
-  }
-
-  return { start, end }
-}
-
-async function semanticImpactQueryForRelation(
-  root,
-  relation,
-  id,
-) {
-  const witnessFile = evidenceFileKey(relation?.witness_file)
-  const expectedFile = semanticExpectedImpactTarget(relation)
-  const spec =
-    typeof relation?.spec === "string"
-      ? relation.spec
-      : ""
-  const witnessLine = relation?.witness_line
-  const language = semanticLanguageForFile(witnessFile)
-
-  if (
-    !witnessFile ||
-    !expectedFile ||
-    !spec ||
-    !language ||
-    !Number.isInteger(witnessLine) ||
-    witnessLine < 1
-  ) {
-    return {
-      ok: false,
-      reason: "unsupported_relation",
-    }
-  }
-
-  const resolved = path.resolve(root, witnessFile)
-
-  if (
-    resolved !== root &&
-    !resolved.startsWith(root + path.sep)
-  ) {
-    return {
-      ok: false,
-      reason: "witness_outside_root",
-    }
-  }
-
-  let canonical
-  let info
-  let source
-
-  try {
-    canonical = await realpath(resolved)
-
-    if (
-      canonical !== root &&
-      !canonical.startsWith(root + path.sep)
-    ) {
-      return {
-        ok: false,
-        reason: "witness_realpath_outside_root",
-      }
-    }
-
-    info = await stat(canonical)
-
-    if (
-      !info.isFile() ||
-      info.size > MAX_CONTEXT_FILE_BYTES
-    ) {
-      return {
-        ok: false,
-        reason: "witness_file_budget",
-      }
-    }
-
-    source = await readFile(canonical, "utf8")
-  } catch {
-    return {
-      ok: false,
-      reason: "witness_unavailable",
-    }
-  }
-
-  const window = semanticLineWindow(
-    source,
-    witnessLine,
-    SEMANTIC_IMPACT_WITNESS_WINDOW_LINES,
-  )
-
-  if (!window) {
-    return {
-      ok: false,
-      reason: "witness_line_invalid",
-    }
-  }
-
-  const fragment = source.slice(window.start, window.end)
-  const occurrences = []
-
-  let cursor = 0
-
-  while (true) {
-    const found = fragment.indexOf(spec, cursor)
-    if (found < 0) break
-
-    occurrences.push(found)
-
-    if (occurrences.length > 1) break
-
-    cursor = found + Math.max(1, spec.length)
-  }
-
-  if (occurrences.length !== 1) {
-    return {
-      ok: false,
-      reason:
-        occurrences.length === 0
-          ? "module_spec_not_found"
-          : "module_spec_ambiguous",
-    }
-  }
-
-  const charOffset =
-    window.start +
-    occurrences[0] +
-    semanticSpecCursorOffset(spec)
-
-  const byteOffset =
-    Buffer.byteLength(
-      source.slice(0, charOffset),
-      "utf8",
-    )
-
-  return {
-    ok: true,
-    language,
-    expectedFile,
-    relation: {
-      file: evidenceFileKey(relation?.file),
-      seed: evidenceFileKey(relation?.seed),
-      direction: relation?.direction ?? null,
-      witness_file: witnessFile,
-      witness_line: witnessLine,
-      spec,
-    },
-    query: {
-      id,
-      operation: "definition",
-      file: witnessFile,
-      byte_offset: byteOffset,
-      max_results: SEMANTIC_IMPACT_MAX_RESULTS,
-    },
-  }
-}
-
-function runSemanticResolverBatch(
-  root,
-  language,
-  planned,
-) {
-  return new Promise((resolve) => {
-    const binary = semanticResolverBinary()
-
-    if (!binary) {
-      resolve({
-        ok: false,
-        reason: "binary_unavailable",
-        language,
-        elapsedMs: 0,
-      })
-      return
-    }
-
-    const started = performance.now()
-
-    let child
-
-    try {
-      child = spawn(binary, [], {
-        cwd: root,
-        stdio: ["pipe", "pipe", "pipe"],
-      })
-    } catch {
-      resolve({
-        ok: false,
-        reason: "spawn_error",
-        language,
-        elapsedMs:
-          Math.round(
-            (performance.now() - started) * 100,
-          ) / 100,
-      })
-      return
-    }
-
-    let stdout = []
-    let stdoutBytes = 0
-    let stderr = ""
-    let timedOut = false
-    let outputLimited = false
-    let settled = false
-
-    const elapsed = () =>
-      Math.round(
-        (performance.now() - started) * 100,
-      ) / 100
-
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(result)
-    }
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGKILL")
-    }, SEMANTIC_RESOLVER_TIMEOUT_MS)
-
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length
-
-      if (
-        stdoutBytes >
-        SEMANTIC_RESOLVER_MAX_STDOUT_BYTES
-      ) {
-        outputLimited = true
-        child.kill("SIGKILL")
-        return
-      }
-
-      stdout.push(Buffer.from(chunk))
-    })
-
-    child.stderr.on("data", (chunk) => {
-      if (stderr.length < 4096) {
-        stderr += chunk.toString("utf8")
-      }
-    })
-
-    child.on("error", () => {
-      finish({
-        ok: false,
-        reason: "spawn_error",
-        language,
-        elapsedMs: elapsed(),
-      })
-    })
-
-    child.on("close", (code) => {
-      if (timedOut) {
-        finish({
-          ok: false,
-          reason: "timeout",
-          language,
-          elapsedMs: elapsed(),
-        })
-        return
-      }
-
-      if (outputLimited) {
-        finish({
-          ok: false,
-          reason: "stdout_limit",
-          language,
-          elapsedMs: elapsed(),
-        })
-        return
-      }
-
-      if (code !== 0) {
-        finish({
-          ok: false,
-          reason: "exit_error",
-          language,
-          elapsedMs: elapsed(),
-          error: stderr.trim() || null,
-        })
-        return
-      }
-
-      let response
-
-      try {
-        response = JSON.parse(
-          Buffer.concat(stdout).toString("utf8"),
-        )
-      } catch {
-        finish({
-          ok: false,
-          reason: "invalid_json",
-          language,
-          elapsedMs: elapsed(),
-        })
-        return
-      }
-
-      const expectedIds =
-        new Set(
-          planned.map((entry) => entry.query.id),
-        )
-
-      const results = response?.results
-
-      const ids =
-        Array.isArray(results)
-          ? results.map((entry) => entry?.id)
-          : []
-
-      const validIds =
-        ids.length === expectedIds.size &&
-        new Set(ids).size === ids.length &&
-        ids.every((id) => expectedIds.has(id))
-
-      if (
-        response?.protocol !== SEMANTIC_RESOLVER_PROTOCOL ||
-        response?.authority !== SEMANTIC_RESOLVER_AUTHORITY ||
-        typeof response?.engine !== "string" ||
-        !response.engine ||
-        !Array.isArray(results) ||
-        !validIds
-      ) {
-        finish({
-          ok: false,
-          reason: "response_contract_invalid",
-          language,
-          elapsedMs: elapsed(),
-        })
-        return
-      }
-
-      finish({
-        ok: true,
-        reason: "resolved",
-        language,
-        engine: response.engine,
-        elapsedMs: elapsed(),
-        response,
-      })
-    })
-
-    const request = {
-      protocol: SEMANTIC_RESOLVER_PROTOCOL,
-      root,
-      language,
-      queries:
-        planned.map((entry) => entry.query),
-    }
-
-    child.stdin.end(
-      JSON.stringify(request),
-      "utf8",
-    )
-  })
-}
-
-async function runSemanticImpactShadow(
-  root,
-  validatedImpact,
-) {
-  const sourceValidated =
-    Array.isArray(validatedImpact)
-      ? validatedImpact
-      : []
-
-  if (sourceValidated.length < 1) {
-    return {
-      attempted: false,
-      ok: true,
-      reason: "no_source_validated_impact",
-      elapsedMs: 0,
-      queries: 0,
-      confirmed: 0,
-      contradicted: 0,
-      ambiguous: 0,
-      unresolved: 0,
-      unavailable: 0,
-      skipped: 0,
-      engines: [],
-      outcomes: [],
-    }
-  }
-
-  const started = performance.now()
-  const planned = []
-  const seen = new Set()
-  let skipped = 0
-
-  outer:
-  for (const hypothesis of sourceValidated) {
-    for (const relation of hypothesis?.relations ?? []) {
-      if (planned.length >= SEMANTIC_IMPACT_MAX_QUERIES) {
-        break outer
-      }
-
-      const expectedFile =
-        semanticExpectedImpactTarget(relation)
-
-      const key = [
-        evidenceFileKey(relation?.witness_file),
-        relation?.witness_line,
-        relation?.spec,
-        expectedFile,
-      ].join("\0")
-
-      if (seen.has(key)) continue
-      seen.add(key)
-
-      const entry =
-        await semanticImpactQueryForRelation(
-          root,
-          relation,
-          `impact-semantic-${planned.length + 1}`,
-        )
-
-      if (!entry.ok) {
-        skipped += 1
-        continue
-      }
-
-      planned.push(entry)
-    }
-  }
-
-  if (planned.length < 1) {
-    return {
-      attempted: false,
-      ok: true,
-      reason: "no_supported_semantic_witnesses",
-      elapsedMs:
-        Math.round(
-          (performance.now() - started) * 100,
-        ) / 100,
-      queries: 0,
-      confirmed: 0,
-      contradicted: 0,
-      ambiguous: 0,
-      unresolved: 0,
-      unavailable: 0,
-      skipped,
-      engines: [],
-      outcomes: [],
-    }
-  }
-
-  const byLanguage = new Map()
-
-  for (const entry of planned) {
-    const batch =
-      byLanguage.get(entry.language) ?? []
-    batch.push(entry)
-    byLanguage.set(entry.language, batch)
-  }
-
-  const batches =
-    await Promise.all(
-      [...byLanguage.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([language, entries]) =>
-          runSemanticResolverBatch(
-            root,
-            language,
-            entries,
-          ),
-        ),
-    )
-
-  const batchByLanguage =
-    new Map(
-      batches.map((batch) => [
-        batch.language,
-        batch,
-      ]),
-    )
-
-  const outcomes = []
-
-  for (const plan of planned) {
-    const batch =
-      batchByLanguage.get(plan.language)
-
-    if (!batch?.ok) {
-      outcomes.push({
-        verdict: "unavailable",
-        expected_file: plan.expectedFile,
-        actual_file: null,
-        engine: null,
-        reason:
-          batch?.reason ??
-          "batch_unavailable",
-        ...plan.relation,
-      })
-      continue
-    }
-
-    const result =
-      batch.response.results.find(
-        (entry) =>
-          entry?.id === plan.query.id,
-      )
-
-    if (!result) {
-      outcomes.push({
-        verdict: "unavailable",
-        expected_file: plan.expectedFile,
-        actual_file: null,
-        engine: batch.engine,
-        reason: "result_missing",
-        ...plan.relation,
-      })
-      continue
-    }
-
-    const locations =
-      Array.isArray(result?.locations)
-        ? result.locations
-        : []
-
-    let verdict = "unresolved"
-    let actualFile = null
-    let reason = result?.status ?? "unknown"
-
-    if (
-      result?.status === "resolved" &&
-      result?.bounded_complete === true &&
-      locations.length === 1
-    ) {
-      actualFile =
-        evidenceFileKey(locations[0]?.file)
-
-      verdict =
-        actualFile === plan.expectedFile
-          ? "confirmed"
-          : "contradicted"
-
-      reason =
-        verdict === "confirmed"
-          ? "semantic_target_match"
-          : "semantic_target_mismatch"
-    } else if (
-      result?.status === "ambiguous" ||
-      result?.bounded_complete !== true ||
-      locations.length > 1
-    ) {
-      verdict = "ambiguous"
-      reason = "semantic_result_ambiguous"
-    } else if (
-      result?.status === "unsupported" ||
-      result?.status === "error"
-    ) {
-      verdict = "unavailable"
-    }
-
-    outcomes.push({
-      verdict,
-      expected_file: plan.expectedFile,
-      actual_file: actualFile,
-      engine: batch.engine,
-      reason,
-      ...plan.relation,
-    })
-  }
-
-  const count = (verdict) =>
-    outcomes.filter(
-      (entry) => entry.verdict === verdict,
-    ).length
-
-  const confirmed = count("confirmed")
-  const contradicted = count("contradicted")
-  const ambiguous = count("ambiguous")
-  const unresolved = count("unresolved")
-  const unavailable = count("unavailable")
-  const allBatchesOk =
-    batches.every((batch) => batch.ok)
-
-  return {
-    attempted: true,
-    ok: allBatchesOk,
-    reason:
-      !allBatchesOk
-        ? "resolver_partial"
-        : contradicted > 0
-          ? "semantic_contradictions_observed"
-          : confirmed > 0
-            ? "semantic_confirmations_observed"
-            : "semantic_no_confirmation",
-    elapsedMs:
-      Math.round(
-        (performance.now() - started) * 100,
-      ) / 100,
-    queries: planned.length,
-    confirmed,
-    contradicted,
-    ambiguous,
-    unresolved,
-    unavailable,
-    skipped,
-    engines:
-      [...new Set(
-        batches
-          .map((batch) => batch.engine)
-          .filter(Boolean),
-      )].sort(),
-    outcomes: outcomes.slice(
-      0,
-      SEMANTIC_IMPACT_MAX_QUERIES,
-    ),
-  }
 }

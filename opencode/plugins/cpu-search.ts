@@ -8,6 +8,88 @@ import {
   unresolvedTaskAction,
 } from "./cpu-search-core/task-action-v1.mjs"
 import {
+  TASK_REQUIREMENTS_PROTOCOL,
+  compileTaskRequirements,
+  unresolvedTaskRequirements,
+} from "./cpu-search-core/task-requirements-v1.mjs"
+import {
+  classifyEvidenceAuthority,
+} from "./cpu-search-core/evidence-authority-v1.mjs"
+import {
+  LOCALIZATION_STATUS,
+  decideLocalization,
+} from "./cpu-search-core/localization-decision-v1.mjs"
+import {
+  REPO_CAPABILITY_PROTOCOL,
+  SOURCE_FAMILY_PLAN_PROTOCOL,
+  compileRepoCapabilityProfile,
+  planTaskSourceFamilies,
+} from "./cpu-search-core/repo-capability-v1.mjs"
+import {
+  FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+  inspectFrameworkResourceFile,
+} from "./cpu-search-core/framework-resource-bridge-v1.mjs"
+
+import {
+  RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
+  inspectResourceAdapterFile,
+} from "./cpu-search-core/resource-adapter-bridge-v1.mjs"
+
+import {
+  TASK_ANCHOR_PROTOCOL,
+  compileTaskAnchors,
+} from "./cpu-search-core/task-anchor-v1.mjs"
+
+import {
+  TASK_CAUSAL_SHADOW_PROTOCOL,
+  runTaskCausalShadow,
+} from "./cpu-search-core/task-causal-shadow-v1.mjs"
+
+import {
+  TASK_SHAPE_PROTOCOL,
+  compileTaskShape,
+} from "./cpu-search-core/task-shape-v1.mjs"
+
+import {
+  ADDITIVE_LOCALIZATION_PLAN_PROTOCOL,
+  planAdditiveLocalization,
+} from "./cpu-search-core/additive-localization-plan-v1.mjs"
+
+
+import {
+  HOST_INTEGRATION_SHADOW_PROTOCOL,
+  runHostIntegrationShadow,
+} from "./cpu-search-core/host-integration-shadow-v1.mjs"
+
+
+import {
+  resolveAnchorFrontier,
+  routeAnchorValues,
+} from "./cpu-search-core/anchor-resolution-frontier-v1.mjs"
+
+import {
+  hostResourceClosureSummary,
+  mergeHostAliases,
+  resolveHostAliasesForNodes,
+  resolveHostClosureContext,
+} from "./cpu-search-core/host-resource-closure-v2.mjs"
+
+import {
+  projectAnchoredHostObligationProofs,
+} from "./cpu-search-core/host-obligation-projector-v1.mjs"
+
+import {
+  mergeTaskRoleEvidence,
+  projectTaskBoundObligationProofs,
+} from "./cpu-search-core/task-bound-obligation-evidence-v1.mjs"
+
+import {
+  solveObligationCoverage,
+} from "./cpu-search-core/obligation-coverage-v1.mjs"
+
+
+
+import {
   TASK_SEARCH_PLAN_PROTOCOL,
   compileTaskSearchPlanForState,
 } from "./cpu-search-core/task-search-plan-v1.mjs"
@@ -44,6 +126,17 @@ const INDEX_FACET_TEXT_MAX = 80
 const MAX_OUTPUT_BYTES = 6500
 const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
+const FRAMEWORK_ROUTING_MAX_FILES = 8
+const FRAMEWORK_ROUTING_MAX_FILE_BYTES = 512 * 1024
+const FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE = 32
+const FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN = 96
+const RESOURCE_ROUTING_MAX_FILES = 8
+const RESOURCE_ROUTING_MAX_FILE_BYTES = 512 * 1024
+const RESOURCE_ROUTING_MAX_EDGES_PER_FILE = 32
+const RESOURCE_ROUTING_MAX_EDGES_PER_TURN = 96
+const TASK_CAUSAL_SHADOW_MAX_HOPS = 3
+const TASK_CAUSAL_SHADOW_MAX_NODES = 48
+const TASK_CAUSAL_SHADOW_MAX_EDGES = 96
 const QUERY_TIMEOUT_MS = 1500
 
 // Structural BM25F/RRF is routing-only. Failure must preserve the existing
@@ -223,7 +316,7 @@ let runtimeStackManifestCache = null
 const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
 const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
 const TASK_CONTEXT_PROTOCOL = "task-context-v1"
-const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
+const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.2-json-string-controls"
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
 const TASK_CONTEXT_MAX_PARTS = 64
@@ -622,6 +715,84 @@ async function resolveSearchLanguageGlob(root, target, requestedGlob, state) {
   }
 }
 
+
+async function resolveTaskSourceFamilyGlob(
+  root,
+  target,
+  requestedGlob,
+  state,
+) {
+  const legacy =
+    await resolveSearchLanguageGlob(
+      root,
+      target,
+      requestedGlob,
+      state,
+    )
+
+  const profile =
+    compileRepoCapabilityProfile({
+      inventoryProtocol: legacy.protocol,
+      complete: legacy.inventoryComplete === true,
+      files: legacy.inventoryFiles ?? 0,
+      extensions: legacy.inventoryExtensions ?? {},
+    })
+
+  const parsed =
+    parseSimpleLanguageGlob(legacy.effectiveGlob)
+
+  const sourceFamilyPlan =
+    planTaskSourceFamilies({
+      taskRequirements: state?.taskRequirements,
+      profile,
+      requestedExtensions:
+        parsed?.extensions ?? [],
+      maxExtensions:
+        SOURCE_GLOB_FALLBACK_MAX_EXTENSIONS,
+    })
+
+  const base = {
+    ...legacy,
+
+    repoCapability: profile,
+    sourceFamilyPlan,
+
+    roleBroadened: false,
+  }
+
+  if (
+    !parsed ||
+    sourceFamilyPlan?.applied !== true
+  ) {
+    return base
+  }
+
+  const effectiveGlob =
+    buildLanguageGlob(
+      parsed.prefix,
+      sourceFamilyPlan.effective_extensions,
+    )
+
+  if (
+    !effectiveGlob ||
+    effectiveGlob === legacy.effectiveGlob
+  ) {
+    return base
+  }
+
+  return {
+    ...base,
+
+    /*
+     * This is routing expansion, not correction of the model request.
+     * Keep legacy `corrected/reason` semantics intact and expose a separate
+     * role-broadening fact.
+     */
+    effectiveGlob,
+    roleBroadened: true,
+  }
+}
+
 function isReservedAgentEvidencePath(raw) {
   const normalized = String(raw ?? "")
     .replaceAll("\\", "/")
@@ -954,6 +1125,1166 @@ async function writeScoutHandoff(root, sessionID, bundle) {
     await rm(tempPath, { force: true }).catch(() => {})
     return null
   }
+}
+
+
+function frameworkResourceEdgeFact(edge) {
+  return evidenceFact("framework_edge", [
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+function frameworkResourceEdgeKey(edge) {
+  return JSON.stringify([
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+const ANCHOR_FRONTIER_MAX_CANDIDATE_FILES = 8
+const ANCHOR_FRONTIER_TIMEOUT_MS = 500
+const ANCHOR_FRONTIER_MAX_STDOUT_BYTES = 128 * 1024
+
+const NAVIGATION_REVERSE_MAX_CANDIDATE_FILES = 8
+const NAVIGATION_REVERSE_TIMEOUT_MS = 500
+const NAVIGATION_REVERSE_MAX_STDOUT_BYTES = 128 * 1024
+
+const HOST_RESOURCE_INVENTORY_MAX_FILES = 20_000
+const HOST_RESOURCE_INVENTORY_TIMEOUT_MS = 500
+const HOST_RESOURCE_INVENTORY_MAX_STDOUT_BYTES = 2 * 1024 * 1024
+
+
+function boundedInternalRgNullList(
+  root,
+  args,
+  {
+    maxFiles,
+    timeoutMs,
+    maxStdoutBytes,
+  },
+) {
+  return new Promise((resolve) => {
+    const started =
+      performance.now()
+
+    let stdoutBytes = 0
+    const chunks = []
+
+    let timedOut = false
+    let byteCapped = false
+    let spawnError = null
+    let settled = false
+
+    let child
+
+    try {
+      child = spawn(
+        "rg",
+        args,
+        {
+          cwd: root,
+          stdio: [
+            "ignore",
+            "pipe",
+            "ignore",
+          ],
+        },
+      )
+    } catch (error) {
+      resolve({
+        files: [],
+        complete: false,
+        timedOut: false,
+        scanCapped: false,
+        error:
+          String(
+            error?.message ??
+            error,
+          ),
+        elapsedMs:
+          Math.round(
+            (
+              performance.now() -
+              started
+            ) * 100,
+          ) / 100,
+      })
+
+      return
+    }
+
+    const timer =
+      setTimeout(
+        () => {
+          timedOut = true
+
+          try {
+            child.kill(
+              "SIGKILL",
+            )
+          } catch {
+            // Best effort watchdog.
+          }
+        },
+        timeoutMs,
+      )
+
+    child.on(
+      "error",
+      (error) => {
+        spawnError =
+          String(
+            error?.message ??
+            error,
+          )
+      },
+    )
+
+    child.stdout.on(
+      "data",
+      (chunk) => {
+        if (byteCapped) {
+          return
+        }
+
+        const buffer =
+          Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk)
+
+        if (
+          stdoutBytes +
+            buffer.length >
+          maxStdoutBytes
+        ) {
+          byteCapped = true
+
+          try {
+            child.kill(
+              "SIGKILL",
+            )
+          } catch {
+            // Best effort cap.
+          }
+
+          return
+        }
+
+        stdoutBytes +=
+          buffer.length
+
+        chunks.push(buffer)
+      },
+    )
+
+    child.on(
+      "close",
+      (code) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        clearTimeout(timer)
+
+        const raw =
+          Buffer.concat(
+            chunks,
+          ).toString(
+            "utf8",
+          )
+
+        const observed =
+          [
+            ...new Set(
+              raw
+                .split("\0")
+                .map(
+                  (value) =>
+                    evidenceFileKey(
+                      value,
+                    ),
+                )
+                .filter(
+                  (value) =>
+                    value &&
+                    value !== "." &&
+                    !value.startsWith("../") &&
+                    !path.isAbsolute(value),
+                ),
+            ),
+          ].sort()
+
+        const fileCapped =
+          observed.length >
+          maxFiles
+
+        const files =
+          observed.slice(
+            0,
+            maxFiles,
+          )
+
+        /*
+         * rg:
+         *   0 = matches/files
+         *   1 = complete zero-result search
+         *
+         * Both are deterministic complete outcomes.
+         */
+        const cleanExit =
+          code === 0 ||
+          code === 1
+
+        const scanCapped =
+          byteCapped ||
+          fileCapped
+
+        const complete =
+          cleanExit &&
+          !timedOut &&
+          !scanCapped &&
+          !spawnError
+
+        resolve({
+          files,
+          complete,
+          timedOut,
+          scanCapped,
+          error:
+            spawnError,
+
+          elapsedMs:
+            Math.round(
+              (
+                performance.now() -
+                started
+              ) * 100,
+            ) / 100,
+        })
+      },
+    )
+  })
+}
+
+
+async function discoverTaskAnchorFrontierFiles(
+  root,
+  taskAnchors,
+) {
+  const routeAnchors =
+    routeAnchorValues(
+      taskAnchors,
+    )
+
+  if (routeAnchors.length < 1) {
+    return {
+      protocol:
+        "anchor-frontier-discovery-v1",
+
+      route_anchors: [],
+      candidate_files: [],
+
+      route_results: [],
+
+      search_complete: true,
+      search_truncated: false,
+
+      elapsed_ms: 0,
+    }
+  }
+
+  const started =
+    performance.now()
+
+  const routeResults = []
+
+  for (const route of routeAnchors) {
+    const args = [
+      "--files-with-matches",
+      "--null",
+      "--fixed-strings",
+      "--no-messages",
+
+      /*
+       * Current first-class route-bearing source families.
+       * Unsupported languages simply fail closed at parser
+       * validation rather than becoming heuristic evidence.
+       */
+      "-g",
+      "*.{py,pyi,js,jsx,ts,tsx,mjs,cjs}",
+    ]
+
+    for (const pattern of EXCLUDES) {
+      args.push(
+        "-g",
+        pattern,
+      )
+    }
+
+    args.push(
+      "--",
+      route,
+      ".",
+    )
+
+    const result =
+      await boundedInternalRgNullList(
+        root,
+        args,
+        {
+          maxFiles:
+            ANCHOR_FRONTIER_MAX_CANDIDATE_FILES +
+            1,
+
+          timeoutMs:
+            ANCHOR_FRONTIER_TIMEOUT_MS,
+
+          maxStdoutBytes:
+            ANCHOR_FRONTIER_MAX_STDOUT_BYTES,
+        },
+      )
+
+    routeResults.push({
+      route,
+      ...result,
+    })
+  }
+
+  const allFiles =
+    [
+      ...new Set(
+        routeResults
+          .flatMap(
+            (result) =>
+              result.files,
+          ),
+      ),
+    ].sort()
+
+  const totalCapped =
+    allFiles.length >
+    ANCHOR_FRONTIER_MAX_CANDIDATE_FILES
+
+  const candidateFiles =
+    allFiles.slice(
+      0,
+      ANCHOR_FRONTIER_MAX_CANDIDATE_FILES,
+    )
+
+  const searchTruncated =
+    totalCapped ||
+    routeResults.some(
+      (result) =>
+        result.scanCapped ===
+        true,
+    )
+
+  const searchComplete =
+    !searchTruncated &&
+    routeResults.every(
+      (result) =>
+        result.complete ===
+        true,
+    )
+
+  return {
+    protocol:
+      "anchor-frontier-discovery-v1",
+
+    route_anchors:
+      routeAnchors,
+
+    candidate_files:
+      candidateFiles,
+
+    route_results:
+      routeResults,
+
+    search_complete:
+      searchComplete,
+
+    search_truncated:
+      searchTruncated,
+
+    elapsed_ms:
+      Math.round(
+        (
+          performance.now() -
+          started
+        ) * 100,
+      ) / 100,
+  }
+}
+
+
+function navigationIncludeTargetLiterals(
+  resourceNodes,
+) {
+  const nodes =
+    Array.isArray(resourceNodes)
+      ? resourceNodes
+      : []
+
+  return [
+    ...new Set(
+      nodes
+        .map(
+          (node) => {
+            if (
+              typeof node !== "string" ||
+              !node.startsWith(
+                "template:",
+              )
+            ) {
+              return null
+            }
+
+            const value =
+              node.slice(
+                "template:".length,
+              )
+
+            if (
+              value.length < 1 ||
+              value.startsWith("/") ||
+              value.includes("..")
+            ) {
+              return null
+            }
+
+            return value
+          },
+        )
+        .filter(Boolean),
+    ),
+  ].sort()
+}
+
+
+async function discoverNavigationReverseIncluderFiles(
+  root,
+  resourceNodes,
+) {
+  const targetLiterals =
+    navigationIncludeTargetLiterals(
+      resourceNodes,
+    )
+
+  if (targetLiterals.length < 1) {
+    return {
+      protocol:
+        "navigation-reverse-frontier-v1",
+
+      target_literals: [],
+      candidate_files: [],
+
+      search_complete: true,
+      search_truncated: false,
+
+      elapsed_ms: 0,
+    }
+  }
+
+  const started =
+    performance.now()
+
+  const results = []
+
+  for (const target of targetLiterals) {
+    const args = [
+      "--files-with-matches",
+      "--null",
+      "--fixed-strings",
+      "--no-messages",
+
+      /*
+       * Current first-class template/resource-bearing source
+       * family. Parser validation remains authoritative for
+       * relation evidence.
+       */
+      "-g",
+      "*.{html,htm,jinja,jinja2,j2}",
+    ]
+
+    for (const pattern of EXCLUDES) {
+      args.push(
+        "-g",
+        pattern,
+      )
+    }
+
+    args.push(
+      "--",
+      target,
+      ".",
+    )
+
+    const result =
+      await boundedInternalRgNullList(
+        root,
+        args,
+        {
+          /*
+           * +1 detects that the observed candidate set is not
+           * exhaustive. Positive sharedness proof does not
+           * require exhaustive discovery.
+           */
+          maxFiles:
+            NAVIGATION_REVERSE_MAX_CANDIDATE_FILES +
+            1,
+
+          timeoutMs:
+            NAVIGATION_REVERSE_TIMEOUT_MS,
+
+          maxStdoutBytes:
+            NAVIGATION_REVERSE_MAX_STDOUT_BYTES,
+        },
+      )
+
+    results.push({
+      target,
+      ...result,
+    })
+  }
+
+  const allFiles =
+    [
+      ...new Set(
+        results.flatMap(
+          (result) =>
+            result.files,
+        ),
+      ),
+    ].sort()
+
+  const totalCapped =
+    allFiles.length >
+    NAVIGATION_REVERSE_MAX_CANDIDATE_FILES
+
+  const candidateFiles =
+    allFiles.slice(
+      0,
+      NAVIGATION_REVERSE_MAX_CANDIDATE_FILES,
+    )
+
+  const searchTruncated =
+    totalCapped ||
+    results.some(
+      (result) =>
+        result.scanCapped === true,
+    )
+
+  const searchComplete =
+    !searchTruncated &&
+    results.every(
+      (result) =>
+        result.complete === true,
+    )
+
+  return {
+    protocol:
+      "navigation-reverse-frontier-v1",
+
+    target_literals:
+      targetLiterals,
+
+    candidate_files:
+      candidateFiles,
+
+    search_complete:
+      searchComplete,
+
+    search_truncated:
+      searchTruncated,
+
+    elapsed_ms:
+      Math.round(
+        (
+          performance.now() -
+          started
+        ) * 100,
+      ) / 100,
+  }
+}
+
+
+async function observedHostResourceInventory(
+  root,
+  state,
+) {
+  const cacheKey =
+    `host-resource-inventory-v2:${root}`
+
+  const cached =
+    state
+      ?.sourceInventoryCache
+      ?.get(
+        cacheKey,
+      )
+
+  if (
+    cached &&
+    cached.protocol ===
+      "host-resource-inventory-v2"
+  ) {
+    return {
+      ...cached,
+      cache_hit: true,
+    }
+  }
+
+  const args = [
+    "--files",
+    "--null",
+    "--no-messages",
+  ]
+
+  for (const pattern of EXCLUDES) {
+    args.push(
+      "-g",
+      pattern,
+    )
+  }
+
+  const result =
+    await boundedInternalRgNullList(
+      root,
+      args,
+      {
+        maxFiles:
+          HOST_RESOURCE_INVENTORY_MAX_FILES,
+
+        timeoutMs:
+          HOST_RESOURCE_INVENTORY_TIMEOUT_MS,
+
+        maxStdoutBytes:
+          HOST_RESOURCE_INVENTORY_MAX_STDOUT_BYTES,
+      },
+    )
+
+  const inventory = {
+    protocol:
+      "host-resource-inventory-v2",
+
+    authority:
+      "routing_inventory_only",
+
+    files:
+      result.files,
+
+    complete:
+      result.complete ===
+      true,
+
+    timed_out:
+      result.timedOut ===
+      true,
+
+    truncated:
+      result.scanCapped ===
+      true,
+
+    error:
+      result.error ??
+      null,
+
+    elapsed_ms:
+      result.elapsedMs,
+
+    cache_hit:
+      false,
+
+    mutation_authority:
+      false,
+  }
+
+  if (
+    state?.sourceInventoryCache
+      instanceof Map
+  ) {
+    state.sourceInventoryCache.set(
+      cacheKey,
+      inventory,
+    )
+  }
+
+  return inventory
+}
+
+
+async function inspectFrameworkRoutingForSelected(
+  root,
+  selectedFiles,
+  state,
+  options = null,
+) {
+  const routeFacts = new Set()
+  const frameworks = new Set()
+  const edgeKinds = new Set()
+
+  let filesScanned = 0
+  let witnesses = 0
+  let edgeCandidates = 0
+  let validatedEdges = 0
+  let rejectedEdges = 0
+  let skippedFiles = 0
+  let truncated = false
+
+  const selected = (
+    Array.isArray(selectedFiles)
+      ? selectedFiles
+      : []
+  ).slice(0, FRAMEWORK_ROUTING_MAX_FILES)
+
+  if (
+    Array.isArray(selectedFiles) &&
+    selectedFiles.length > selected.length
+  ) {
+    truncated = true
+  }
+
+  for (const entry of selected) {
+    const rawFile =
+      typeof entry === "string"
+        ? entry
+        : entry?.file
+
+    const file = evidenceFileKey(rawFile)
+
+    if (
+      !file ||
+      file === "." ||
+      file.startsWith("../") ||
+      path.isAbsolute(file)
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let safeFile
+
+    try {
+      safeFile = await safeTarget(root, file)
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (safeFile === ".") {
+      skippedFiles += 1
+      continue
+    }
+
+    const absolute = path.join(root, safeFile)
+
+    let info
+
+    try {
+      info = await stat(absolute)
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (
+      !info.isFile() ||
+      info.size > FRAMEWORK_ROUTING_MAX_FILE_BYTES
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let text
+
+    try {
+      text = await readFile(absolute, "utf8")
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    let inspected
+
+    try {
+      inspected = inspectFrameworkResourceFile({
+        sourcePath: file,
+        text,
+        maxWitnesses:
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE * 2,
+        maxEdges:
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE,
+
+        routeTargets:
+          options?.routeTargets ??
+          null,
+
+        includeTargets:
+          options?.includeTargets ??
+          null,
+      })
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    filesScanned += 1
+    witnesses += inspected.witnesses.length
+    edgeCandidates += inspected.edge_candidates.length
+    rejectedEdges +=
+      inspected.rejected_edge_candidates.length
+
+    truncated ||= inspected.truncated === true
+
+    for (const framework of inspected.frameworks) {
+      frameworks.add(framework)
+    }
+
+    for (const edge of inspected.resource_edges) {
+      if (
+        validatedEdges >=
+        FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        truncated = true
+        break
+      }
+
+      validatedEdges += 1
+      edgeKinds.add(edge.kind)
+
+      routeFacts.add(
+        frameworkResourceEdgeFact(edge),
+      )
+
+      if (
+        state?.frameworkResourceEdges instanceof Map &&
+        state.frameworkResourceEdges.size <
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        state.frameworkResourceEdges.set(
+          frameworkResourceEdgeKey(edge),
+          edge,
+        )
+      }
+    }
+  }
+
+  return {
+    protocol:
+      FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+
+    authority: "routing_only",
+    mutationAuthority: false,
+
+    filesScanned,
+    skippedFiles,
+
+    frameworks:
+      [...frameworks].sort(),
+
+    witnesses,
+    edgeCandidates,
+    validatedEdges,
+    rejectedEdges,
+
+    edgeKinds:
+      [...edgeKinds].sort(),
+
+    routeFacts,
+    truncated,
+  }
+}
+
+
+function resourceAdapterEdgeKey(edge) {
+  return JSON.stringify([
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+async function inspectResourceRoutingForSelected(
+  root,
+  selectedFiles,
+  state,
+) {
+  const families = new Set()
+  const edgeKinds = new Set()
+
+  let filesScanned = 0
+  let witnesses = 0
+  let edgeCandidates = 0
+  let validatedEdges = 0
+  let rejectedEdges = 0
+  let skippedFiles = 0
+  let truncated = false
+
+  const selected = (
+    Array.isArray(selectedFiles)
+      ? selectedFiles
+      : []
+  ).slice(
+    0,
+    RESOURCE_ROUTING_MAX_FILES,
+  )
+
+  if (
+    Array.isArray(selectedFiles) &&
+    selectedFiles.length >
+      selected.length
+  ) {
+    truncated = true
+  }
+
+  for (const entry of selected) {
+    const rawFile =
+      typeof entry === "string"
+        ? entry
+        : entry?.file
+
+    const file =
+      evidenceFileKey(rawFile)
+
+    if (
+      !file ||
+      file === "." ||
+      file.startsWith("../") ||
+      path.isAbsolute(file)
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let safeFile
+
+    try {
+      safeFile =
+        await safeTarget(
+          root,
+          file,
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (safeFile === ".") {
+      skippedFiles += 1
+      continue
+    }
+
+    const absolute =
+      path.join(
+        root,
+        safeFile,
+      )
+
+    let info
+
+    try {
+      info =
+        await stat(
+          absolute,
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (
+      !info.isFile() ||
+      info.size >
+        RESOURCE_ROUTING_MAX_FILE_BYTES
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let text
+
+    try {
+      text =
+        await readFile(
+          absolute,
+          "utf8",
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    let inspected
+
+    try {
+      inspected =
+        inspectResourceAdapterFile({
+          sourcePath:
+            file,
+
+          text,
+
+          maxWitnesses:
+            RESOURCE_ROUTING_MAX_EDGES_PER_FILE
+            * 2,
+
+          maxEdges:
+            RESOURCE_ROUTING_MAX_EDGES_PER_FILE,
+        })
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    filesScanned += 1
+
+    witnesses +=
+      inspected.witnesses.length
+
+    edgeCandidates +=
+      inspected.edge_candidates.length
+
+    rejectedEdges +=
+      inspected
+        .rejected_edge_candidates
+        .length
+
+    truncated ||=
+      inspected.truncated === true
+
+    for (
+      const family of
+      inspected.families
+    ) {
+      families.add(family)
+    }
+
+    for (
+      const edge of
+      inspected.resource_edges
+    ) {
+      if (
+        validatedEdges >=
+        RESOURCE_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        truncated = true
+        break
+      }
+
+      validatedEdges += 1
+
+      edgeKinds.add(
+        edge.kind,
+      )
+
+      /*
+       * Shadow state only.
+       *
+       * Do NOT add these edges to:
+       * - evidenceLedger
+       * - routeLedger
+       * - taskRoleEvidence
+       *
+       * E0 observes topology; it does not change Scout decisions.
+       */
+      if (
+        state?.resourceAdapterEdges
+          instanceof Map &&
+        state.resourceAdapterEdges.size <
+          RESOURCE_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        state.resourceAdapterEdges.set(
+          resourceAdapterEdgeKey(
+            edge,
+          ),
+          edge,
+        )
+      }
+    }
+  }
+
+  return {
+    protocol:
+      RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
+
+    authority:
+      "routing_only",
+
+    mutationAuthority:
+      false,
+
+    filesScanned,
+    skippedFiles,
+
+    families:
+      [...families].sort(),
+
+    witnesses,
+    edgeCandidates,
+    validatedEdges,
+    rejectedEdges,
+
+    edgeKinds:
+      [...edgeKinds].sort(),
+
+    truncated,
+  }
+}
+
+function taskCausalShadowForState(
+  state,
+) {
+  const edges = []
+
+  if (
+    state?.frameworkResourceEdges
+      instanceof Map
+  ) {
+    edges.push(
+      ...state
+        .frameworkResourceEdges
+        .values(),
+    )
+  }
+
+  if (
+    state?.resourceAdapterEdges
+      instanceof Map
+  ) {
+    edges.push(
+      ...state
+        .resourceAdapterEdges
+        .values(),
+    )
+  }
+
+  return runTaskCausalShadow({
+    taskAnchors:
+      state?.taskAnchors,
+
+    edges,
+
+    maxHops:
+      TASK_CAUSAL_SHADOW_MAX_HOPS,
+
+    maxNodes:
+      TASK_CAUSAL_SHADOW_MAX_NODES,
+
+    maxEdges:
+      TASK_CAUSAL_SHADOW_MAX_EDGES,
+  })
 }
 
 function scoutEvidenceWitnesses(hits, selectedFiles) {
@@ -2727,6 +4058,11 @@ function getSessionState(sessionID) {
       sourceInventoryCache: new Map(),
       evidenceLedger: new Set(),
       routeLedger: new Set(),
+      taskAnchors: null,
+      taskShape: null,
+      additiveLocalizationPlan: null,
+      frameworkResourceEdges: new Map(),
+      resourceAdapterEdges: new Map(),
       contextualizedHitLines: new Set(),
       consecutiveNoProgress: 0,
       ledgerSaturated: false,
@@ -2762,6 +4098,8 @@ function getSessionState(sessionID) {
       taskContextReason: "unresolved",
       taskContextDrift: false,
       taskAction: null,
+      taskRequirements: null,
+      taskRoleEvidence: [],
       actionCommitSha256: null,
       actionCommitDispatches: 0,
       terminalCommit: null,
@@ -2812,6 +4150,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.sourceInventoryCache.clear()
   state.evidenceLedger.clear()
   state.routeLedger.clear()
+  state.frameworkResourceEdges = new Map()
+  state.resourceAdapterEdges = new Map()
   state.contextualizedHitLines.clear()
   state.consecutiveNoProgress = 0
   state.ledgerSaturated = false
@@ -2847,6 +4187,11 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskContextReason = "unresolved"
   state.taskContextDrift = false
   state.taskAction = null
+  state.taskRequirements = null
+  state.taskAnchors = null
+  state.taskShape = null
+  state.additiveLocalizationPlan = null
+  state.taskRoleEvidence = []
   state.actionCommitSha256 = null
   state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
@@ -9613,7 +10958,34 @@ const fileEntriesByCanonical =
       (scope.mutation_candidate_bases ?? [])
         .includes("validated_forward_impact_definition")
 
-    scope.mutation_candidate = true
+    const directStructural =
+      (scope.mutation_candidate_bases ?? [])
+        .includes("direct_structural_evidence")
+
+    const exactTaskActionMatch =
+      directStructural &&
+      state?.taskAction?.status === "exact" &&
+      state?.taskAction?.operation === "rename_symbol" &&
+      state?.taskAction?.old_name === scope.symbol_name
+
+    const evidenceAuthority =
+      classifyEvidenceAuthority({
+        origins: fileEntry?.origins ?? [],
+        mutationCandidateBases:
+          scope.mutation_candidate_bases ?? [],
+        exactTaskActionMatch,
+        taskCausal:
+          (fileEntry?.origins ?? []).includes("task_causal"),
+      })
+
+    scope.evidence_authority = evidenceAuthority
+    scope.mutation_candidate =
+      evidenceAuthority.mutation_authority === true
+
+    if (!scope.mutation_candidate) {
+      scope.mutation_authorized = false
+      continue
+    }
 
     mutationCandidates.push({
       file,
@@ -9623,6 +10995,7 @@ const fileEntriesByCanonical =
       end_line: scope.end_line,
       evidence_lines: [...scope.evidence_lines],
       source_sha256: fingerprint.sha256,
+      evidence_authority: evidenceAuthority,
       structural_source:
         impactRecovered
           ? "line_owner_recovery"
@@ -9682,7 +11055,73 @@ const fileEntriesByCanonical =
   const mutationScopeComplete =
     mutationCapableScopes.length === 1
 
+  const additiveCoverageRequirements =
+    state
+      ?.additiveLocalizationPlan
+      ?.positive_coverage_requirements
+
+  const additiveCoverageIdentityValid =
+    state
+      ?.additiveLocalizationPlan
+      ?.status === "planned" &&
+    additiveCoverageRequirements
+      ?.status === "compiled" &&
+    additiveCoverageRequirements
+      ?.task_sha256 ===
+      state
+        ?.taskRequirements
+        ?.task_sha256
+
+  const localizationRequirements =
+    additiveCoverageIdentityValid
+      ? additiveCoverageRequirements
+      : state?.taskRequirements
+
+  const localizationCoverage =
+    solveObligationCoverage({
+      taskRequirements:
+        localizationRequirements,
+
+      evidence:
+        state?.taskRoleEvidence ??
+        [],
+    })
+
+  const localizationDecision =
+    decideLocalization({
+      taskRequirements:
+        localizationRequirements,
+
+      coveredRoles:
+        localizationCoverage
+          .covered_roles,
+
+      ambiguousRoles:
+        localizationCoverage
+          .ambiguous_roles,
+
+      mutationSupported:
+        mutationScopeComplete &&
+        mutationCandidates.length > 0,
+
+      candidateAuthority:
+        mutationCandidates.some(
+          (candidate) =>
+            candidate?.evidence_authority
+              ?.mutation_authority === true,
+        ),
+    })
+
   const readinessBlockers = []
+
+  if (
+    localizationDecision.status !==
+    LOCALIZATION_STATUS.AUTHORIZED
+  ) {
+    readinessBlockers.push(
+      `localization_${localizationDecision.reason}`,
+    )
+  }
 
   if (!strongFingerprints) {
     readinessBlockers.push("weak_file_fingerprint")
@@ -9726,6 +11165,16 @@ const fileEntriesByCanonical =
     protocol: EDIT_CAPSULE_PROTOCOL,
     render_contract: EDIT_CAPSULE_RENDER_CONTRACT,
     search_protocol: SEARCH_PROTOCOL,
+    task_requirements_protocol:
+      state?.taskRequirements?.protocol ?? TASK_REQUIREMENTS_PROTOCOL,
+    task_requirements_status:
+      state?.taskRequirements?.status ?? null,
+    task_required_roles:
+      state?.taskRequirements?.required_roles ?? [],
+    task_required_source_families:
+      state?.taskRequirements?.required_source_families ?? [],
+    task_constraints:
+      state?.taskRequirements?.constraints ?? [],
     scout_handoff_protocol: SCOUT_HANDOFF_PROTOCOL,
     scout_handoff: scoutHandoff.path,
     scout_handoff_status: scoutHandoff.status,
@@ -9733,6 +11182,14 @@ const fileEntriesByCanonical =
       scoutHandoff.partialReasons ?? [],
     mutation_localization_eligibility:
       mutationLocalization.reason,
+    localization_requirements:
+      localizationRequirements,
+
+    localization_coverage:
+      localizationCoverage,
+
+    localization_decision:
+      localizationDecision,
     generated_at_ms: nowMs(),
     mutation_ready: mutationReady,
     readiness_reason: readinessReason,
@@ -10654,24 +12111,55 @@ function normalizeTaskTextChunk(value, source) {
     }
   }
 
-  // Real OpenCode context evidence shows content text parts may carry one
-  // JSON-string serialization layer. Decode exactly one layer only for this
-  // versioned host representation. Never recursively parse arbitrary values.
+  // OpenCode context may expose one JSON-string serialization layer.
+  // Decode exactly one layer; never recursively parse arbitrary values.
+  //
+  // Some host paths may preserve the outer JSON quotes while materializing
+  // escaped control characters as literal U+0000..U+001F characters.
+  // Strict JSON.parse rejects those. The fallback repairs ONLY those
+  // characters and then requires strict JSON.parse to succeed.
   if (
     source === "content_text_part_text" &&
     raw.startsWith('"')
   ) {
     let decoded = null
+    let decodedSource =
+      "content_text_part_text_json_string"
 
     try {
       decoded = JSON.parse(raw)
     } catch {
-      return {
-        ok: false,
-        reason: "task_text_representation_invalid",
-        text: "",
-        source,
+      if (
+        !raw.endsWith('"') ||
+        !/[\u0000-\u001f]/u.test(raw)
+      ) {
+        return {
+          ok: false,
+          reason: "task_text_representation_invalid",
+          text: "",
+          source,
+        }
       }
+
+      const repaired = raw.replace(
+        /[\u0000-\u001f]/gu,
+        (value) =>
+          JSON.stringify(value).slice(1, -1),
+      )
+
+      try {
+        decoded = JSON.parse(repaired)
+      } catch {
+        return {
+          ok: false,
+          reason: "task_text_representation_invalid",
+          text: "",
+          source,
+        }
+      }
+
+      decodedSource =
+        "content_text_part_text_json_string_controls_repaired"
     }
 
     if (typeof decoded !== "string") {
@@ -10684,20 +12172,25 @@ function normalizeTaskTextChunk(value, source) {
     }
 
     const text = decoded.trim()
+
     if (!text) {
       return {
         ok: false,
         reason: "task_text_chunk_empty",
         text: "",
-        source: "content_text_part_text_json_string",
+        source: decodedSource,
       }
     }
 
     return {
       ok: true,
-      reason: "task_text_json_string_decoded",
+      reason:
+        decodedSource ===
+        "content_text_part_text_json_string"
+          ? "task_text_json_string_decoded"
+          : "task_text_json_string_controls_repaired",
       text,
-      source: "content_text_part_text_json_string",
+      source: decodedSource,
     }
   }
 
@@ -10709,8 +12202,19 @@ function normalizeTaskTextChunk(value, source) {
   }
 }
 
+function taskContextIsUserMessage(message) {
+  return (
+    message != null &&
+    typeof message === "object" &&
+    (
+      message.role === "user" ||
+      message.type === "user"
+    )
+  )
+}
+
 function extractUserMessageText(message) {
-  if (!message || message.role !== "user") {
+  if (!taskContextIsUserMessage(message)) {
     return {
       ok: false,
       reason: "not_user_message",
@@ -10889,7 +12393,7 @@ function userTurnSnapshotFromContext(event) {
   let userOrdinal = 0
   let lastUser = null
   for (const message of messages) {
-    if (message?.role !== "user") continue
+    if (!taskContextIsUserMessage(message)) continue
     userOrdinal += 1
     lastUser = message
   }
@@ -10933,6 +12437,14 @@ function latchTaskContextForTurn(state, snapshot) {
         "task_text_drift_same_turn",
         state.taskTextSha256,
       )
+      state.taskRequirements = unresolvedTaskRequirements(
+        "task_text_drift_same_turn",
+        state.taskTextSha256,
+      )
+      state.taskAnchors = null
+      state.taskShape = null
+      state.additiveLocalizationPlan = null
+      state.taskRoleEvidence = []
       state.mutationIntent = "unknown"
       state.mutationIntentReason = "task_text_drift_same_turn"
       return { ok:false, reason:"task_text_drift_same_turn", drift:true }
@@ -10953,6 +12465,12 @@ function latchTaskContextForTurn(state, snapshot) {
   if (snapshot?.turnID && state.turnID && snapshot.turnID !== state.turnID) {
     state.taskContextReason = "task_turn_mismatch"
     state.taskAction = unresolvedTaskAction("task_turn_mismatch")
+    state.taskRequirements =
+      unresolvedTaskRequirements("task_turn_mismatch")
+    state.taskAnchors = null
+    state.taskShape = null
+    state.additiveLocalizationPlan = null
+    state.taskRoleEvidence = []
     state.mutationIntent = "unknown"
     state.mutationIntentReason = "task_turn_mismatch"
     return { ok:false, reason:"task_turn_mismatch" }
@@ -10961,6 +12479,12 @@ function latchTaskContextForTurn(state, snapshot) {
   if (snapshot?.ok !== true) {
     state.taskContextReason = snapshot?.reason ?? "user_task_text_unavailable"
     state.taskAction = unresolvedTaskAction(state.taskContextReason)
+    state.taskRequirements =
+      unresolvedTaskRequirements(state.taskContextReason)
+    state.taskAnchors = null
+    state.taskShape = null
+    state.additiveLocalizationPlan = null
+    state.taskRoleEvidence = []
     state.mutationIntent = "unknown"
     state.mutationIntentReason = state.taskContextReason
     return { ok:false, reason:state.taskContextReason }
@@ -10968,10 +12492,34 @@ function latchTaskContextForTurn(state, snapshot) {
 
   const intent = classifyMutationIntent(snapshot.text)
   const taskAction = compileTaskAction(snapshot.text, snapshot.textSha256)
+  const taskRequirements =
+    compileTaskRequirements(snapshot.text, snapshot.textSha256)
+  const taskAnchors =
+    compileTaskAnchors(snapshot.text, snapshot.textSha256)
+  const taskShape =
+    compileTaskShape(
+      snapshot.text,
+      snapshot.textSha256,
+    )
+
+  const additiveLocalizationPlan =
+    planAdditiveLocalization({
+      taskRequirements,
+
+      taskKind:
+        taskShape?.status === "compiled"
+          ? taskShape.shape
+          : null,
+    })
   state.taskTextSha256 = snapshot.textSha256
   state.taskTextBytes = snapshot.textBytes
   state.taskContextReason = snapshot.reason
   state.taskAction = taskAction
+  state.taskRequirements = taskRequirements
+  state.taskAnchors = taskAnchors
+  state.taskShape = taskShape
+  state.additiveLocalizationPlan = additiveLocalizationPlan
+  state.taskRoleEvidence = []
 
   if (
     taskAction.status === "exact" &&
@@ -10999,7 +12547,6 @@ function latchTaskContextForTurn(state, snapshot) {
     task_action_status: state.taskAction.status,
   }
 }
-
 function turnIDFromContext(event) {
   return userTurnSnapshotFromContext(event).turnID
 }
@@ -12245,6 +13792,17 @@ export default {
             task_action_operation: state?.taskAction?.operation ?? null,
             task_action_old_name: state?.taskAction?.old_name ?? null,
             task_action_new_name: state?.taskAction?.new_name ?? null,
+            task_requirements_protocol:
+              state?.taskRequirements?.protocol ??
+              TASK_REQUIREMENTS_PROTOCOL,
+            task_requirements_status:
+              state?.taskRequirements?.status ?? null,
+            task_required_roles:
+              state?.taskRequirements?.required_roles ?? [],
+            task_required_source_families:
+              state?.taskRequirements?.required_source_families ?? [],
+            task_constraints:
+              state?.taskRequirements?.constraints ?? [],
             task_search_plan_protocol: taskSearchPlan.protocol,
             task_search_plan_applied: taskSearchPlan.applied,
             task_search_plan_reason: taskSearchPlan.reason,
@@ -12266,12 +13824,65 @@ export default {
           const requestedGlob = taskSearchPlan.effective_glob ?? undefined
 
           const globResolution =
-            await resolveSearchLanguageGlob(
+            await resolveTaskSourceFamilyGlob(
               root,
               target,
               requestedGlob,
               state,
             )
+
+          await writeProjectTrace(
+            root,
+            "search-trace.jsonl",
+            {
+              ts: nowMs(),
+              protocol: SEARCH_PROTOCOL,
+              kind: "source_family_plan",
+              sessionID,
+              turnID: state?.turnID ?? null,
+              project_root: root,
+
+              repo_capability_protocol:
+                globResolution.repoCapability?.protocol ??
+                REPO_CAPABILITY_PROTOCOL,
+              repo_capability_inventory_complete:
+                globResolution.repoCapability?.inventory_complete ??
+                false,
+              repo_capability_absence_claims_allowed:
+                globResolution.repoCapability
+                  ?.absence_claims_allowed ?? false,
+
+              source_family_plan_protocol:
+                globResolution.sourceFamilyPlan?.protocol ??
+                SOURCE_FAMILY_PLAN_PROTOCOL,
+              source_family_plan_applied:
+                globResolution.sourceFamilyPlan?.applied === true,
+              source_family_plan_reason:
+                globResolution.sourceFamilyPlan?.reason ?? null,
+
+              source_family_required_roles:
+                globResolution.sourceFamilyPlan?.required_roles ?? [],
+              source_family_initially_covered_roles:
+                globResolution.sourceFamilyPlan
+                  ?.initially_covered_roles ?? [],
+              source_family_resolved_roles:
+                globResolution.sourceFamilyPlan?.resolved_roles ?? [],
+              source_family_unresolved_roles:
+                globResolution.sourceFamilyPlan?.unresolved_roles ?? [],
+              source_family_selected_families:
+                globResolution.sourceFamilyPlan
+                  ?.selected_families ?? [],
+              source_family_added_extensions:
+                globResolution.sourceFamilyPlan
+                  ?.added_extensions ?? [],
+
+              requested_glob: requestedGlob ?? null,
+              effective_glob:
+                globResolution.effectiveGlob ?? null,
+              glob_role_broadened:
+                globResolution.roleBroadened === true,
+            },
+          )
 
           const glob = globResolution.effectiveGlob
           const signature = searchSignature(queries, target, glob)
@@ -13273,6 +14884,652 @@ export default {
             finalFacts.add(fact)
           }
 
+          const frameworkRouting =
+            await inspectFrameworkRoutingForSelected(
+              root,
+              selectedFiles,
+              state,
+            )
+
+          const resourceRouting =
+            await inspectResourceRoutingForSelected(
+              root,
+              selectedFiles,
+              state,
+            )
+
+          const taskCausalShadow =
+            taskCausalShadowForState(
+              state,
+            )
+
+          const anchorFrontierDiscovery =
+            await discoverTaskAnchorFrontierFiles(
+              root,
+              state?.taskAnchors,
+            )
+
+          const anchorFrontierFramework =
+            anchorFrontierDiscovery
+              .candidate_files
+              .length > 0
+              ? await inspectFrameworkRoutingForSelected(
+                  root,
+                  anchorFrontierDiscovery
+                    .candidate_files,
+                  state,
+                  {
+                    routeTargets:
+                      anchorFrontierDiscovery
+                        .route_anchors,
+                  },
+                )
+              : {
+                  filesScanned: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          const anchorFrontier =
+            resolveAnchorFrontier({
+              taskAnchors:
+                state?.taskAnchors,
+
+              candidateFiles:
+                anchorFrontierDiscovery
+                  .candidate_files,
+
+              searchComplete:
+                anchorFrontierDiscovery
+                  .search_complete,
+
+              searchTruncated:
+                anchorFrontierDiscovery
+                  .search_truncated,
+
+              inspectionTruncated:
+                (
+                  anchorFrontierFramework
+                    ?.truncated ===
+                  true
+                ) ||
+                (
+                  (
+                    anchorFrontierFramework
+                      ?.skippedFiles ??
+                    0
+                  ) > 0
+                ) ||
+                (
+                  (
+                    anchorFrontierFramework
+                      ?.filesScanned ??
+                    0
+                  ) !==
+                  anchorFrontierDiscovery
+                    .candidate_files
+                    .length
+                ),
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+            })
+
+          const hostResourceInventory =
+            await observedHostResourceInventory(
+              root,
+              state,
+            )
+
+          /*
+           * Existing E1.3 stays intact as the baseline shadow.
+           *
+           * The frontier has already had a chance to add exact,
+           * parser-validated owner edges to the same immutable
+           * ResourceEdge state.
+           */
+          const initialHostIntegrationShadow =
+            runHostIntegrationShadow({
+              taskRequirements:
+                state?.taskRequirements,
+
+              taskAnchors:
+                state?.taskAnchors,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              resourceEdges:
+                state?.resourceAdapterEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .resourceAdapterEdges
+                          .values(),
+                      ]
+                    : [],
+
+              impactValidated:
+                impactValidation
+                  ?.validated ??
+                [],
+
+              frameworkTruncated:
+                (
+                  frameworkRouting
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  anchorFrontierFramework
+                    ?.truncated ===
+                    true
+                ),
+
+              resourceTruncated:
+                resourceRouting
+                  ?.truncated ===
+                true,
+            })
+
+          /*
+           * R2 overlay:
+           *
+           * Raw validated ResourceEdges are passed unchanged.
+           * AliasView changes equality/projection only.
+           */
+          const initialHostClosureContext =
+            resolveHostClosureContext({
+              anchorFrontier,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              resourceEdges:
+                state?.resourceAdapterEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .resourceAdapterEdges
+                          .values(),
+                      ]
+                    : [],
+
+              aliases: [],
+            })
+
+          /*
+           * Resolve logical render target -> physical resource
+           * through the complete/partial observed inventory.
+           */
+          const uiAliasResolution =
+            resolveHostAliasesForNodes({
+              nodes:
+                initialHostClosureContext
+                  ?.ui_candidate
+                  ?.resource
+                  ? [
+                      initialHostClosureContext
+                        .ui_candidate
+                        .resource,
+                    ]
+                  : [],
+
+              observedFiles:
+                hostResourceInventory
+                  .files,
+
+              inventoryComplete:
+                hostResourceInventory
+                  .complete ===
+                true,
+            })
+
+          const uiFollowupFiles =
+            uiAliasResolution
+              .aliases
+              .map(
+                (alias) =>
+                  alias.physical_file,
+              )
+
+          const uiFollowupFramework =
+            uiFollowupFiles.length > 0
+              ? await inspectFrameworkRoutingForSelected(
+                  root,
+                  uiFollowupFiles,
+                  state,
+                )
+              : {
+                  filesScanned: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          const uiFollowupResource =
+            uiFollowupFiles.length > 0
+              ? await inspectResourceRoutingForSelected(
+                  root,
+                  uiFollowupFiles,
+                  state,
+                )
+              : {
+                  filesScanned: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          const aliasesAfterUi =
+            mergeHostAliases(
+              uiAliasResolution
+                .aliases,
+            )
+
+          /*
+           * UI physical inspection can now expose include/extends
+           * relations whose source node is the physical template.
+           */
+          const midHostClosureContext =
+            resolveHostClosureContext({
+              anchorFrontier,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              resourceEdges:
+                state?.resourceAdapterEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .resourceAdapterEdges
+                          .values(),
+                      ]
+                    : [],
+
+              aliases:
+                aliasesAfterUi,
+            })
+
+          const uiPhysicalSource =
+            uiAliasResolution
+              .aliases
+              .find(
+                (alias) =>
+                  alias.logical_node ===
+                  midHostClosureContext
+                    ?.ui_candidate
+                    ?.resource,
+              )
+              ?.physical_file ??
+            null
+
+          /*
+           * Resolve every bounded included-resource candidate.
+           * No "menu" filename heuristic is permitted.
+           */
+          const navigationAliasResolution =
+            resolveHostAliasesForNodes({
+              nodes:
+                midHostClosureContext
+                  .navigation_include_candidates ??
+                [],
+
+              sourcePath:
+                uiPhysicalSource,
+
+              observedFiles:
+                hostResourceInventory
+                  .files,
+
+              inventoryComplete:
+                hostResourceInventory
+                  .complete ===
+                true,
+            })
+
+          const navigationFollowupFiles =
+            navigationAliasResolution
+              .aliases
+              .map(
+                (alias) =>
+                  alias.physical_file,
+              )
+
+          const navigationFollowupFramework =
+            navigationFollowupFiles.length > 0
+              ? await inspectFrameworkRoutingForSelected(
+                  root,
+                  navigationFollowupFiles,
+                  state,
+                )
+              : {
+                  filesScanned: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          const navigationFollowupResource =
+            navigationFollowupFiles.length > 0
+              ? await inspectResourceRoutingForSelected(
+                  root,
+                  navigationFollowupFiles,
+                  state,
+                )
+              : {
+                  filesScanned: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          /*
+           * R4 target-conditioned reverse include witnesses.
+           *
+           * Exact literal search proposes possible includers.
+           * Only parser-validated INCLUDES_RESOURCE relations
+           * are added to the immutable proof graph.
+           *
+           * Search completeness is NOT required to prove the
+           * positive predicate "shared by >= 2 includers".
+           * Incomplete search simply cannot prove absence.
+           */
+          const navigationReverseDiscovery =
+            await discoverNavigationReverseIncluderFiles(
+              root,
+
+              midHostClosureContext
+                .navigation_include_candidates ??
+              [],
+            )
+
+          const navigationReverseFramework =
+            navigationReverseDiscovery
+              .candidate_files
+              .length > 0
+              ? await inspectFrameworkRoutingForSelected(
+                  root,
+
+                  navigationReverseDiscovery
+                    .candidate_files,
+
+                  state,
+
+                  {
+                    includeTargets:
+                      navigationReverseDiscovery
+                        .target_literals,
+                  },
+                )
+              : {
+                  filesScanned: 0,
+                  skippedFiles: 0,
+                  validatedEdges: 0,
+                  rejectedEdges: 0,
+                  truncated: false,
+                }
+
+          const finalHostAliases =
+            mergeHostAliases(
+              aliasesAfterUi,
+
+              navigationAliasResolution
+                .aliases,
+            )
+
+          const finalHostClosureContext =
+            resolveHostClosureContext({
+              anchorFrontier,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              resourceEdges:
+                state?.resourceAdapterEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .resourceAdapterEdges
+                          .values(),
+                      ]
+                    : [],
+
+              aliases:
+                finalHostAliases,
+            })
+
+          /*
+           * Final legacy E1.3 observation is recomputed on the RAW
+           * proof graph after deterministic follow-up inspection.
+           *
+           * No alias endpoint rewriting.
+           */
+          const hostIntegrationShadow =
+            runHostIntegrationShadow({
+              taskRequirements:
+                state?.taskRequirements,
+
+              taskAnchors:
+                state?.taskAnchors,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              resourceEdges:
+                state?.resourceAdapterEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .resourceAdapterEdges
+                          .values(),
+                      ]
+                    : [],
+
+              impactValidated:
+                impactValidation
+                  ?.validated ??
+                [],
+
+              frameworkTruncated:
+                (
+                  frameworkRouting
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  anchorFrontierFramework
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  uiFollowupFramework
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  navigationFollowupFramework
+                    ?.truncated ===
+                    true
+                ),
+
+              resourceTruncated:
+                (
+                  resourceRouting
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  uiFollowupResource
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  navigationFollowupResource
+                    ?.truncated ===
+                    true
+                ),
+            })
+
+          const hostResourceClosure =
+            hostResourceClosureSummary({
+              context:
+                finalHostClosureContext,
+
+              aliases:
+                finalHostAliases,
+
+              uiResolution:
+                uiAliasResolution,
+
+              navigationResolution:
+                navigationAliasResolution,
+
+              uiFramework:
+                uiFollowupFramework,
+
+              uiResource:
+                uiFollowupResource,
+
+              navigationFramework:
+                navigationFollowupFramework,
+
+              navigationResource:
+                navigationFollowupResource,
+
+              baselineHostIntegrationShadow:
+                hostIntegrationShadow,
+
+              positiveObligations:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_localization_obligations ??
+                [],
+            })
+
+          /*
+           * E1.5 — task-bound obligation evidence.
+           *
+           * Host projector emits proof descriptors only.
+           * Generic ABI performs A/B classification.
+           * Existing task-role evidence is merged, never
+           * overwritten by one producer.
+           */
+          const hostObligationProjection =
+            projectAnchoredHostObligationProofs({
+              taskRequirements:
+                state?.taskRequirements,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              anchorFrontier,
+
+              hostResourceClosure,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              aliases:
+                finalHostAliases,
+            })
+
+          const taskBoundHostEvidence =
+            projectTaskBoundObligationProofs({
+              coverageRequirements:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_coverage_requirements,
+
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+
+              proofs:
+                hostObligationProjection
+                  .proofs,
+            })
+
+          const mergedRoleEvidence =
+            mergeTaskRoleEvidence({
+              existing:
+                state?.taskRoleEvidence ??
+                [],
+
+              incoming:
+                taskBoundHostEvidence
+                  .evidence,
+
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+            })
+
+          if (state) {
+            state.taskRoleEvidence =
+              mergedRoleEvidence
+                .evidence
+          }
+
           const routeFacts = routeFactsForRanking(
             rankedFiles,
             selectedLexicalFileSet,
@@ -13280,11 +15537,20 @@ export default {
             target,
             glob,
           )
+
+          for (const fact of frameworkRouting.routeFacts) {
+            routeFacts.add(fact)
+          }
+
           const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
           const novelty = novelEvidenceFacts(state, finalFacts)
           const routeNovelty = novelRouteFacts(state, routeFacts)
           const meaningfulRouteProgress =
-            routingActive && routeNovelty.novel.size > 0
+            (
+              routingActive ||
+              frameworkRouting.validatedEdges > 0
+            ) &&
+            routeNovelty.novel.size > 0
           const novelFactStats = summarizeEvidenceFacts(novelty.novel)
           let ledgerFactsAdded = 0
           let routeFactsAdded = 0
@@ -13829,6 +16095,35 @@ export default {
             glob_inventory_files: globResolution.inventoryFiles,
             glob_inventory_extensions: globResolution.inventoryExtensions,
             glob_inventory_cache_hit: globResolution.inventoryCacheHit,
+
+            repo_capability_protocol:
+              globResolution.repoCapability?.protocol ??
+              REPO_CAPABILITY_PROTOCOL,
+            repo_capability_inventory_complete:
+              globResolution.repoCapability?.inventory_complete ??
+              false,
+            repo_capability_absence_claims_allowed:
+              globResolution.repoCapability
+                ?.absence_claims_allowed ?? false,
+
+            source_family_plan_protocol:
+              globResolution.sourceFamilyPlan?.protocol ??
+              SOURCE_FAMILY_PLAN_PROTOCOL,
+            source_family_plan_applied:
+              globResolution.sourceFamilyPlan?.applied === true,
+            source_family_plan_reason:
+              globResolution.sourceFamilyPlan?.reason ?? null,
+            source_family_resolved_roles:
+              globResolution.sourceFamilyPlan?.resolved_roles ?? [],
+            source_family_unresolved_roles:
+              globResolution.sourceFamilyPlan?.unresolved_roles ?? [],
+            source_family_selected_families:
+              globResolution.sourceFamilyPlan?.selected_families ?? [],
+            source_family_added_extensions:
+              globResolution.sourceFamilyPlan?.added_extensions ?? [],
+            glob_role_broadened:
+              globResolution.roleBroadened === true,
+
             file_discovery_cap_per_query: FILE_DISCOVERY_CAP_PER_QUERY,
             line_hit_cap_per_query: LINE_HIT_CAP_PER_QUERY,
             lexical_discovery_complete: discoveryComplete,
@@ -13838,6 +16133,869 @@ export default {
             all_discovered_files_emitted: allDiscoveredFilesSelected,
             routing_active: routingActive,
             route_strategy: "query_fair_lexical8_plus_task_local_impact",
+            framework_resource_bridge_protocol:
+              frameworkRouting.protocol,
+            framework_routing_authority:
+              frameworkRouting.authority,
+            framework_routing_mutation_authority:
+              frameworkRouting.mutationAuthority,
+            framework_routing_files_scanned:
+              frameworkRouting.filesScanned,
+            framework_routing_skipped_files:
+              frameworkRouting.skippedFiles,
+            framework_routing_frameworks:
+              frameworkRouting.frameworks,
+            framework_routing_witnesses:
+              frameworkRouting.witnesses,
+            framework_routing_edge_candidates:
+              frameworkRouting.edgeCandidates,
+            framework_resource_edges_validated:
+              frameworkRouting.validatedEdges,
+            framework_resource_edges_rejected:
+              frameworkRouting.rejectedEdges,
+            framework_resource_edge_kinds:
+              frameworkRouting.edgeKinds,
+            framework_resource_edges_truncated:
+              frameworkRouting.truncated,
+            resource_adapter_bridge_protocol:
+              resourceRouting.protocol,
+            resource_adapter_routing_authority:
+              resourceRouting.authority,
+            resource_adapter_mutation_authority:
+              resourceRouting.mutationAuthority,
+            resource_adapter_files_scanned:
+              resourceRouting.filesScanned,
+            resource_adapter_skipped_files:
+              resourceRouting.skippedFiles,
+            resource_adapter_families:
+              resourceRouting.families,
+            resource_adapter_witnesses:
+              resourceRouting.witnesses,
+            resource_adapter_edge_candidates:
+              resourceRouting.edgeCandidates,
+            resource_adapter_edges_validated:
+              resourceRouting.validatedEdges,
+            resource_adapter_edges_rejected:
+              resourceRouting.rejectedEdges,
+            resource_adapter_edge_kinds:
+              resourceRouting.edgeKinds,
+            resource_adapter_edges_truncated:
+              resourceRouting.truncated,
+
+            task_anchor_protocol:
+              state?.taskAnchors?.protocol ??
+              TASK_ANCHOR_PROTOCOL,
+            task_anchor_status:
+              state?.taskAnchors?.status ?? null,
+            task_anchor_count:
+              state?.taskAnchors?.anchors?.length ??
+              0,
+            task_anchor_kinds:
+              [
+                ...new Set(
+                  (
+                    state?.taskAnchors?.anchors ??
+                    []
+                  ).map(
+                    (item) =>
+                      item.kind,
+                  ),
+                ),
+              ].sort(),
+            task_anchor_truncated:
+              state?.taskAnchors?.truncated ===
+              true,
+
+            task_shape_protocol:
+              state?.taskShape?.protocol ??
+              TASK_SHAPE_PROTOCOL,
+            task_shape_authority:
+              state?.taskShape?.authority ?? null,
+            task_shape_status:
+              state?.taskShape?.status ?? null,
+            task_shape_shape:
+              state?.taskShape?.shape ?? null,
+            task_shape_reason:
+              state?.taskShape?.reason ?? null,
+            task_shape_additive_evidence:
+              (
+                state?.taskShape
+                  ?.additive_evidence ??
+                []
+              )
+                .map(
+                  (item) => ({
+                    rule:
+                      item.rule,
+                    verb:
+                      item.verb,
+                    surface:
+                      item.surface,
+                    index:
+                      item.index,
+                  }),
+                )
+                .slice(
+                  0,
+                  8,
+                ),
+            task_shape_conflict_evidence:
+              (
+                state?.taskShape
+                  ?.conflict_evidence ??
+                []
+              )
+                .map(
+                  (item) => ({
+                    verb:
+                      item.verb,
+                    index:
+                      item.index,
+                  }),
+                )
+                .slice(
+                  0,
+                  8,
+                ),
+            task_shape_localization_authority:
+              state?.taskShape
+                ?.localization_authority ??
+              false,
+            task_shape_mutation_authority:
+              state?.taskShape
+                ?.mutation_authority ??
+              false,
+
+            additive_localization_plan_protocol:
+              state?.additiveLocalizationPlan
+                ?.protocol ??
+              ADDITIVE_LOCALIZATION_PLAN_PROTOCOL,
+            additive_localization_plan_authority:
+              state?.additiveLocalizationPlan
+                ?.authority ??
+              null,
+            additive_localization_plan_status:
+              state?.additiveLocalizationPlan
+                ?.status ??
+              null,
+            additive_localization_plan_reason:
+              state?.additiveLocalizationPlan
+                ?.reason ??
+              null,
+            additive_localization_plan_task_kind:
+              state?.additiveLocalizationPlan
+                ?.task_kind ??
+              null,
+
+            additive_localization_positive_obligations:
+              state?.additiveLocalizationPlan
+                ?.positive_localization_obligations ??
+              [],
+
+            additive_localization_positive_bindings:
+              (
+                state?.additiveLocalizationPlan
+                  ?.positive_localization_bindings ??
+                []
+              ).slice(
+                0,
+                16,
+              ),
+
+            additive_localization_positive_source_families:
+              state?.additiveLocalizationPlan
+                ?.positive_localization_source_families ??
+              [],
+
+            additive_localization_protected_obligations:
+              state?.additiveLocalizationPlan
+                ?.protected_surface_obligations ??
+              [],
+
+            additive_localization_protected_bindings:
+              (
+                state?.additiveLocalizationPlan
+                  ?.protected_surface_bindings ??
+                []
+              ).slice(
+                0,
+                16,
+              ),
+
+            additive_localization_protected_source_families:
+              state?.additiveLocalizationPlan
+                ?.protected_surface_source_families ??
+              [],
+
+            additive_localization_implementation_roles:
+              state?.additiveLocalizationPlan
+                ?.implementation_verification_roles ??
+              [],
+
+            additive_localization_policy_roles:
+              state?.additiveLocalizationPlan
+                ?.policy_roles ??
+              [],
+
+            additive_localization_plan_localization_authority:
+              state?.additiveLocalizationPlan
+                ?.localization_authority ??
+              false,
+
+            additive_localization_plan_mutation_authority:
+              state?.additiveLocalizationPlan
+                ?.mutation_authority ??
+              false,
+
+            anchor_frontier_protocol:
+              anchorFrontier.protocol,
+            anchor_frontier_status:
+              anchorFrontier.status,
+            anchor_frontier_reason:
+              anchorFrontier.reason,
+            anchor_frontier_route_anchor:
+              anchorFrontier.route_anchor,
+            anchor_frontier_candidate_files:
+              anchorFrontier.candidate_files,
+            anchor_frontier_search_complete:
+              anchorFrontier.search_complete,
+            anchor_frontier_search_truncated:
+              anchorFrontier.search_truncated,
+            anchor_frontier_inspection_truncated:
+              anchorFrontier.inspection_truncated,
+            anchor_frontier_owner:
+              anchorFrontier.owner,
+            anchor_frontier_owner_file:
+              anchorFrontier.owner_file,
+            anchor_frontier_owner_candidates:
+              anchorFrontier.owner_candidates,
+            anchor_frontier_localization_authority:
+              anchorFrontier.localization_authority,
+            anchor_frontier_mutation_authority:
+              anchorFrontier.mutation_authority,
+
+            host_resource_inventory_protocol:
+              hostResourceInventory.protocol,
+            host_resource_inventory_files:
+              hostResourceInventory.files.length,
+            host_resource_inventory_complete:
+              hostResourceInventory.complete,
+            host_resource_inventory_truncated:
+              hostResourceInventory.truncated,
+            host_resource_inventory_timed_out:
+              hostResourceInventory.timed_out,
+            host_resource_inventory_cache_hit:
+              hostResourceInventory.cache_hit,
+
+            host_resource_closure_protected_surface:
+              hostResourceClosure.protected_surface,
+            host_resource_closure_ui_candidate:
+              hostResourceClosure.ui_candidate,
+            host_resource_closure_navigation_candidate:
+              hostResourceClosure.navigation_candidate,
+            host_resource_closure_structurally_ready:
+              hostResourceClosure.structurally_ready,
+            host_resource_closure_structurally_missing:
+              hostResourceClosure.structurally_missing,
+            host_resource_closure_semantically_ready:
+              hostResourceClosure.semantically_ready,
+            host_resource_closure_positive_complete:
+              hostResourceClosure.positive_complete,
+
+            host_obligation_projector_protocol:
+              hostObligationProjection
+                .protocol,
+
+            host_obligation_projector_status:
+              hostObligationProjection
+                .status,
+
+            host_obligation_projector_proofs:
+              hostObligationProjection
+                .proofs
+                .map(
+                  (item) =>
+                    item.obligation,
+                ),
+
+            task_bound_host_evidence_protocol:
+              taskBoundHostEvidence
+                .protocol,
+
+            task_bound_host_evidence_status:
+              taskBoundHostEvidence
+                .status,
+
+            task_bound_host_evidence:
+              taskBoundHostEvidence
+                .evidence
+                .map(
+                  (item) => ({
+                    role:
+                      item.role,
+
+                    tier:
+                      item.tier,
+
+                    ambiguous:
+                      item.ambiguous ===
+                      true,
+
+                    localization_authority:
+                      item.localization_authority ===
+                      true,
+
+                    mutation_authority:
+                      item.mutation_authority ===
+                      true,
+                  }),
+                ),
+
+            task_role_evidence_merge_status:
+              mergedRoleEvidence
+                .status,
+
+            task_role_evidence_merge_truncated:
+              mergedRoleEvidence
+                .truncated ===
+              true,
+
+            task_role_evidence_roles:
+              mergedRoleEvidence
+                .evidence
+                .map(
+                  (item) =>
+                    item.role,
+                ),
+
+
+            host_resource_closure_protocol:
+              hostResourceClosure.protocol,
+            host_resource_closure_status:
+              hostResourceClosure.status,
+            host_resource_aliases:
+              (
+                hostResourceClosure
+                  .aliases ??
+                []
+              )
+                .map(
+                  (item) => ({
+                    logical_node:
+                      item.logical_node,
+                    physical_node:
+                      item.physical_node,
+                    physical_file:
+                      item.physical_file,
+                    resource_root:
+                      item.resource_root,
+                    proof:
+                      item.proof,
+                  }),
+                )
+                .slice(
+                  0,
+                  16,
+                ),
+            host_resource_followup_files:
+              hostResourceClosure
+                .followup_files ??
+              [],
+            host_resource_followup_truncated:
+              hostResourceClosure
+                .followup_truncated ===
+              true,
+            navigation_reverse_protocol:
+              navigationReverseDiscovery
+                .protocol,
+
+            navigation_reverse_target_literals:
+              navigationReverseDiscovery
+                .target_literals,
+
+            navigation_reverse_candidate_files:
+              navigationReverseDiscovery
+                .candidate_files,
+
+            navigation_reverse_search_complete:
+              navigationReverseDiscovery
+                .search_complete,
+
+            navigation_reverse_search_truncated:
+              navigationReverseDiscovery
+                .search_truncated,
+
+            navigation_reverse_elapsed_ms:
+              navigationReverseDiscovery
+                .elapsed_ms,
+
+            navigation_reverse_framework_files_scanned:
+              navigationReverseFramework
+                .filesScanned,
+
+            navigation_reverse_framework_skipped_files:
+              navigationReverseFramework
+                .skippedFiles,
+
+            navigation_reverse_framework_edges_validated:
+              navigationReverseFramework
+                .validatedEdges,
+
+            navigation_reverse_framework_edges_rejected:
+              navigationReverseFramework
+                .rejectedEdges,
+
+            navigation_reverse_framework_truncated:
+              navigationReverseFramework
+                .truncated ===
+              true,
+
+            host_resource_followup_framework_files_scanned:
+              hostResourceClosure
+                .framework_files_scanned ??
+              0,
+            host_resource_followup_framework_edges_validated:
+              hostResourceClosure
+                .framework_edges_validated ??
+              0,
+            host_resource_followup_resource_files_scanned:
+              hostResourceClosure
+                .resource_files_scanned ??
+              0,
+            host_resource_followup_resource_edges_validated:
+              hostResourceClosure
+                .resource_edges_validated ??
+              0,
+            host_resource_closure_localization_authority:
+              hostResourceClosure
+                .localization_authority,
+            host_resource_closure_mutation_authority:
+              hostResourceClosure
+                .mutation_authority,
+
+            host_integration_shadow_protocol:
+              hostIntegrationShadow.protocol ??
+              HOST_INTEGRATION_SHADOW_PROTOCOL,
+            host_integration_shadow_authority:
+              hostIntegrationShadow.authority,
+            host_integration_shadow_status:
+              hostIntegrationShadow.status,
+            host_integration_shadow_reason:
+              hostIntegrationShadow.reason,
+            host_integration_shadow_localization_authority:
+              hostIntegrationShadow.localization_authority,
+            host_integration_shadow_mutation_authority:
+              hostIntegrationShadow.mutation_authority,
+
+            host_obligation_spec_status:
+              hostIntegrationShadow
+                .obligation_spec
+                ?.status ??
+              null,
+            host_obligation_spec_positive:
+              (
+                hostIntegrationShadow
+                  .obligation_spec
+                  ?.positive_specs ??
+                []
+              )
+                .map(
+                  (item) =>
+                    item.obligation,
+                )
+                .slice(
+                  0,
+                  16,
+                ),
+            host_obligation_spec_protected_anchor_status:
+              hostIntegrationShadow
+                .obligation_spec
+                ?.protected_anchor_status ??
+              null,
+            host_obligation_spec_protected_routes:
+              (
+                hostIntegrationShadow
+                  .obligation_spec
+                  ?.protected_route_candidates ??
+                []
+              )
+                .map(
+                  (item) =>
+                    item.value,
+                )
+                .slice(
+                  0,
+                  8,
+                ),
+
+            host_graph_view_validated_edges:
+              hostIntegrationShadow
+                .graph_views
+                ?.validated_edge_count ??
+              0,
+            host_graph_view_rejected_edges:
+              hostIntegrationShadow
+                .graph_views
+                ?.rejected_edge_count ??
+              0,
+            host_graph_view_truncated:
+              hostIntegrationShadow
+                .graph_views
+                ?.truncated ===
+              true,
+
+            host_protected_surface:
+              hostIntegrationShadow
+                .bindings
+                ?.protected_surface
+                ? {
+                    status:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .status,
+
+                    route_anchor:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .route_anchor ??
+                      null,
+
+                    owner:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .owner ??
+                      null,
+
+                    owner_candidates:
+                      (
+                        hostIntegrationShadow
+                          .bindings
+                          .protected_surface
+                          .owner_candidates ??
+                        []
+                      ).slice(
+                        0,
+                        8,
+                      ),
+
+                    structural_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .structural_ready ===
+                      true,
+
+                    semantic_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .semantic_ready ===
+                      true,
+
+                    reason:
+                      hostIntegrationShadow
+                        .bindings
+                        .protected_surface
+                        .reason,
+                  }
+                : null,
+
+            host_ui_candidate:
+              hostIntegrationShadow
+                .bindings
+                ?.ui_host
+                ? {
+                    status:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .status,
+
+                    owner:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .owner ??
+                      null,
+
+                    resource:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .resource ??
+                      null,
+
+                    candidates:
+                      (
+                        hostIntegrationShadow
+                          .bindings
+                          .ui_host
+                          .candidates ??
+                        []
+                      ).slice(
+                        0,
+                        8,
+                      ),
+
+                    structural_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .structural_ready ===
+                      true,
+
+                    semantic_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .semantic_ready ===
+                      true,
+
+                    reason:
+                      hostIntegrationShadow
+                        .bindings
+                        .ui_host
+                        .reason,
+                  }
+                : null,
+
+            host_navigation_candidate:
+              hostIntegrationShadow
+                .bindings
+                ?.navigation_host
+                ? {
+                    status:
+                      hostIntegrationShadow
+                        .bindings
+                        .navigation_host
+                        .status,
+
+                    resource:
+                      hostIntegrationShadow
+                        .bindings
+                        .navigation_host
+                        .resource ??
+                      null,
+
+                    candidates:
+                      (
+                        hostIntegrationShadow
+                          .bindings
+                          .navigation_host
+                          .candidates ??
+                        []
+                      ).slice(
+                        0,
+                        8,
+                      ),
+
+                    structural_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .navigation_host
+                        .structural_ready ===
+                      true,
+
+                    semantic_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .navigation_host
+                        .semantic_ready ===
+                      true,
+
+                    reason:
+                      hostIntegrationShadow
+                        .bindings
+                        .navigation_host
+                        .reason,
+                  }
+                : null,
+
+            host_data_access_candidate:
+              hostIntegrationShadow
+                .bindings
+                ?.data_access_capability
+                ? {
+                    status:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .status,
+
+                    candidate:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .candidate ??
+                      null,
+
+                    candidates:
+                      (
+                        hostIntegrationShadow
+                          .bindings
+                          .data_access_capability
+                          .candidates ??
+                        []
+                      ).slice(
+                        0,
+                        8,
+                      ),
+
+                    source_identity_status:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .source_identity_status,
+
+                    structural_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .structural_ready ===
+                      true,
+
+                    semantic_ready:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .semantic_ready ===
+                      true,
+
+                    reason:
+                      hostIntegrationShadow
+                        .bindings
+                        .data_access_capability
+                        .reason,
+                  }
+                : null,
+
+            host_shadow_coverage_status:
+              hostIntegrationShadow
+                .coverage
+                ?.status ??
+              null,
+            host_shadow_coverage_structurally_ready:
+              hostIntegrationShadow
+                .coverage
+                ?.structurally_ready ??
+              [],
+            host_shadow_coverage_structurally_missing:
+              hostIntegrationShadow
+                .coverage
+                ?.structurally_missing ??
+              [],
+            host_shadow_coverage_semantically_ready:
+              hostIntegrationShadow
+                .coverage
+                ?.semantically_ready ??
+              [],
+            host_shadow_coverage_semantic_blockers:
+              (
+                hostIntegrationShadow
+                  .coverage
+                  ?.semantic_blockers ??
+                []
+              ).slice(
+                0,
+                16,
+              ),
+            host_shadow_coverage_positive_complete:
+              hostIntegrationShadow
+                .coverage
+                ?.positive_complete ===
+              true,
+
+            task_causal_shadow_protocol:
+              taskCausalShadow.protocol ??
+              TASK_CAUSAL_SHADOW_PROTOCOL,
+            task_causal_shadow_authority:
+              taskCausalShadow.authority,
+            task_causal_shadow_localization_authority:
+              taskCausalShadow
+                .localization_authority,
+            task_causal_shadow_mutation_authority:
+              taskCausalShadow
+                .mutation_authority,
+            task_causal_shadow_status:
+              taskCausalShadow.status,
+            task_causal_shadow_seed_count:
+              taskCausalShadow.seed_count,
+
+            task_causal_shadow_bound_nodes:
+              (
+                taskCausalShadow
+                  .bound_anchors ??
+                []
+              )
+                .map(
+                  (item) =>
+                    item.node,
+                )
+                .slice(
+                  0,
+                  16,
+                ),
+
+            task_causal_shadow_unbound_anchors:
+              (
+                taskCausalShadow
+                  .unbound_anchors ??
+                []
+              )
+                .map(
+                  (item) => ({
+                    kind:
+                      item.kind,
+                    value:
+                      item.value,
+                    reason:
+                      item.reason,
+                  }),
+                )
+                .slice(
+                  0,
+                  16,
+                ),
+
+            task_causal_shadow_ambiguous_anchors:
+              (
+                taskCausalShadow
+                  .ambiguous_anchors ??
+                []
+              ).slice(
+                0,
+                8,
+              ),
+
+            task_causal_shadow_reached_nodes:
+              (
+                taskCausalShadow
+                  .closure?.nodes ??
+                []
+              )
+                .map(
+                  (item) =>
+                    item.id,
+                )
+                .slice(
+                  0,
+                  TASK_CAUSAL_SHADOW_MAX_NODES,
+                ),
+
+            task_causal_shadow_edges_considered:
+              taskCausalShadow
+                .closure
+                ?.edges_considered ??
+              0,
+
+            task_causal_shadow_truncated:
+              taskCausalShadow
+                .closure
+                ?.truncated ===
+              true,
             scout_handoff_protocol: scoutHandoff?.protocol ?? SCOUT_HANDOFF_PROTOCOL,
             scout_handoff_path: scoutHandoff?.path ?? null,
             scout_handoff_status: scoutHandoff?.status ?? null,

@@ -1,1478 +1,1573 @@
-          let focusedScopeCandidates = null
-          let focusedSelectedScopes = null
-          let focusedReusedScopes = null
-          let focusedFullScopes = null
-          let focusedPartialScopes = null
-          let focusedRadius = null
-          let focusedCanonicalSavedBytes = null
-          let focusedFacts = new Set()
-          let focusedContextualizedHitLines = new Set()
 
-          focusedCandidate =
-            selectedScanComplete &&
-            selectedEvidenceComplete &&
-            hits.size > 0 &&
-            hits.size <= FOCUSED_PROBE_MAX_LINE_HITS &&
-            pressure.maxHitsPerFile <= FOCUSED_PROBE_MAX_HITS_PER_FILE &&
-            spansComplete &&
-            distillInput.length > 0 &&
-            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
+export default {
+  id: "cpu-agent.global",
 
-          const shouldDistill = pressure.active || focusedCandidate
+  setup: async (ctx) => {
+    const registrations = []
+    const track = async (registrationPromise) => {
+      registrations.push(await registrationPromise)
+    }
 
-          if (!selectedScanComplete) distillReason = "selected_scan_incomplete"
-          else if (!shouldDistill) distillReason = "not_needed"
-          else if (!spansComplete) distillReason = "span_capture_incomplete"
-          else if (distillInput.length < 1) distillReason = "no_exact_spans"
-          else {
-            distillAttempted = true
+    const unsubscribeEvents = await subscribeEvents(ctx)
 
-            const distill = await runDistiller(root, distillInput)
-            distillElapsedMs = distill.elapsedMs
+    const executeCapabilityMutationCore = async (
+      rawInput,
+      toolContext,
+      forcedKind,
+      toolName,
+      dispatch = null,
+    ) => {
+      const input = {
+        ...(rawInput ?? {}),
+        kind: forcedKind,
+      }
+        const dispatchOrigin =
+        dispatch?.origin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? ACTION_COMMIT_DISPATCH_ORIGIN
+          : "model_tool"
+      const actionCommit =
+        dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN
+          ? dispatch?.actionCommit ?? null
+          : null
+      const started = performance.now()
+        const sessionID =
+          typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
+            ? toolContext.sessionID
+            : null
+        const state = getSessionState(sessionID)
+        const root = await rootForTool(ctx, toolContext, sessionID, state)
+        const runtimeIdentity = await runtimeStackIdentity()
 
-            if (!distill.ok) {
-              distillReason = distill.reason
-              if (focusedCandidate) focusedReason = `distill_${distill.reason}`
-              distillIrComplete = distill.response?.ir_complete ?? false
-              distillWitnessComplete = distill.response?.witness_complete ?? false
-              v2GroupingPreserved = distill.response?.v2_grouping_preserved ?? null
-            } else {
-              distillIrComplete = true
-              distillWitnessComplete = true
-              v2GroupingPreserved = true
-              distillGroupsForIndex = distill.response.groups
-              variantDiversity = Number.isFinite(distill.response?.variant_diversity)
-                ? distill.response.variant_diversity
-                : null
-              distillerElapsedMs = Number.isFinite(distill.response?.elapsed_ms)
-                ? distill.response.elapsed_ms
-                : null
+        const trace = async (record) => {
+          await writeProjectTrace(root, "executor-trace.jsonl", {
+            ts: nowMs(),
+            protocol: EXECUTION_LOOP_PROTOCOL,
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            mutation_attempt: state?.mutationAttempts ?? null,
+            repair_attempts: state?.repairAttempts ?? null,
+            compiler_runs: state?.compilerRuns ?? null,
+            patch_attempt: state?.patchAttempts ?? null,
+            executor_runs: state?.executorRuns ?? null,
+            executed_patches: state?.executedPatches ?? null,
+            turn_model_calls: state?.modelCalls ?? null,
+            scout_handoff_path: state?.scoutHandoffPath ?? null,
+            edit_capsule_path: state?.editCapsulePath ?? null,
+            bound_mutation_target: state?.boundMutationTarget ?? null,
+            preauthorized_mutation_candidates:
+              state?.localMutationCandidates?.length ?? 0,
+            execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_state: state?.executionState ?? null,
+            execution_reason: state?.executionReason ?? null,
+            mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
+            mutation_tool: toolName,
+            semantic_kind: forcedKind,
+            mutation_dispatch_origin: dispatchOrigin,
+            action_commit_protocol: actionCommit?.protocol ?? null,
+            action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+            tool_contract_failures: state?.contractFailures ?? null,
+            ...runtimeIdentity,
+            ...record,
+            tool_elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+          })
+        }
 
-              const hybridRendered = await renderHybridEvidence(
-                root,
-                distill.response.groups,
-                bodyBudget,
-              )
-
-              hybridGroups = hybridRendered.shownGroups
-              hybridVariants = hybridRendered.shownVariants
-              hybridBodyBytes = hybridRendered.bodyBytes
-              hybridCoreBytes = hybridRendered.coreBytes
-              hybridContextSamples = hybridRendered.contextSamples
-              hybridFacts = hybridRendered.facts ?? new Set()
-
-              if (!hybridRendered.complete) {
-                distillReason = hybridRendered.reason ?? "hybrid_render_incomplete"
-              } else {
-                const contextSampled = hybridRendered.contextSamples > 0
-                const publicHybridRepresentation = routingActive
-                  ? "ranked_hybrid"
-                  : "hybrid"
-                const hybridHeader = [
-                  `SEARCH representation=${publicHybridRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} selected_witnesses_complete=true context_complete=false context_sampled=${contextSampled} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} exact_matches=${distillInput.length} shown_hits=${hits.size} groups=${hybridRendered.shownGroups} variants=${hybridRendered.shownVariants}`,
-                  ...querySummary,
-                ]
-
-                if (routingActive) {
-                  hybridHeader.push(
-                    `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
-                  )
-                }
-
-                const hybridContent = [
-                  ...hybridHeader,
-                  ...(routeRendered.body.length > 0
-                    ? ["", ...routeRendered.body]
-                    : []),
-                  "",
-                  ...hybridRendered.body,
-                ].join("\n")
-                const hybridResultBytes = bytes(hybridContent)
-                hybridRatio = rawResultBytes > 0
-                  ? Math.round((hybridResultBytes / rawResultBytes) * 1000) / 1000
-                  : null
-
-                const materiallySmaller =
-                  rawResultBytes > 0 &&
-                  hybridResultBytes <= rawResultBytes * HYBRID_MIN_SAVINGS_RATIO
-
-                const hybridBeneficial =
-                  pressure.active &&
-                  (!selectedEvidenceComplete || materiallySmaller)
-
-                if (hybridResultBytes > callBudgetBytes) {
-                  distillReason = "hybrid_output_budget"
-                } else if (!hybridBeneficial) {
-                  distillReason = "no_material_size_reduction"
-                } else {
-                  representation = "hybrid"
-                  content = hybridContent
-                  resultBytes = hybridResultBytes
-                  bodyBytes = hybridRendered.bodyBytes
-                  shownHits = hits.size
-                  evidenceComplete = scanComplete && allDiscoveredFilesSelected
-                  complete = scanComplete && allDiscoveredFilesSelected
-                  distillReason = "selected"
-                }
-              }
-
-              if (representation !== "raw" && focusedCandidate) {
-                focusedReason = "superseded_by_hybrid"
-              }
-
-              if (representation === "raw" && focusedCandidate) {
-                focusedAttempted = true
-                const supplementBudget = Math.min(
-                  FOCUSED_SUPPLEMENT_MAX_BYTES,
-                  Math.max(0, bodyBudget - rawRendered.bodyBytes),
-                )
-                const focusedRendered = await renderFocusedSupplement(
-                  root,
-                  distill.response.groups,
-                  supplementBudget,
-                  hits,
-                  state?.evidenceLedger ?? null,
-                  state?.contextualizedHitLines ?? null,
-                )
-
-                focusedSupplementBytes = focusedRendered.bodyBytes
-                focusedScopeCandidates = focusedRendered.scopeCount
-                focusedSelectedScopes = focusedRendered.selectedScopeCount
-                focusedReusedScopes = focusedRendered.reusedScopeCount
-                focusedFullScopes = focusedRendered.fullScopes
-                focusedPartialScopes = focusedRendered.partialScopes
-                focusedRadius = focusedRendered.radius
-
-                if (!focusedRendered.complete) {
-                  focusedReason = focusedRendered.reason ?? "supplement_incomplete"
-                } else {
-                  const uncoveredHits = new Map(
-                    [...hits.entries()].filter(
-                      ([key]) => !focusedRendered.coveredHitKeys.has(key),
-                    ),
-                  )
-                  const seenForRaw = new Set(state?.evidenceLedger ?? [])
-
-                  for (const fact of focusedRendered.facts ?? []) {
-                    seenForRaw.add(fact)
-                  }
-
-                  const rawRemainingBudget = Math.max(
-                    0,
-                    bodyBudget - focusedRendered.bodyBytes,
-                  )
-                  const rawUncovered = await renderNovelRawEvidence(
-                    root,
-                    uncoveredHits,
-                    rawRemainingBudget,
-                    seenForRaw,
-                    focusedRendered.coveredRangesByFile,
-                    state?.contextualizedHitLines ?? null,
-                  )
-                  const uncoveredComplete = [...uncoveredHits.entries()].every(
-                    ([key, hit]) =>
-                      rawUncovered.shown.has(key) ||
-                      hitFactsAlreadySeen(hit, state?.evidenceLedger),
-                  )
-
-                  if (!uncoveredComplete) {
-                    focusedReason = "canonical_raw_budget"
-                  } else {
-                    const focusedBody = []
-
-                    if (rawUncovered.body.length > 0) {
-                      focusedBody.push(...rawUncovered.body)
-                    }
-
-                    if (
-                      rawUncovered.body.length > 0 &&
-                      focusedRendered.body.length > 0
-                    ) {
-                      focusedBody.push("")
-                    }
-
-                    focusedBody.push(...focusedRendered.body)
-
-                    const shownNow = new Set([
-                      ...rawUncovered.shown,
-                      ...focusedRendered.shownHitKeys,
-                    ])
-                    const priorHits = countHitsAlreadySeen(
-                      hits,
-                      state?.evidenceLedger,
-                    )
-                    const publicFocusedRepresentation = routingActive
-                      ? "ranked_focused"
-                      : "focused"
-                    const focusedHeader = [
-                      `SEARCH representation=${publicFocusedRepresentation} complete=${scanComplete && allDiscoveredFilesSelected} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${scanComplete && allDiscoveredFilesSelected} selected_evidence_complete=true matches_complete=${scanComplete} context_complete=false context_mode=scope_guided_dedup candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${shownNow.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawUncovered.skippedPriorLines > 0} full_scopes=${focusedRendered.fullScopes} partial_scopes=${focusedRendered.partialScopes}`,
-                      ...querySummary,
-                    ]
-
-                    if (routingActive) {
-                      focusedHeader.push(
-                        `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete" : !allDiscoveredFilesProbed ? "probe_subset" : "budgeted_emit_subset"}`,
-                      )
-                    }
-                    const focusedContent = [
-                      ...focusedHeader,
-                      ...(routeRendered.body.length > 0
-                        ? ["", ...routeRendered.body]
-                        : []),
-                      "",
-                      ...focusedBody,
-                    ].join("\n")
-                    const focusedResultBytes = bytes(focusedContent)
-
-                    const focusedCostLimit = Math.min(
-                      rawResultBytes + FOCUSED_MAX_OVERHEAD_BYTES,
-                      Math.ceil(rawResultBytes * FOCUSED_MAX_OVERHEAD_RATIO),
-                    )
-                    const focusedCostAccepted =
-                      focusedResultBytes <= focusedCostLimit
-
-                    if (focusedResultBytes > callBudgetBytes) {
-                      focusedReason = "focused_output_budget"
-                    } else if (!focusedCostAccepted) {
-                      focusedReason = "cost_guard"
-                    } else {
-                      representation = "focused"
-                      content = focusedContent
-                      resultBytes = focusedResultBytes
-                      bodyBytes =
-                        rawUncovered.bodyBytes + focusedRendered.bodyBytes
-                      shownHits = shownNow.size
-                      evidenceComplete = scanComplete && allDiscoveredFilesSelected
-                      complete = scanComplete && allDiscoveredFilesSelected
-                      distillReason = "ir_complete"
-                      focusedReason = "selected"
-                      focusedFacts = new Set([
-                        ...rawUncovered.facts,
-                        ...focusedRendered.facts,
-                      ])
-                      focusedContextualizedHitLines =
-                        focusedRendered.contextualizedHitLines
-                      focusedCanonicalSavedBytes = Math.max(
-                        0,
-                        rawRendered.bodyBytes +
-                          focusedRendered.bodyBytes -
-                          bodyBytes,
-                      )
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-
-          // Dense evidence that cannot fit RAW is routed one level deeper
-          // inside the selected file(s). This is intentionally sampled and
-          // marked incomplete, but it gives the model concrete function/scope
-          // context without forcing an INDEX -> model -> narrower-search loop.
-          if (
-            representation === "raw" &&
-            selectedScanComplete &&
-            !selectedEvidenceComplete &&
-            Array.isArray(distillGroupsForIndex) &&
-            distillGroupsForIndex.length > 0
-          ) {
-            regionAttempted = true
-            const regionRendered = await renderRegionEvidence(
-              root,
-              distillGroupsForIndex,
-              bodyBudget,
-              hits,
-            )
-
-            regionReason = regionRendered.reason ?? "selected"
-            regionScopes = regionRendered.scopeCount
-            regionSampledScopes = regionRendered.sampledScopes
-            regionSampledHits = regionRendered.sampledHits
-            regionRetainedHits = regionRendered.retainedHits
-
-            if (regionRendered.complete) {
-              const publicRegionRepresentation = routingActive
-                ? "ranked_region"
-                : "region"
-              const regionHeader = [
-                `SEARCH representation=${publicRegionRepresentation} complete=false scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=false selected_evidence_complete=false matches_complete=${scanComplete} region_sampled=true refinement_required=false candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} sampled_hits=${regionRendered.sampledHits} retained_hits=${regionRendered.retainedHits} scopes=${regionRendered.sampledScopes}`,
-                ...querySummary,
-                `EVIDENCE_SAMPLED reason=dense_region_router exact_match_locations_preserved=true`,
-              ]
-
-              if (routingActive) {
-                regionHeader.push(
-                  `INCOMPLETE reasons=${!discoveryComplete ? "lexical_discovery_incomplete,region_sampled" : !allDiscoveredFilesProbed ? "probe_subset,region_sampled" : "budgeted_emit_subset,region_sampled"}`,
-                )
-              } else {
-                regionHeader.push("INCOMPLETE reasons=region_sampled")
-              }
-
-              const regionContent = [
-                ...regionHeader,
-                ...(routeRendered.body.length > 0
-                  ? ["", ...routeRendered.body]
-                  : []),
-                "",
-                ...regionRendered.body,
-              ].join("\n")
-              const regionResultBytes = bytes(regionContent)
-
-              if (regionResultBytes <= callBudgetBytes) {
-                representation = "region"
-                content = regionContent
-                resultBytes = regionResultBytes
-                bodyBytes = regionRendered.bodyBytes
-                shownHits = regionRendered.sampledHits
-                evidenceComplete = false
-                complete = false
-                refinementRequired = false
-                regionReason = "selected"
-                regionFacts = regionRendered.facts ?? new Set()
-              } else {
-                regionReason = "region_output_budget"
-              }
-            }
-          }
-
-          // INDEX is not a compressed substitute for code evidence. It is a
-          // bounded routing map used only when the normal evidence cannot be
-          // complete. It tells the model where to refine and explicitly
-          // forbids absence conclusions from an incomplete discovery.
-          if (
-            representation === "raw" &&
-            !routingActive &&
-            (!scanComplete || !selectedEvidenceComplete)
-          ) {
-            const indexRendered = renderSearchIndex(
-              results,
-              distillGroupsForIndex,
-              bodyBudget,
-            )
-
-            const lineDiscoveryComplete = scanComplete
-            const absenceNotProven = !lineDiscoveryComplete
-            const indexHeader = [
-              `SEARCH representation=index complete=false scan_complete=${scanComplete} evidence_complete=false index_render_complete=${indexRendered.complete} refinement_required=true absence_not_proven=${absenceNotProven} collected_line_hits=${hits.size} exact_matches=${exactSpanHits} indexed_files=${indexRendered.fileCount}`,
-              ...querySummary,
-              `REFINE_REQUIRED action=prefer_route_match_or_narrow_file routing=match_facets`,
-            ]
-
-            if (absenceNotProven) {
-              indexHeader.push(
-                "ABSENCE_NOT_PROVEN reason=line_scan_incomplete do_not_conclude_no_other_matches",
-              )
-              indexReason = "line_scan_incomplete"
-            } else {
-              indexHeader.push(
-                "EVIDENCE_SUMMARIZED reason=raw_output_budget inspect_focused_evidence_before_code_level_conclusions",
-              )
-              indexReason = "raw_output_budget"
-            }
-
-            const indexContent = [
-              ...indexHeader,
-              "",
-              ...indexRendered.body,
-            ].join("\n")
-            const indexResultBytes = bytes(indexContent)
-
-            if (indexResultBytes <= callBudgetBytes) {
-              representation = "index"
-              content = indexContent
-              resultBytes = indexResultBytes
-              bodyBytes = indexRendered.bodyBytes
-              shownHits = indexRendered.sampleCount
-              evidenceComplete = false
-              complete = false
-              refinementRequired = true
-              indexRenderComplete = indexRendered.complete
-              indexFiles = indexRendered.fileCount
-              indexSamples = indexRendered.sampleCount
-              indexStructuralGroups = indexRendered.structuralGroupsShown
-              indexDiscriminativeFacets =
-                indexRendered.discriminativeFacetsShown
-              indexFacts = indexRendered.facts ?? new Set()
-            }
-          }
-
-          // Final RAW packing is turn-aware. Prior source/context remains in
-          // conversation history, so only novel lines or newly-matched spans
-          // need to be emitted again.
-          let rawNovelFacts = new Set()
-          let rawNovelEmittedLines = null
-          let rawPriorHits = null
-          let rawSkippedPriorLines = null
-          let rawSuppressedContextAnchors = null
-
-          if (representation === "raw") {
-            const rawNovel = await renderNovelRawEvidence(
-              root,
-              hits,
-              bodyBudget,
-              state?.evidenceLedger ?? null,
-              new Map(),
-              state?.contextualizedHitLines ?? null,
-            )
-            const priorHits = countHitsAlreadySeen(
-              hits,
-              state?.evidenceLedger,
-            )
-            const accountedHits = [...hits.entries()].every(
-              ([key, hit]) =>
-                rawNovel.shown.has(key) ||
-                hitFactsAlreadySeen(hit, state?.evidenceLedger),
-            )
-            const selectedTurnEvidenceComplete =
-              selectedEvidenceComplete && accountedHits
-            const turnEvidenceComplete =
-              scanComplete &&
-              allDiscoveredFilesSelected &&
-              selectedTurnEvidenceComplete
-            const turnComplete = scanComplete && turnEvidenceComplete
-            const rawNovelReasons = []
-
-            if (!discoveryComplete) {
-              rawNovelReasons.push("lexical_discovery_incomplete")
-            } else if (!allDiscoveredFilesProbed) {
-              rawNovelReasons.push("probe_subset")
-            } else if (!selectedScanComplete) {
-              rawNovelReasons.push("scan_incomplete")
-            } else if (!allDiscoveredFilesSelected) {
-              rawNovelReasons.push("budgeted_emit_subset")
-            }
-            if (!selectedTurnEvidenceComplete) {
-              rawNovelReasons.push("output_budget")
-            }
-
-            const publicRawRepresentation = routingActive
-              ? "ranked_raw"
-              : "raw"
-            const rawNovelHeader = [
-              `SEARCH representation=${publicRawRepresentation} complete=${turnComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${turnEvidenceComplete} selected_evidence_complete=${selectedTurnEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawNovel.shown.size} prior_hits=${priorHits} prior_evidence_reused=${priorHits > 0 || rawNovel.skippedPriorLines > 0}`,
-              ...querySummary,
-            ]
-
-            if (rawNovelReasons.length) {
-              rawNovelHeader.push(
-                `INCOMPLETE reasons=${rawNovelReasons.join(",")}`,
-              )
-            }
-
-            const rawNovelContent = [
-              ...rawNovelHeader,
-              ...(routeRendered.body.length > 0
-                ? ["", ...routeRendered.body]
-                : []),
-              "",
-              ...rawNovel.body,
-            ].join("\n")
-            const rawNovelResultBytes = bytes(rawNovelContent)
-
-            if (rawNovelResultBytes <= callBudgetBytes) {
-              content = rawNovelContent
-              resultBytes = rawNovelResultBytes
-              bodyBytes = rawNovel.bodyBytes
-              shownHits = rawNovel.shown.size
-              evidenceComplete = turnEvidenceComplete
-              complete = turnComplete
-              rawNovelFacts = rawNovel.facts
-              rawNovelEmittedLines = rawNovel.emittedLines
-              rawPriorHits = priorHits
-              rawSkippedPriorLines = rawNovel.skippedPriorLines
-              rawSuppressedContextAnchors =
-                rawNovel.suppressedContextAnchors
-            } else {
-              // Safe fallback: the original bounded RAW body is already known
-              // to fit. Positive hit facts are still ledgered; context-line
-              // dedup simply becomes conservative for this one result.
-              rawNovelFacts = positiveFactsForHits(hits)
-            }
-          }
-
-          const sourceRepresentation = representation
-          const finalFacts = new Set()
-
-          if (representation === "raw") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of rawNovelFacts) finalFacts.add(fact)
-          } else if (representation === "focused") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of focusedFacts) finalFacts.add(fact)
-          } else if (representation === "hybrid") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of hybridFacts) finalFacts.add(fact)
-          } else if (representation === "region") {
-            for (const fact of positiveFactsForHits(hits)) finalFacts.add(fact)
-            for (const fact of regionFacts) finalFacts.add(fact)
-          } else if (representation === "index") {
-            for (const fact of indexFacts) finalFacts.add(fact)
-          }
-
-          for (const fact of negativeFactsForDiscoveryResults(
-            discoveryResults,
-            target,
-            glob,
-          )) {
-            finalFacts.add(fact)
-          }
-
-          for (const fact of impactEvidenceFactsForSelected(selectedFiles)) {
-            finalFacts.add(fact)
-          }
-
-          const routeFacts = routeFactsForRanking(
-            rankedFiles,
-            selectedLexicalFileSet,
-            discoveryComplete,
-            target,
-            glob,
+        if (!root || !state) {
+          await trace({ admitted: false, reason: "session_root_unavailable", action: "stop" })
+          return { content: "PATCH_STOP reason=session_root_unavailable action=report_blocked" }
+        }
+        if (
+          dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+          (
+            actionCommit?.protocol !== ACTION_COMMIT_PROTOCOL ||
+            actionCommit?.operation !== "rename_symbol" ||
+            actionCommit?.tool !== toolName ||
+            actionCommit?.task_sha256 !== state.taskTextSha256 ||
+            actionCommit?.new_name !== rawInput?.new_name ||
+            actionCommit?.old_name !==
+              state?.renameMutationCapability?.target?.symbol_name ||
+            actionCommit?.scout_handoff_path !== state.scoutHandoffPath ||
+            actionCommit?.target_identity_sha256 !==
+              state?.renameMutationCapability?.targetIdentitySha256 ||
+            actionCommit?.target_source_sha256 !==
+              state?.renameMutationCapability?.targetSourceSha256 ||
+            actionCommit?.commit_sha256 !== state.actionCommitSha256
           )
-          const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
-          const novelty = novelEvidenceFacts(state, finalFacts)
-          const routeNovelty = novelRouteFacts(state, routeFacts)
-          const meaningfulRouteProgress =
-            routingActive && routeNovelty.novel.size > 0
-          const novelFactStats = summarizeEvidenceFacts(novelty.novel)
-          let ledgerFactsAdded = 0
-          let routeFactsAdded = 0
-          let noProgress = false
-          let noProgressBlocked = false
-
-          const priorEvidenceReused = novelty.prior > 0
-          const noMeaningfulProgress =
-            novelty.novel.size < 1 && !meaningfulRouteProgress
-
-          if (state && noMeaningfulProgress) {
-            state.consecutiveNoProgress += 1
-            noProgress = true
-            noProgressBlocked =
-              state.consecutiveNoProgress >= MAX_CONSECUTIVE_NO_PROGRESS
-
-            const noProgressReason = priorEvidenceReused
-              ? "evidence_already_seen"
-              : "evidence_unavailable"
-
-            if (noProgressBlocked) {
-              content =
-                `SEARCH_BLOCKED reason=no_progress_loop ` +
-                `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
-                `action=use_prior_or_change_search_dimension`
-            } else {
-              content =
-                `SEARCH_NO_PROGRESS reason=${noProgressReason} ` +
-                `source_representation=${sourceRepresentation} ` +
-                `prior_evidence_reused=${priorEvidenceReused} no_progress_streak=${state.consecutiveNoProgress} ` +
-                `action=use_prior_or_change_search_dimension`
-            }
-
-            representation = "no_progress"
-            resultBytes = bytes(content)
-            bodyBytes = 0
-            shownHits = 0
-          } else if (state) {
-            state.consecutiveNoProgress = 0
-            const remembered = rememberEvidenceFacts(state, finalFacts)
-            const rememberedRoutes = rememberRouteFacts(state, routeFacts)
-            ledgerFactsAdded = remembered.added
-            routeFactsAdded = rememberedRoutes.added
-
-            if (sourceRepresentation === "focused") {
-              rememberContextualizedHitLines(
-                state,
-                focusedContextualizedHitLines,
-              )
-            }
+        ) {
+          applyExecutionEvent(state, "fatal", "action_commit_stale")
+          await trace({ admitted: false, reason: "action_commit_stale", action: "stop" })
+          return {
+            content: "PATCH_STOP reason=action_commit_stale action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "action_commit_stale",
+            },
           }
+        }
 
-          if (
-            !noProgress &&
-            routingActive &&
-            (representation === "raw" ||
-              representation === "focused" ||
-              representation === "hybrid" ||
-              representation === "region")
-          ) {
-            representation = `ranked_${representation}`
+        const exactTaskRename =
+          state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
+          state?.taskAction?.status === "exact" &&
+          state?.taskAction?.operation === "rename_symbol" &&
+          state?.taskAction?.task_sha256 === state?.taskTextSha256
+
+        if (
+          forcedKind === "rename_symbol" &&
+          exactTaskRename &&
+          rawInput?.new_name !== state.taskAction.new_name
+        ) {
+          applyExecutionEvent(state, "fatal", "task_action_argument_mismatch")
+          await trace({
+            admitted: false,
+            reason: "task_action_argument_mismatch",
+            action: "stop",
+          })
+          return {
+            content:
+              "PATCH_STOP reason=task_action_argument_mismatch " +
+              "action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "task_action_argument_mismatch",
+            },
           }
-
-          if (state) {
-            state.evidenceBytes += resultBytes
-            state.lastSeen = nowMs()
+        }
+        if (!toolAllowedForExecutionState(state, toolName)) {
+          const next = nextActionForExecutionState(state)
+          const action = state.executionState === EXEC_STATE_LOCATE ? "rescout" : "stop"
+          await trace({ admitted: false, reason: "causal_frontier", action, execution_state: state.executionState })
+          return {
+            content: `${action === "rescout" ? "PATCH_RESCOUT" : "PATCH_STOP"} reason=causal_frontier state=${state.executionState} action=${next}`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action,
+              reason: "causal_frontier",
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              next_action: next,
+            },
           }
+        }
+        if (!state.scoutHandoffPath) {
+          applyExecutionEvent(state, "patch_rescout", "scout_handoff_missing", { reason: "scout_handoff_missing" })
+          await trace({ admitted: false, reason: "scout_handoff_missing", action: "rescout" })
+          return {
+            content: "PATCH_RESCOUT reason=scout_handoff_missing action=search_first",
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "scout_handoff_missing" },
+          }
+        }
+        if (state.patchAccepted) {
+          applyExecutionEvent(state, "patch_ready", "patch_already_accepted")
+          await trace({ admitted: false, reason: "patch_already_accepted", action: "stop", receipt_path: state.patchReceiptPath })
+          return {
+            content: `PATCH_STOP reason=patch_already_accepted receipt=${state.patchReceiptPath ?? "unknown"} action=use_receipt`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "patch_already_accepted", receipt_path: state.patchReceiptPath },
+          }
+        }
+        if (state.mutationAttempts >= MAX_PATCH_ATTEMPTS_PER_TURN) {
+          applyExecutionEvent(state, "fatal", "mutation_attempt_budget")
+          await trace({
+            admitted: false,
+            reason: "mutation_attempt_budget",
+            action: "stop",
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_attempt_budget ` +
+              `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_attempt_budget",
+            },
+          }
+        }
 
-          const scoutHandoff = await updateScoutHandoff(root, sessionID, state, {
-            attemptIndex,
-            queries,
-            target,
-            glob,
-            representation,
-            sourceRepresentation,
-            selectedFiles,
-            hits,
-            discoveryComplete,
-            scanComplete,
-            selectedScanComplete,
-            evidenceComplete,
-            selectedEvidenceComplete,
-            refinementRequired,
-            retainedUnreadFiles: Math.max(0, rankedFiles.length - probeFileSet.size),
-            retainedUnemittedFiles: routeRendered.retained,
-            impactIndexCoverageComplete: impactIndexShadow.refreshComplete,
-            noProgress,
-            noProgressBlocked,
+        const forbiddenRawAuthorityField = [
+          "kind",
+          "file",
+          "symbol",
+          "scope",
+        ].find((field) => mutationFieldPresent(rawInput, field))
+
+        const shape = forbiddenRawAuthorityField
+          ? mutationShapeFailure(
+              forcedKind,
+              `action_tool_forbids_${forbiddenRawAuthorityField}`,
+            )
+          : validateMutationShape(input)
+
+        // Tool-schema/transport violations are not semantic patch attempts.
+        // With action-specific top-level required fields these should be
+        // unreachable under a conforming provider; if they reach runtime,
+        // fail closed without consuming the one semantic repair.
+        if (shape.ok !== true) {
+          state.contractFailures += 1
+          const repeated = state.contractFailureSignatures.has(shape.signature)
+          state.contractFailureSignatures.add(shape.signature)
+          applyExecutionEvent(state, "fatal", "tool_contract_violation")
+
+          await trace({
+            admitted: false,
+            failure_layer: "tool_contract",
+            reason: "tool_contract_violation",
+            contract_detail: shape.detail,
+            contract_signature: shape.signature,
+            repeated_contract_failure: repeated,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
           })
 
-          const mutationLocalization =
-            scoutMutationLocalizationEligibility(
+          return {
+            content:
+              `PATCH_STOP reason=tool_contract_violation ` +
+              `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `contract_failures=${state.contractFailures} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "tool_contract_violation",
+              detail: shape.detail,
+              failure_layer: "tool_contract",
+              semantic_attempt_consumed: false,
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        if (
+          state.activeMutationTool &&
+          state.activeMutationTool !== toolName
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_action_changed_during_attempt")
+          await trace({
+            admitted: false,
+            failure_layer: "orchestrator_contract",
+            reason: "mutation_action_changed_during_attempt",
+            previous_tool: state.activeMutationTool,
+            attempted_tool: toolName,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              `PATCH_STOP reason=mutation_action_changed_during_attempt ` +
+              `expected=${state.activeMutationTool} got=${toolName} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_action_changed_during_attempt",
+              failure_layer: "orchestrator_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        state.activeMutationTool = toolName
+
+        if (state.executionState === EXEC_STATE_REPAIR) {
+          state.repairAttempts += 1
+        }
+
+        state.mutationAttempts += 1
+        state.lastSeen = nowMs()
+
+        const authorization =
+          await materializeCapabilityBoundMutation(
+            root,
+            state,
+            input,
+          )
+
+        if (authorization.ok !== true) {
+          const reason =
+            typeof authorization.reason === "string"
+              ? authorization.reason
+              : "mutation_scope_unavailable"
+
+          const detail =
+            typeof authorization.detail === "string"
+              ? authorization.detail
+              : reason
+
+          const canRetryAuthorization =
+            authorization.repairable === true &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+
+          if (canRetryAuthorization) {
+            applyExecutionEvent(
               state,
-              scoutHandoff,
+              "patch_retry",
+              reason,
             )
 
-          // First reuse structural groups produced by the normal exact-span
-          // Evidence IR path, if available.
-          const existingExactStructuralGroups =
-            Array.isArray(distillGroupsForIndex) &&
-            distillGroupsForIndex.length > 0
-              ? distillGroupsForIndex
-              : null
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "retry",
+              compiler_run: false,
+              executor_run: false,
+            })
 
-          // If model-facing evidence did not need distillation, perform a
-          // separate strict exact-span probe solely for EditCapsule structural
-          // ownership. This closes the spansComplete=true / shouldDistill=false
-          // dead zone without changing search representation.
-          if (
-            mutationLocalization.eligible &&
-            !existingExactStructuralGroups &&
-            spansComplete &&
-            distillInput.length > 0 &&
-            distillInput.length <= FOCUSED_PROBE_MAX_EXACT_MATCHES
-          ) {
-            capsuleExactProbeAttempted = true
-
-            const exactProbe =
-              await runDistiller(root, distillInput)
-
-            capsuleExactProbeElapsedMs =
-              exactProbe.elapsedMs
-
-            if (
-              exactProbe.ok === true &&
-              exactProbe.response?.ir_complete === true &&
-              exactProbe.response?.location_complete === true &&
-              exactProbe.response?.anchor_complete === true &&
-              exactProbe.response?.witness_complete === true &&
-              exactProbe.response?.distill_complete === true &&
-              exactProbe.response?.truncated === false &&
-              Array.isArray(exactProbe.response?.groups) &&
-              exactProbe.response.groups.length > 0
-            ) {
-              capsuleExactProbeGroups =
-                exactProbe.response.groups
-              capsuleExactProbeReason =
-                "exact_structural_groups_observed"
-            } else {
-              capsuleExactProbeReason =
-                exactProbe.reason ??
-                "exact_structural_probe_rejected"
-            }
-          } else if (
-            !mutationLocalization.eligible
-          ) {
-            capsuleExactProbeReason =
-              mutationLocalization.reason
-          } else if (existingExactStructuralGroups) {
-            capsuleExactProbeReason =
-              "reused_existing_evidence_ir"
-          } else if (!spansComplete) {
-            capsuleExactProbeReason =
-              "exact_spans_incomplete"
-          } else if (distillInput.length < 1) {
-            capsuleExactProbeReason =
-              "no_exact_spans"
-          } else if (
-            distillInput.length >
-            FOCUSED_PROBE_MAX_EXACT_MATCHES
-          ) {
-            capsuleExactProbeReason =
-              "exact_input_cap"
-          }
-
-          const exactGroupsForCapsule =
-            existingExactStructuralGroups ??
-            capsuleExactProbeGroups
-
-          // Line-only recovery is the fallback when no exact structural
-          // ownership is available. It no longer depends directly on
-          // spansComplete: exact spans may exist yet fail structural parsing.
-          if (
-            mutationLocalization.eligible &&
-            !exactGroupsForCapsule
-          ) {
-            if (ownerRecoveryInput.length < 1) {
-              ownerRecoveryReason = "no_line_hits"
-            } else if (
-              ownerRecoveryInput.length > FOCUSED_PROBE_MAX_LINE_HITS
-            ) {
-              ownerRecoveryReason = "input_cap"
-            } else {
-              ownerRecoveryAttempted = true
-
-              const ownerRecoveryByFile = new Map()
-
-              for (const hit of ownerRecoveryInput) {
-                const batch =
-                  ownerRecoveryByFile.get(hit.file) ?? []
-                batch.push(hit)
-                ownerRecoveryByFile.set(hit.file, batch)
-              }
-
-              const ownerRecoveryBatches =
-                [...ownerRecoveryByFile.entries()]
-                  .sort(([a], [b]) => a.localeCompare(b))
-
-              ownerRecoveryFilesAttempted =
-                ownerRecoveryBatches.length
-
-              let elapsedTotal = 0
-              let mappedTotal = 0
-              let exactSpanTotal = 0
-              let groupTotal = 0
-              let allLocationIncomplete = true
-              let allIrIncomplete = true
-
-              const acceptedGroups = []
-              const rejectedFiles = []
-
-              for (const [file, fileHits] of ownerRecoveryBatches) {
-                const ownerProbe = await runDistiller(
-                  root,
-                  fileHits,
-                )
-
-                elapsedTotal +=
-                  Number.isFinite(ownerProbe.elapsedMs)
-                    ? ownerProbe.elapsedMs
-                    : 0
-
-                const response = ownerProbe.response
-
-                if (Number.isInteger(response?.mapped_hits)) {
-                  mappedTotal += response.mapped_hits
-                }
-
-                if (Number.isInteger(response?.exact_span_hits)) {
-                  exactSpanTotal += response.exact_span_hits
-                }
-
-                if (Array.isArray(response?.groups)) {
-                  groupTotal += response.groups.length
-                }
-
-                if (response?.location_complete !== false) {
-                  allLocationIncomplete = false
-                }
-
-                if (response?.ir_complete !== false) {
-                  allIrIncomplete = false
-                }
-
-                const fileOwnerSafe =
-                  ownerProbe.ok === false &&
-                  ownerProbe.reason === "unsafe_ir" &&
-                  response?.protocol === "evidence-distiller-v3" &&
-                  response?.representation === "evidence_ir" &&
-                  response?.raw_hits === fileHits.length &&
-                  response?.mapped_hits === fileHits.length &&
-                  response?.exact_span_hits === 0 &&
-                  response?.location_complete === false &&
-                  response?.anchor_complete === true &&
-                  response?.witness_complete === true &&
-                  response?.distill_complete === true &&
-                  response?.ir_complete === false &&
-                  response?.v2_grouping_preserved === true &&
-                  response?.truncated === false &&
-                  Array.isArray(response?.groups) &&
-                  response.groups.length > 0 &&
-                  response?.groups_shown ===
-                    response.groups.length &&
-                  response?.variants_shown ===
-                    response?.variants_total
-
-                if (fileOwnerSafe) {
-                  ownerRecoveryFilesAccepted += 1
-                  acceptedGroups.push(...response.groups)
-                } else {
-                  ownerRecoveryFilesRejected += 1
-
-                  rejectedFiles.push({
-                    file,
-                    input_hits: fileHits.length,
-                    reason:
-                      ownerProbe.reason ??
-                      "owner_contract_rejected",
-                    mapped_hits:
-                      Number.isInteger(response?.mapped_hits)
-                        ? response.mapped_hits
-                        : null,
-                    unsupported:
-                      Array.isArray(response?.unsupported_files)
-                        ? response.unsupported_files.length
-                        : null,
-                    errors:
-                      Array.isArray(response?.errors)
-                        ? response.errors.length
-                        : null,
-                  })
-                }
-              }
-
-              ownerRecoveryElapsedMs =
-                Math.round(elapsedTotal * 100) / 100
-              ownerRecoveryMappedHits = mappedTotal
-              ownerRecoveryExactSpanHits = exactSpanTotal
-              ownerRecoveryGroupCount = groupTotal
-
-              ownerRecoveryLocationComplete =
-                ownerRecoveryFilesAttempted > 0
-                  ? !allLocationIncomplete
-                  : null
-
-              ownerRecoveryIrComplete =
-                ownerRecoveryFilesAttempted > 0
-                  ? !allIrIncomplete
-                  : null
-
-              ownerRecoveryDistillComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryAnchorComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryWitnessComplete =
-                ownerRecoveryFilesAccepted > 0 &&
-                ownerRecoveryFilesRejected === 0
-
-              ownerRecoveryRejectedFiles =
-                rejectedFiles.slice(0, 16)
-
-              if (acceptedGroups.length > 0) {
-                ownerRecoveryObserved = true
-                ownerRecoveryGroups = acceptedGroups
-
-                ownerRecoveryReason =
-                  ownerRecoveryFilesRejected > 0
-                    ? "partial_diagnostic_groups_observed"
-                    : "diagnostic_groups_observed"
-
-                const owners = new Map()
-
-                for (const group of acceptedGroups) {
-                  const file =
-                    typeof group?.file === "string"
-                      ? group.file
-                      : null
-                  const symbolKind =
-                    typeof group?.symbol_kind === "string"
-                      ? group.symbol_kind
-                      : null
-                  const symbolName =
-                    typeof group?.symbol_name === "string"
-                      ? group.symbol_name
-                      : null
-                  const startLine =
-                    Number.isInteger(group?.start_line)
-                      ? group.start_line
-                      : null
-                  const endLine =
-                    Number.isInteger(group?.end_line)
-                      ? group.end_line
-                      : null
-
-                  if (
-                    !file ||
-                    !symbolKind ||
-                    !symbolName ||
-                    !startLine ||
-                    !endLine
-                  ) {
-                    continue
-                  }
-
-                  const key =
-                    `${file}\0${symbolKind}\0${symbolName}` +
-                    `\0${startLine}\0${endLine}`
-
-                  if (!owners.has(key)) {
-                    owners.set(key, {
-                      file,
-                      symbol_kind: symbolKind,
-                      symbol_name: symbolName,
-                      start_line: startLine,
-                      end_line: endLine,
-                    })
-                  }
-                }
-
-                ownerRecoveryOwners =
-                  [...owners.values()].slice(0, 16)
-              } else {
-                ownerRecoveryReason =
-                  "no_valid_owner_batches"
-              }
+            return {
+              content:
+                `PATCH_RETRY reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=revise_semantic_owner_binding`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "retry",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
             }
           }
 
-          const exactStructuralGroups =
-            Array.isArray(exactGroupsForCapsule) &&
-            exactGroupsForCapsule.length > 0
-              ? exactGroupsForCapsule
-              : null
-
-          const recoveredStructuralGroups =
-            Array.isArray(ownerRecoveryGroups) &&
-            ownerRecoveryGroups.length > 0
-              ? ownerRecoveryGroups
-              : null
-
-          const renameMutationCapability =
-            await attestRenameTargetCapability(
-              root,
+          if (authorization.rescout === true) {
+            applyExecutionEvent(
               state,
-              queries,
-              discoveryResults,
-              exactStructuralGroups ?? [],
-            )
-          state.renameMutationCapability =
-            renameMutationCapability?.ok === true
-              ? renameMutationCapability
-              : null
-
-          const impactMutationCandidateRecovery =
-            await recoverValidatedImpactMutationCandidateGroups(
-              root,
-              selectedImpactFiles,
+              "patch_rescout",
+              reason,
+              {
+                reason,
+                detail,
+              },
             )
 
-          const capsuleGroups = [
-            ...(exactStructuralGroups ?? recoveredStructuralGroups ?? []),
-            ...(impactMutationCandidateRecovery.groups ?? []),
-          ]
+            await trace({
+              admitted: false,
+              failure_layer: "scope_authorization",
+              reason,
+              scope_detail: detail,
+              action: "rescout",
+              compiler_run: false,
+              executor_run: false,
+            })
 
-          const capsuleStructuralSource =
-            existingExactStructuralGroups
-              ? "evidence_ir"
-              : capsuleExactProbeGroups
-                ? "exact_structural_probe"
-                : recoveredStructuralGroups ||
-                    impactMutationCandidateRecovery.groups.length > 0
-                  ? "line_owner_recovery"
-                  : "none"
+            return {
+              content:
+                `PATCH_RESCOUT reason=${reason} ` +
+                `detail=${detail} ` +
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+                `action=refine_search`,
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "rescout",
+                reason,
+                detail,
+                failure_layer: "scope_authorization",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
 
-          let editCapsule = null
-          let localMutationCapability = null
-          let localMutationCandidateSet = null
-          let localCompetitorCheck = null
-          if (mutationLocalization.eligible) {
-            editCapsule = await buildEditCapsule(
+          applyExecutionEvent(
+            state,
+            "fatal",
+            reason,
+          )
+
+          await trace({
+            admitted: false,
+            failure_layer: "internal_contract",
+            reason,
+            scope_detail: detail,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+
+          return {
+            content:
+              `PATCH_STOP reason=${reason} ` +
+              `detail=${detail} action=report_blocked`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason,
+              detail,
+              failure_layer: "internal_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
+
+        const mutation =
+          authorization.mutation
+
+        const mutations = [mutation]
+
+        const activeMutationHandoffPath =
+          authorization.handoff_path
+
+        if (
+          typeof activeMutationHandoffPath !== "string" ||
+          activeMutationHandoffPath.length < 1
+        ) {
+          applyExecutionEvent(state, "fatal", "mutation_handoff_unavailable")
+          await trace({
+            admitted: false,
+            reason: "mutation_handoff_unavailable",
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              "PATCH_STOP reason=mutation_handoff_unavailable action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: "mutation_handoff_unavailable",
+            },
+          }
+        }
+
+        state.activeMutationHandoffPath = activeMutationHandoffPath
+        state.compilerRuns += 1
+
+        const compiled = await runPatchCompiler(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mutation_protocol: PATCH_MUTATION_PROTOCOL,
+          mutations,
+        })
+        if (!compiled.ok) {
+          const reason = `compiler_${compiled.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", compiler_elapsed_ms: compiled.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+        const compilerResponse = compiled.response
+        if (compilerResponse?.ok !== true) {
+          const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
+          const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
+          const canRetry =
+            PATCH_COMPILER_RETRY_REASONS.has(reason) &&
+            state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+          const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+          if (needsRescout) {
+            applyExecutionEvent(state, "patch_rescout", reason, { reason, mutation_index: compilerResponse?.mutation_index ?? null })
+          } else if (canRetry) {
+            applyExecutionEvent(state, "patch_retry", reason)
+          } else {
+            applyExecutionEvent(state, "fatal", reason)
+          }
+          await trace({
+            admitted: false,
+            reason,
+            action,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutation_index: compilerResponse?.mutation_index ?? null,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            executor_run: false,
+          })
+          if (needsRescout) {
+            return {
+              content: `PATCH_RESCOUT reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason },
+            }
+          }
+          if (canRetry) {
+            return {
+              content: `PATCH_RETRY reason=${reason} mutation_index=${compilerResponse?.mutation_index ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+            }
+          }
+          return {
+            content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        state.patchAttempts += 1
+
+        const signature = patchPlanSignature(compilerResponse)
+        if (state.patchSignatures.has(signature)) {
+          applyExecutionEvent(state, "fatal", "duplicate_patch_plan")
+          await trace({ admitted: false, reason: "duplicate_patch_plan", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_run: false })
+          return {
+            content: `PATCH_STOP reason=duplicate_patch_plan attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_or_stop`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "duplicate_patch_plan" },
+          }
+        }
+        state.patchSignatures.add(signature)
+        state.executorRuns += 1
+        state.executedPatches += 1
+
+        const result = await runPatchExecutor(root, {
+          root,
+          handoff: activeMutationHandoffPath,
+          mode: "guarded",
+          edit_protocol: PATCH_EDIT_PROTOCOL,
+          edits: compilerResponse?.edits ?? [],
+          checks: compilerResponse?.checks ?? [],
+        })
+
+        if (!result.ok) {
+          const reason = `executor_${result.reason}`
+          applyExecutionEvent(state, "fatal", reason)
+          await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+          return {
+            content: `PATCH_STOP reason=${reason} action=report_blocked`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+          }
+        }
+
+        const response = result.response
+        if (response?.admitted === true) {
+          const proofObligations = proofObligationsForMutations(mutations)
+          state.proofObligations = proofObligations
+          const verified = await runInvariantVerifier(root, {
+            root,
+            handoff: activeMutationHandoffPath,
+            patch: response?.patch ?? "",
+            compiler_protocol: PATCH_COMPILER_PROTOCOL,
+            mutation_protocol: PATCH_MUTATION_PROTOCOL,
+            mutations,
+            changed_files: compilerResponse?.changed_files ?? [],
+            edits: compilerResponse?.edits ?? [],
+          })
+          if (!verified.ok) {
+            const reason = `verifier_${verified.reason}`
+            applyExecutionEvent(state, "fatal", reason)
+            await trace({ admitted: false, reason, action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=${reason} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+            }
+          }
+          const verificationResponse = verified.response
+          const proofAssessment = assessProofObligations(verificationResponse, proofObligations)
+          if (!proofAssessment.ok) {
+            const failedProofs = compactProofFailure(proofAssessment)
+            const canRepair =
+              proofAssessment.disposition === "repair" &&
+              state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+            if (proofAssessment.disposition === "rescout") {
+              applyExecutionEvent(state, "verification_rescout", "proof_obligation_failed", {
+                reason: "proof_obligation_failed",
+                failed: proofAssessment.failed,
+              })
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "rescout", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RESCOUT reason=proof_obligation_failed failed=${failedProofs} action=refine_search`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            if (canRepair) {
+              applyExecutionEvent(state, "verification_repair", "proof_obligation_failed")
+              await trace({ admitted: false, reason: "proof_obligation_failed", action: "retry", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+              return {
+                content: `PATCH_RETRY reason=proof_obligation_failed failed=${failedProofs} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+                metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+              }
+            }
+            applyExecutionEvent(state, "fatal", "proof_obligation_failed")
+            await trace({ admitted: false, reason: "proof_obligation_failed", action: "stop", failed_proofs: failedProofs, plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs, verifier_elapsed_ms: verified.elapsedMs })
+            return {
+              content: `PATCH_STOP reason=proof_obligation_failed failed=${failedProofs} action=report_blocked`,
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
+            }
+          }
+          const persisted = await writePatchReceipt(
+            root,
+            sessionID,
+            state,
+            response,
+            compilerResponse,
+            verificationResponse,
+            proofAssessment,
+            { origin: dispatchOrigin, actionCommit },
+          )
+          if (!persisted) {
+            applyExecutionEvent(state, "fatal", "receipt_write_failed")
+            await trace({ admitted: false, reason: "receipt_write_failed", action: "stop", plan_signature: signature, compiler_elapsed_ms: compiled.elapsedMs, executor_elapsed_ms: result.elapsedMs })
+            return {
+              content: "PATCH_STOP reason=receipt_write_failed action=report_blocked",
+              metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "receipt_write_failed" },
+            }
+          }
+          const completionAuthorization =
+            await observeCompletionAuthorization(
               root,
               sessionID,
               state,
-              capsuleGroups,
-              scoutHandoff,
-              capsuleStructuralSource,
-              mutationLocalization,
+              persisted,
+              proofAssessment,
+              dispatchOrigin,
+              actionCommit,
             )
 
-            if (editCapsule?.mutationReady === true) {
-              localCompetitorCheck = await confirmLocalMutationCompetitors(
-                root,
-                state,
-                scoutHandoff,
-                editCapsule,
-                rankedFiles,
-                discoveryResults,
-                queries,
-                glob,
-              )
+          state.patchAccepted = true
+          state.patchReceiptPath = persisted.path
+          applyExecutionEvent(state, "patch_ready", "verification_passed")
 
-              if (localCompetitorCheck.ok === true) {
-                localMutationCandidateSet =
-                  await attestLocalMutationCandidateSet(
-                    root,
-                    sessionID,
-                    state,
-                    scoutHandoff,
-                    editCapsule,
-                    localCompetitorCheck,
-                  )
-
-                localMutationCapability =
-                  localMutationCandidateSet.primary
-              }
-
-              if (localMutationCapability?.ok === true) {
-                state.localMutationHandoffPath =
-                  localMutationCapability.localHandoffPath
-                state.localMutationCapability = localMutationCapability
-                state.localMutationCandidates =
-                  localMutationCandidateSet?.candidates ?? []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_ready",
-                  "local_mutation_capability_ready",
-                )
-              } else {
-                state.localMutationHandoffPath = null
-                state.localMutationCapability = null
-                state.localMutationCandidates = []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_needs_evidence",
-                  localMutationCapability?.reason ??
-                    localCompetitorCheck?.reason ??
-                    "local_mutation_capability_unavailable",
-                )
-              }
-            } else {
-              applyExecutionEvent(
-                state,
-                "scout_needs_evidence",
-                "edit_capsule_unavailable",
-              )
-            }
-          } else {
-            applyExecutionEvent(
+          // Native CompletionAuthorizer is the only permission to create a
+          // TerminalCommit. ABSTAIN/transport failure withholds only the
+          // terminal optimization; the verified patch remains PATCH_READY and
+          // the ordinary agent loop may continue.
+          const completionAuthorized =
+            completionAuthorizationPermitsTerminal(
+              completionAuthorization,
+            )
+          let completionSafeFail = null
+          let completionSafeFailClaim = null
+          if (!completionAuthorized) {
+            const completionSafeFailResult = deriveCompletionSafeFail({
               state,
-              "scout_needs_evidence",
-              `mutation_localization_${mutationLocalization.reason}`,
-            )
+              persisted,
+              completionAuthorization,
+            })
+            if (completionSafeFailResult.ok === true) {
+              completionSafeFailClaim = claimCompletionSafeFail(
+                state,
+                completionSafeFailResult.commit,
+              )
+              if (completionSafeFailClaim.ok === true) {
+                completionSafeFail = completionSafeFailResult.commit
+                await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                  ts: nowMs(),
+                  protocol: AGENT_PROTOCOL,
+                  kind: "completion_safe_fail_commit",
+                  completion_safe_fail_protocol: COMPLETION_SAFE_FAIL_PROTOCOL,
+                  completion_safe_fail_sha256:
+                    completionSafeFail.commit_sha256,
+                  completion_safe_fail_reason: completionSafeFail.reason,
+                  completion_authorizer_transport_ok:
+                    completionAuthorization.transport_ok,
+                  completion_authorizer_decision:
+                    completionAuthorization.decision,
+                  sessionID,
+                  turnID: state.turnID,
+                  task_turn_id: state.taskTurnID,
+                  task_sha256: state.taskTextSha256,
+                  action_commit_sha256:
+                    completionSafeFail.action_commit_sha256,
+                  patch_receipt: completionSafeFail.patch_receipt_path,
+                  verification_receipt:
+                    completionSafeFail.verification_receipt_path,
+                  patch_sha256: completionSafeFail.patch_sha256,
+                  project_root: root,
+                })
+              }
+            }
           }
 
-          const elapsedMs = Math.round((performance.now() - started) * 100) / 100
+          const terminalCommitResult = completionAuthorized
+            ? deriveTerminalCommit({
+                state,
+                persisted,
+                proofAssessment,
+              })
+            : {
+                ok: false,
+                reason:
+                  completionAuthorization.applicable !== true
+                    ? "completion_authorizer_not_applicable"
+                    : completionAuthorization.transport_ok !== true
+                      ? "completion_authorizer_unavailable"
+                      : completionAuthorization.decision !== "CERTIFY"
+                        ? "completion_authorizer_abstain"
+                        : "completion_certificate_invalid",
+              }
+          let terminalCommit = null
+          let terminalClaim = null
+          if (terminalCommitResult.ok === true) {
+            terminalClaim = claimTerminalCommit(
+              state,
+              terminalCommitResult.commit,
+            )
+            if (terminalClaim.ok === true) {
+              terminalCommit = terminalCommitResult.commit
+              await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+                ts: nowMs(),
+                protocol: AGENT_PROTOCOL,
+                kind: "terminal_commit",
+                terminal_commit_protocol: TERMINAL_COMMIT_PROTOCOL,
+                terminal_commit_sha256: terminalCommit.commit_sha256,
+                completion_authorizer_protocol:
+                  COMPLETION_AUTHORIZER_PROTOCOL,
+                completion_authorizer_authority:
+                  "terminal_permission",
+                completion_authorizer_permits_terminal:
+                  completionAuthorized,
+                completion_certificate_sha256:
+                  completionAuthorization.certificate_sha256,
+                sessionID,
+                turnID: state.turnID,
+                task_turn_id: state.taskTurnID,
+                task_sha256: state.taskTextSha256,
+                project_root: root,
+                proof_disposition: "pass",
+                patch_receipt: terminalCommit.patch_receipt_path,
+                verification_receipt:
+                  terminalCommit.verification_receipt_path,
+                patch_sha256: terminalCommit.patch_sha256,
+              })
+            }
+          }
+
+          await trace({
+            admitted: true,
+            reason: null,
+            action: "ready",
+            plan_signature: signature,
+            compiler_elapsed_ms: compiled.elapsedMs,
+            compiler_mutations_requested: compilerResponse?.mutations_requested ?? 0,
+            compiler_mutations_effective: compilerResponse?.mutations_effective ?? 0,
+            compiler_dropped_noops: compilerResponse?.dropped_noops ?? 0,
+            compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? 0,
+            compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+            executor_elapsed_ms: result.elapsedMs,
+            verifier_elapsed_ms: verified.elapsedMs,
+            invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+            invariants_total: verificationResponse?.invariants_total ?? 0,
+            invariants_passed: verificationResponse?.invariants_passed ?? 0,
+            proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+            proof_obligations: proofAssessment.obligations.map((item) => item.id),
+            proof_disposition: proofAssessment.disposition,
+            terminal_commit_protocol:
+              terminalCommit?.protocol ?? null,
+            terminal_commit_sha256:
+              terminalCommit?.commit_sha256 ?? null,
+            terminal_commit_reason:
+              terminalCommitResult.reason,
+            terminal_commit_claim_reason:
+              terminalClaim?.reason ?? null,
+            completion_safe_fail_protocol:
+              completionSafeFail?.protocol ?? null,
+            completion_safe_fail_sha256:
+              completionSafeFail?.commit_sha256 ?? null,
+            completion_safe_fail_claim_reason:
+              completionSafeFailClaim?.reason ?? null,
+            completion_authorizer_protocol:
+              COMPLETION_AUTHORIZER_PROTOCOL,
+            completion_authorizer_authority:
+              "terminal_permission",
+            completion_authorizer_permits_terminal:
+              completionAuthorized,
+            completion_authorizer_applicable:
+              completionAuthorization.applicable,
+            completion_authorizer_transport_ok:
+              completionAuthorization.transport_ok,
+            completion_authorizer_decision:
+              completionAuthorization.decision,
+            completion_authorizer_reason:
+              completionAuthorization.reason,
+            completion_certificate_sha256:
+              completionAuthorization.certificate_sha256,
+            completion_authorizer_elapsed_ms:
+              completionAuthorization.elapsed_ms,
+            verification_receipt: persisted.verificationPath,
+            receipt_path: persisted.path,
+            patch_path: persisted.receipt.patch_path,
+            patch_sha256: persisted.receipt.patch_sha256,
+            changed_files: response.changed_files ?? [],
+            changed_lines: response.changed_lines ?? 0,
+            patch_bytes: response.patch_bytes ?? 0,
+            structural_edits: response.structural_edits ?? 0,
+            repo_mutated: response.repo_mutated === true,
+          })
+          return {
+            content:
+              `PATCH_READY receipt=${persisted.path} changed_files=${(response.changed_files ?? []).length} ` +
+              `changed_lines=${response.changed_lines ?? 0} semantic_mutations=${compilerResponse?.mutations_effective ?? 0} ` +
+              `lowered_edits=${compilerResponse?.lowered_edits ?? 0} normalized=${(compilerResponse?.dropped_noops ?? 0) + (compilerResponse?.dropped_duplicates ?? 0)} ` +
+              `invariants=${verificationResponse?.invariants_passed ?? 0}/${verificationResponse?.invariants_total ?? 0} ` +
+              `proofs=${proofAssessment.obligations.length}/${proofAssessment.obligations.length} ` +
+              `capsule=${state.editCapsulePath ?? "none"} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} repo_mutated=false`,
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "ready",
+              receipt_protocol: PATCH_RECEIPT_PROTOCOL,
+              receipt_path: persisted.path,
+              verification_receipt: persisted.verificationPath,
+              verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
+              terminal_commit_protocol:
+                terminalCommit?.protocol ?? null,
+              terminal_commit_sha256:
+                terminalCommit?.commit_sha256 ?? null,
+              terminal_commit_reason:
+                terminalCommitResult.reason,
+              invariant_verifier_protocol: INVARIANT_VERIFIER_PROTOCOL,
+              invariants_total: verificationResponse?.invariants_total ?? 0,
+              invariants_passed: verificationResponse?.invariants_passed ?? 0,
+              proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
+              proof_obligations: proofAssessment.obligations,
+              edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
+              edit_capsule_path: state.editCapsulePath,
+              edit_capsule_sha256: state.editCapsuleHash,
+              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_state: state.executionState,
+              compiler_protocol: PATCH_COMPILER_PROTOCOL,
+              mutation_protocol: PATCH_MUTATION_PROTOCOL,
+                patch_tool_protocol: PATCH_TOOL_PROTOCOL,
+              mutation_dispatch_origin: dispatchOrigin,
+              action_commit_protocol: actionCommit?.protocol ?? null,
+              action_commit_sha256: actionCommit?.commit_sha256 ?? null,
+              semantic_mutations: compilerResponse?.mutations_effective ?? 0,
+              lowered_edits: compilerResponse?.lowered_edits ?? 0,
+              changed_files: response.changed_files ?? [],
+              changed_lines: response.changed_lines ?? 0,
+              patch_bytes: response.patch_bytes ?? 0,
+              truncated: false,
+            },
+          }
+        }
+
+        const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
+        const canRetry =
+          PATCH_RETRY_REASONS.has(reason) &&
+          state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
+        const needsRescout = PATCH_RESCOUT_REASONS.has(reason)
+        const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
+        if (needsRescout) {
+          applyExecutionEvent(state, "patch_rescout", reason, { reason, allowed_files: response?.allowed_files ?? [] })
+        } else if (canRetry) {
+          applyExecutionEvent(state, "patch_retry", reason)
+        } else {
+          applyExecutionEvent(state, "fatal", reason)
+        }
+        await trace({
+          admitted: false,
+          reason,
+          action,
+          plan_signature: signature,
+          compiler_elapsed_ms: compiled.elapsedMs,
+          compiler_lowered_edits: compilerResponse?.lowered_edits ?? 0,
+          executor_elapsed_ms: result.elapsedMs,
+          executor_diagnostic:
+            result.diagnostic ?? null,
+          allowed_files: response?.allowed_files ?? [],
+          changed_files: response?.changed_files ?? [],
+        })
+
+        if (needsRescout) {
+          return {
+            content: `PATCH_RESCOUT reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=refine_search`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "rescout", reason, allowed_files: response?.allowed_files ?? [] },
+          }
+        }
+        if (canRetry) {
+          return {
+            content: `PATCH_RETRY reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=revise_semantic_plan`,
+            metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "retry", reason },
+          }
+        }
+        return {
+          content: `PATCH_STOP reason=${reason} attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} action=report_blocked`,
+          metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason },
+        }
+    }
+
+    await track(ctx.tool.transform((tools) => {
+      tools.add({
+        name: "search",
+        description:
+          "Search the active project with 1 to 4 regular expressions in one call. " +
+          "Search first performs repository-wide lexical discovery, applies bounded deterministic structural BM25F/RRF reranking when available, and keeps query fairness separate from relevance, " +
+          "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
+          "Returns bounded line-numbered evidence and explicit completeness metadata. " +
+          "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
+          "for the requested regex/path/glob. scan_complete=true is stronger: every discovered file " +
+          "was probed and every matching line was scanned. " +
+          "A ROUTE block is heuristic routing only; retained_unemitted files remain lexical candidates " +
+          "and must not be treated as irrelevant or absent. " +
+          "Completeness is lexical: scan_complete=true means all matches for the requested " +
+          "regex/path/glob were scanned across the probed universe, not that a semantic category is exhaustively absent. " +
+          "evidence_complete=true means every discovered hit line is represented, not that " +
+          "the surrounding function or file is fully shown. representation=focused adds bounded " +
+          "containing-scope context chosen from structurally relevant non-module matches but still " +
+          "does not imply whole-file context. Turn evidence is deduplicated: prior_evidence_reused=true " +
+          "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
+          "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
+          "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
+          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
+          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only capability-derived action-specific mutation tools.",
+        input: {
+          type: "object",
+          properties: {
+            queries: {
+              type: "array",
+              minItems: 1,
+              maxItems: MAX_QUERIES,
+              items: { type: "string", minLength: 1, maxLength: 200 },
+              description: "One to four regular expressions.",
+            },
+            path: {
+              type: "string",
+              minLength: 1,
+              description: "Optional project-relative file or directory. Default: project root.",
+            },
+            glob: {
+              type: "string",
+              minLength: 1,
+              description: "Optional file glob such as **/*.py.",
+            },
+          },
+          required: ["queries"],
+          additionalProperties: false,
+        },
+        options: {
+          codemode: false,
+          permission: "search",
+        },
+
+        execute: async (input, toolContext) => {
+          const started = performance.now()
+          const sessionID =
+            typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
+              ? toolContext.sessionID
+              : null
+
+          const state = getSessionState(sessionID)
+          const root = await rootForTool(ctx, toolContext, sessionID, state)
+
+          if (!root) {
+            return {
+              content: "SEARCH_ERROR: cannot resolve active project root for this session.",
+            }
+          }
+
+          if (state && !state.turnID) {
+            resetTurnState(state, `implicit:${sessionID}:${nowMs()}`, nowMs())
+          }
+
+          if (state && !toolAllowedForExecutionState(state, "search")) {
+            return {
+              content: `SEARCH_BLOCKED reason=causal_frontier state=${state.executionState} action=${nextActionForExecutionState(state)}`,
+              metadata: {
+                protocol: SEARCH_PROTOCOL,
+                blocked: true,
+                reason: "causal_frontier",
+                execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+                execution_state: state.executionState,
+                next_action: nextActionForExecutionState(state),
+              },
+            }
+          }
+
+          let attemptIndex = null
+          let taskSearchPlan = null
+          if (state) {
+            state.searchAttempts += 1
+            state.lastSeen = nowMs()
+            attemptIndex = state.searchAttempts
+          }
+
+          const blockSearch = async (reason, extra = {}) => {
+            await writeProjectTrace(root, "search-trace.jsonl", {
+              ts: nowMs(),
+              protocol: SEARCH_PROTOCOL,
+              sessionID,
+              turnID: state?.turnID ?? null,
+              project_root: root,
+              blocked: true,
+              reason,
+              attempt_index: attemptIndex,
+              turn_model_calls: state?.modelCalls ?? null,
+              turn_search_attempts: state?.searchAttempts ?? null,
+              turn_executed_searches: state?.executedSearches ?? null,
+              turn_evidence_bytes: state?.evidenceBytes ?? null,
+              task_search_plan_protocol:
+                taskSearchPlan?.protocol ?? TASK_SEARCH_PLAN_PROTOCOL,
+              task_search_plan_applied: taskSearchPlan?.applied ?? false,
+              task_search_plan_reason: taskSearchPlan?.reason ?? "not_compiled",
+              task_search_requested_queries:
+                taskSearchPlan?.requested_queries ?? null,
+              task_search_effective_queries:
+                taskSearchPlan?.effective_queries ?? null,
+              task_search_requested_path:
+                taskSearchPlan?.requested_path ?? null,
+              task_search_effective_path:
+                taskSearchPlan?.effective_path ?? null,
+              task_search_requested_glob:
+                taskSearchPlan?.requested_glob ?? null,
+              task_search_effective_glob:
+                taskSearchPlan?.effective_glob ?? null,
+              ...extra,
+            })
+
+            return {
+              content: `SEARCH_BLOCKED reason=${reason} action=use_prior_or_refine`,
+              metadata: { protocol: SEARCH_PROTOCOL, blocked: true, reason },
+            }
+          }
+
+          if (state && state.searchAttempts > MAX_SEARCH_ATTEMPTS_PER_TURN) {
+            return await blockSearch("attempt_budget", {
+              limit: MAX_SEARCH_ATTEMPTS_PER_TURN,
+            })
+          }
+
+          let queries = input?.queries
+          if (
+            !Array.isArray(queries) ||
+            queries.length < 1 ||
+            queries.length > MAX_QUERIES ||
+            queries.some(
+              (query) =>
+                typeof query !== "string" || query.length < 1 || query.length > 200,
+            )
+          ) {
+            return {
+              content: "SEARCH_ERROR: queries must contain 1..4 strings of 1..200 characters.",
+            }
+          }
+
+          const requestedQueries = [...new Set(queries)]
+          const requestedPath =
+            typeof input?.path === "string" && input.path.length > 0
+              ? input.path
+              : "."
+          const modelRequestedGlob =
+            typeof input?.glob === "string" && input.glob.length > 0
+              ? input.glob
+              : undefined
+
+          taskSearchPlan = compileTaskSearchPlanForState(
+            state,
+            requestedQueries,
+            requestedPath,
+            modelRequestedGlob,
+            buildLanguageGlob("**/*", SOURCE_LANGUAGE_EXTENSIONS),
+          )
+          queries = taskSearchPlan.effective_queries
 
           await writeProjectTrace(root, "search-trace.jsonl", {
             ts: nowMs(),
             protocol: SEARCH_PROTOCOL,
+            kind: "task_search_plan",
             sessionID,
             turnID: state?.turnID ?? null,
             project_root: root,
-            attempt_index: attemptIndex,
-            requested_queries: input?.queries,
-            queries,
-            path: target,
-            glob: glob ?? null,
-            requested_glob: requestedGlob ?? null,
-            effective_glob: glob ?? null,
-            glob_corrected: globResolution.corrected === true,
-            glob_correction_reason: globResolution.reason,
-            glob_inventory_complete: globResolution.inventoryComplete,
-            glob_inventory_files: globResolution.inventoryFiles,
-            glob_inventory_extensions: globResolution.inventoryExtensions,
-            glob_inventory_cache_hit: globResolution.inventoryCacheHit,
-            file_discovery_cap_per_query: FILE_DISCOVERY_CAP_PER_QUERY,
-            line_hit_cap_per_query: LINE_HIT_CAP_PER_QUERY,
-            lexical_discovery_complete: discoveryComplete,
-            selected_scan_complete: selectedScanComplete,
-            probe_scan_complete: selectedScanComplete,
-            all_discovered_files_probed: allDiscoveredFilesProbed,
-            all_discovered_files_emitted: allDiscoveredFilesSelected,
-            routing_active: routingActive,
-            route_strategy: "query_fair_lexical8_plus_task_local_impact",
-            scout_handoff_protocol: scoutHandoff?.protocol ?? SCOUT_HANDOFF_PROTOCOL,
-            scout_handoff_path: scoutHandoff?.path ?? null,
-            scout_handoff_status: scoutHandoff?.status ?? null,
-            scout_handoff_files: scoutHandoff?.files ?? null,
-            scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
-            scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
-            scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
-            mutation_localization_eligible:
-              mutationLocalization.eligible,
-            mutation_localization_reason:
-              mutationLocalization.reason,
-            scout_local_capability_protocol:
-              localMutationCapability?.protocol ?? null,
-            scout_local_capability_reason:
-              localMutationCapability?.reason ?? null,
-            scout_local_capability_detail:
-              localMutationCapability?.detail ?? null,
-            scout_local_replace_node_ready:
-              localMutationCapability?.replaceNodeReady === true,
-            scout_global_rename_ready:
-              renameMutationCapability?.ok === true &&
-              renameMutationCapability?.ready === true,
-            scout_rename_target_protocol:
-              renameMutationCapability?.protocol ?? SCOUT_RENAME_TARGET_PROTOCOL,
-            scout_rename_target_reason:
-              renameMutationCapability?.reason ?? null,
-            scout_rename_target_ready:
-              renameMutationCapability?.ok === true &&
-              renameMutationCapability?.ready === true,
-            scout_rename_target:
-              renameMutationCapability?.target ?? null,
-            scout_local_mutation_handoff:
-              localMutationCapability?.localHandoffPath ?? null,
-            scout_local_mutation_target:
-              localMutationCapability?.target ?? null,
-            scout_local_allowed_mutations:
-              localMutationCapability?.allowedMutations ?? [],
-            scout_owner_attestation:
-              localMutationCapability?.ownerAttestation ?? null,
-            scout_competitor_check:
-              localCompetitorCheck ?? null,
-            mutation_candidate_protocol:
-              editCapsule?.mutationCandidateProtocol ?? null,
-            mutation_candidate_count:
-              editCapsule?.mutationCandidateCount ?? 0,
-            mutation_candidates_preauthorized:
-              localMutationCandidateSet?.candidates?.length ?? 0,
-            mutation_candidates_rejected:
-              localMutationCandidateSet?.rejected?.length ?? 0,
-            impact_mutation_candidate_recovery_reason:
-              impactMutationCandidateRecovery?.reason ?? null,
-            impact_mutation_candidate_recovery_groups:
-              impactMutationCandidateRecovery?.groups?.length ?? 0,
-            edit_capsule_protocol: editCapsule?.protocol ?? null,
-            edit_capsule_path: editCapsule?.path ?? null,
-            edit_capsule_sha256: editCapsule?.sha256 ?? null,
-            edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
-            edit_capsule_readiness_reason:
-              editCapsule?.readinessReason ?? null,
-            edit_capsule_structural_source:
-              editCapsule?.structuralSource ?? null,
-            edit_capsule_primary_mutation_candidate:
-              editCapsule?.primaryMutationCandidate ?? null,
-            edit_capsule_authorized_mutation_scope:
-              editCapsule?.authorizedMutationScope ?? null,
-            edit_capsule_mutation_capable_scopes:
-              editCapsule?.mutationCapableScopes ?? 0,
-            edit_capsule_mutation_scope_complete:
-              editCapsule?.mutationScopeComplete ?? false,
-            edit_capsule_context_complete:
-              editCapsule?.contextComplete ?? null,
-            edit_capsule_all_handoff_files_contextualized:
-              editCapsule?.allHandoffFilesContextualized ?? null,
-            edit_capsule_handoff_files_contextualized:
-              editCapsule?.handoffFilesContextualized ?? null,
-            edit_capsule_handoff_files_total:
-              editCapsule?.handoffFilesTotal ?? null,
-            edit_capsule_auxiliary_truncated:
-              editCapsule?.auxiliaryTruncated ?? null,
-            edit_capsule_omitted_scopes_by_budget:
-              editCapsule?.omittedScopesByBudget ?? null,
-            edit_capsule_downgraded_structural_scopes:
-              editCapsule?.downgradedStructuralScopes ?? null,
-            edit_capsule_readiness_blockers:
-              editCapsule?.readinessBlockers ?? [],
-            edit_capsule_readiness_warnings:
-              editCapsule?.readinessWarnings ?? [],
-            edit_capsule_coverage: editCapsule?.coverage ?? null,
-            execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-            execution_state: state?.executionState ?? null,
-            execution_reason: state?.executionReason ?? null,
-            execution_event: state?.executionEvent ?? null,
-            next_action: nextActionForExecutionState(state),
-            candidate_files: rankedFiles.length,
-            lexical_candidate_files: lexicalRankedFiles.length,
+            task_action_protocol: state?.taskAction?.protocol ?? null,
+            task_action_status: state?.taskAction?.status ?? null,
+            task_action_operation: state?.taskAction?.operation ?? null,
+            task_action_old_name: state?.taskAction?.old_name ?? null,
+            task_action_new_name: state?.taskAction?.new_name ?? null,
+            task_requirements_protocol:
+              state?.taskRequirements?.protocol ??
+              TASK_REQUIREMENTS_PROTOCOL,
+            task_requirements_status:
+              state?.taskRequirements?.status ?? null,
+            task_required_roles:
+              state?.taskRequirements?.required_roles ?? [],
+            task_required_source_families:
+              state?.taskRequirements?.required_source_families ?? [],
+            task_constraints:
+              state?.taskRequirements?.constraints ?? [],
+            task_search_plan_protocol: taskSearchPlan.protocol,
+            task_search_plan_applied: taskSearchPlan.applied,
+            task_search_plan_reason: taskSearchPlan.reason,
+            task_search_requested_queries: taskSearchPlan.requested_queries,
+            task_search_effective_queries: taskSearchPlan.effective_queries,
+            task_search_requested_path: taskSearchPlan.requested_path,
+            task_search_effective_path: taskSearchPlan.effective_path,
+            task_search_requested_glob: taskSearchPlan.requested_glob,
+            task_search_effective_glob: taskSearchPlan.effective_glob,
+          })
 
-            retrieval_ranker_attempted:
-              retrievalRanking.attempted,
-            retrieval_ranker_ok:
-              retrievalRanking.ok,
-            retrieval_ranker_reason:
-              retrievalRanking.reason,
-            retrieval_ranker_elapsed_ms:
-              retrievalRanking.elapsedMs,
-            retrieval_ranker_input_files:
-              retrievalRanking.inputFiles,
-            retrieval_ranker_output_files:
-              retrievalRanking.outputFiles,
-            retrieval_ranker_degraded_files:
-              retrievalRanking.degradedFiles,
-            retrieval_ranker_error_files:
-              retrievalRanking.errorFiles,
+          let target
+          try {
+            target = await safeTarget(root, taskSearchPlan.effective_path)
+          } catch (error) {
+            return { content: "SEARCH_ERROR: " + String(error?.message ?? error) }
+          }
 
-            discovery_elapsed_ms: discoveryElapsedMs,
-            refine_elapsed_ms: refineElapsedMs,
-            probe_elapsed_ms: refineElapsedMs,
-            impact_index_attempted: impactIndexShadow.attempted,
-            impact_index_ok: impactIndexShadow.ok,
-            impact_index_reason: impactIndexShadow.reason,
-            impact_index_elapsed_ms: impactIndexShadow.elapsedMs,
-            impact_graph_probe_cap: IMPACT_GRAPH_PROBE_MAX_FILES,
-            impact_graph_emit_cap: IMPACT_GRAPH_EMIT_MAX_FILES,
-            impact_validation_attempted: impactValidation.attempted,
-            impact_validation_reason: impactValidation.reason,
-            impact_validation_elapsed_ms: impactValidation.elapsedMs,
-            impact_validation_queries: impactValidation.queryCount,
-            impact_hypotheses: impactValidation.hypotheses.length,
-            impact_validated: impactValidation.validated.length,
-            impact_rejected: impactValidation.rejected.length,
+          const requestedGlob = taskSearchPlan.effective_glob ?? undefined
 
-            semantic_impact_attempted:
-              semanticImpactShadow.attempted,
-            semantic_impact_ok:
-              semanticImpactShadow.ok,
-            semantic_impact_reason:
-              semanticImpactShadow.reason,
-            semantic_impact_elapsed_ms:
-              semanticImpactShadow.elapsedMs,
-            semantic_impact_queries:
-              semanticImpactShadow.queries,
-            semantic_impact_confirmed:
-              semanticImpactShadow.confirmed,
-            semantic_impact_contradicted:
-              semanticImpactShadow.contradicted,
-            semantic_impact_ambiguous:
-              semanticImpactShadow.ambiguous,
-            semantic_impact_unresolved:
-              semanticImpactShadow.unresolved,
-            semantic_impact_unavailable:
-              semanticImpactShadow.unavailable,
-            semantic_impact_skipped:
-              semanticImpactShadow.skipped,
-            semantic_impact_engines:
-              semanticImpactShadow.engines,
-            semantic_impact_outcomes:
-              semanticImpactShadow.outcomes,
+          const globResolution =
+            await resolveTaskSourceFamilyGlob(
+              root,
+              target,
+              requestedGlob,
+              state,
+            )
 
-            impact_scope_conditioned: true,
-            impact_scope_seed_contexts: impactValidation.seedContexts,
-            impact_scope_owner_symbols: impactValidation.ownerSymbols,
-            impact_pairwise_conditioned: impactValidation.pairwiseConditioned === true,
-            impact_filter_before_cap: impactIndexShadow.taskFiltersApplied === true,
-            impact_filter_query_elapsed_ms: impactValidation.filterQueryElapsedMs,
-            impact_refresh_fallback_attempted: impactValidation.refreshFallbackAttempted === true,
-            impact_refresh_fallback_elapsed_ms: impactValidation.refreshFallbackElapsedMs,
-            impact_pre_refresh_refresh_due: impactValidation.initialIndexStats?.refreshDue === true,
-            impact_pre_refresh_stale_seed_files: impactValidation.initialIndexStats?.staleSeedFiles ?? 0,
-            impact_pre_refresh_stale_witness_edges: impactValidation.initialIndexStats?.staleWitnessEdges ?? 0,
-            impact_pre_refresh_cache_age_ms: impactValidation.initialIndexStats?.cacheAgeMs ?? null,
-            impact_refresh_fallback_cause:
-              impactValidation.refreshFallbackAttempted !== true
-                ? null
-                : ((impactValidation.initialIndexStats?.staleSeedFiles ?? 0) > 0 ||
-                    (impactValidation.initialIndexStats?.staleWitnessEdges ?? 0) > 0)
-                  ? "fingerprint_stale"
-                  : impactValidation.initialIndexStats?.refreshDue === true
-                    ? "age_or_unavailable"
-                    : "validation_miss",
-            impact_scope_relations_rejected: impactValidation.scopeRejected,
-            impact_index_coverage_complete: impactIndexShadow.refreshComplete,
-            impact_index_partial_reason: impactIndexShadow.partialReason,
-            impact_index_inventory_kind: impactIndexShadow.inventoryKind,
-            impact_index_local_resolved: impactIndexShadow.resolvedImports,
-            impact_index_local_unresolved: impactIndexShadow.unresolvedImports,
-            impact_index_local_ambiguous: impactIndexShadow.ambiguousImports,
-            impact_index_external_packages: impactIndexShadow.externalPackages,
-            impact_index_unsupported_aliases: impactIndexShadow.unsupportedAliases,
-            impact_emitted_files: selectedImpactFiles.length,
-            impact_emitted: selectedImpactFiles.map((entry) => ({
-              file: entry.file,
-              seed: entry.impact?.seed ?? null,
-              direction: entry.impact?.direction ?? null,
-              bindings: entry.impact?.bindings ?? [],
-              validation_kind: entry.impact?.validationKind ?? null,
-              sample_line: entry.impact?.sample?.line ?? null,
-            })),
-            impact_index_refresh_due: impactIndexShadow.refreshDue,
-            impact_index_refresh_deferred: impactIndexShadow.refreshDeferred === true,
-            impact_index_stale_seed_files: impactIndexShadow.staleSeedFiles,
-            impact_index_stale_witness_edges: impactIndexShadow.staleWitnessEdges,
-            impact_index_bootstrap_cache_hit: impactIndexShadow.bootstrapCacheHit === true,
-            impact_index_refresh_ok: impactIndexShadow.refreshOk,
-            impact_index_refresh_reason: impactIndexShadow.refreshReason,
-            impact_index_refresh_elapsed_ms: impactIndexShadow.refreshElapsedMs,
-            impact_index_query_elapsed_ms: impactIndexShadow.queryElapsedMs,
-            impact_index_cache_age_ms: impactIndexShadow.cacheAgeMs,
-            impact_index_files_total: impactIndexShadow.filesTotal,
-            impact_index_files_reused: impactIndexShadow.filesReused,
-            impact_index_files_reindexed: impactIndexShadow.filesReindexed,
-            impact_index_files_removed: impactIndexShadow.filesRemoved,
-            impact_index_imports_total: impactIndexShadow.importsTotal,
-            impact_index_edges_total: impactIndexShadow.edgesTotal,
-            impact_index_resolved_imports: impactIndexShadow.resolvedImports,
-            impact_index_unresolved_imports: impactIndexShadow.unresolvedImports,
-            impact_index_neighbors_total: impactIndexShadow.neighborsTotal,
-            impact_index_neighbors_shown: impactIndexShadow.neighborsShown,
-            impact_index_lexical_misses: impactIndexShadow.lexicalMisses,
-            impact_index_forward_neighbors: impactIndexShadow.forwardNeighbors,
-            impact_index_reverse_neighbors: impactIndexShadow.reverseNeighbors,
-            impact_index_candidates: impactIndexShadow.candidates,
-            impact_index_routing_active:
-              selectedImpactFiles.length > 0,
+          await writeProjectTrace(
+            root,
+            "search-trace.jsonl",
+            {
+              ts: nowMs(),
+              protocol: SEARCH_PROTOCOL,
+              kind: "source_family_plan",
+              sessionID,
+              turnID: state?.turnID ?? null,
+              project_root: root,
 
-            structural_emit_reservation_candidate:
-              structuralReservationCandidate
-                ? {
-                    file:
-                      structuralReservationCandidate.file,
-                    probe_definition_hints:
-                      structuralReservationCandidate
-                        .probeDefinitionHints ?? 0,
-                    probe_exact_matches:
-                      structuralReservationCandidate
-                        .probeExactMatches ?? 0,
-                    probe_rank:
-                      probeRankedFiles.findIndex(
-                        (candidate) =>
-                          candidate.file ===
-                          structuralReservationCandidate.file,
-                      ) + 1,
-                  }
-                : null,
+              repo_capability_protocol:
+                globResolution.repoCapability?.protocol ??
+                REPO_CAPABILITY_PROTOCOL,
+              repo_capability_inventory_complete:
+                globResolution.repoCapability?.inventory_complete ??
+                false,
+              repo_capability_absence_claims_allowed:
+                globResolution.repoCapability
+                  ?.absence_claims_allowed ?? false,
 
-            structural_emit_reservation_selected:
-              structuralReservationCandidate
-                ? selectedLexicalFileSet.has(
-                    evidenceFileKey(
-                      structuralReservationCandidate.file,
-                    ),
+              source_family_plan_protocol:
+                globResolution.sourceFamilyPlan?.protocol ??
+                SOURCE_FAMILY_PLAN_PROTOCOL,
+              source_family_plan_applied:
+                globResolution.sourceFamilyPlan?.applied === true,
+              source_family_plan_reason:
+                globResolution.sourceFamilyPlan?.reason ?? null,
+
+              source_family_required_roles:
+                globResolution.sourceFamilyPlan?.required_roles ?? [],
+              source_family_initially_covered_roles:
+                globResolution.sourceFamilyPlan
+                  ?.initially_covered_roles ?? [],
+              source_family_resolved_roles:
+                globResolution.sourceFamilyPlan?.resolved_roles ?? [],
+              source_family_unresolved_roles:
+                globResolution.sourceFamilyPlan?.unresolved_roles ?? [],
+              source_family_selected_families:
+                globResolution.sourceFamilyPlan
+                  ?.selected_families ?? [],
+              source_family_added_extensions:
+                globResolution.sourceFamilyPlan
+                  ?.added_extensions ?? [],
+
+              requested_glob: requestedGlob ?? null,
+              effective_glob:
+                globResolution.effectiveGlob ?? null,
+              glob_role_broadened:
+                globResolution.roleBroadened === true,
+            },
+          )
+
+          const glob = globResolution.effectiveGlob
+          const signature = searchSignature(queries, target, glob)
+
+          if (state && state.signatures.has(signature)) {
+            return await blockSearch("duplicate_search", {
+              queries,
+              path: target,
+              glob: glob ?? null,
+              requested_glob: requestedGlob ?? null,
+              effective_glob: glob ?? null,
+              glob_correction_reason: globResolution.reason,
+            })
+          }
+
+          const remainingEvidenceBytes = state
+            ? Math.max(0, MAX_TURN_EVIDENCE_BYTES - state.evidenceBytes)
+            : MAX_OUTPUT_BYTES
+
+          if (state && remainingEvidenceBytes <= 0) {
+            return await blockSearch("evidence_budget", {
+              limit_bytes: MAX_TURN_EVIDENCE_BYTES,
+            })
+          }
+
+          // Every new search now starts with a file-level lexical discovery
+          // pass. This is deliberate: routing must not depend on a possibly
+          // truncated stream of line hits from one noisy file.
+          if (
+            state &&
+            state.executedSearches >= MAX_EXECUTED_SEARCHES_PER_TURN
+          ) {
+            return await blockSearch("executed_search_budget", {
+              limit: MAX_EXECUTED_SEARCHES_PER_TURN,
+              queries,
+              path: target,
+              glob: glob ?? null,
+              requested_glob: requestedGlob ?? null,
+              effective_glob: glob ?? null,
+              glob_correction_reason: globResolution.reason,
+            })
+          }
+
+          if (state) {
+            state.signatures.add(signature)
+            state.executedSearches += 1
+          }
+
+          const discoveryStarted = performance.now()
+          const discoveryResults = await Promise.all(
+            queries.map((query, index) =>
+              runCompiledDiscovery(
+                root,
+                query,
+                index,
+                target,
+                glob,
+              ),
+            ),
+          )
+          const discoveryElapsedMs =
+            Math.round((performance.now() - discoveryStarted) * 100) / 100
+
+          const discoveryComplete = discoveryResults.every(
+            (result) => result.scanComplete,
+          )
+          const lexicalRankedFiles =
+            rankDiscoveredFiles(discoveryResults)
+
+          const retrievalRanking =
+            await runRetrievalRanker(
+              root,
+              queries,
+              lexicalRankedFiles,
+            )
+
+          const rankedFiles =
+            retrievalRanking.rankedFiles
+
+          const probeFiles =
+            selectProbeFiles(
+              rankedFiles,
+              discoveryResults,
+            )
+          const probeFileSet = new Set(probeFiles.map((entry) => entry.file))
+          const allDiscoveredFilesProbed =
+            rankedFiles.length === probeFileSet.size
+
+          const queryPlan = queries.map((query, index) => {
+            const discoveryResult = discoveryResults.find(
+              (result) => result.queryIndex === index,
+            )
+
+            const effectiveQuery =
+              discoveryResult?.effectiveQuery ?? query
+            const matchMode =
+              discoveryResult?.matchMode ?? "exact"
+            const cacheQuery =
+              discoveryResult?.cacheQuery ?? effectiveQuery
+
+            const targets = probeFiles
+              .filter((entry) => entry.queries.has(index))
+              .map((entry) => entry.file)
+              .sort()
+
+            const cacheKey = queryCacheKey(
+              root,
+              cacheQuery,
+              target,
+              glob,
+              targets,
+            )
+
+            const cached =
+              state?.queryCache?.get(cacheKey) ?? null
+
+            const compiledProbe =
+              discoveryResult?.compiledProbe
+                ? restrictProbeResultToTargets(
+                    discoveryResult.compiledProbe,
+                    targets,
                   )
-                : false,
+                : null
 
-            probe_files: probeFiles.map((entry) => ({
-              file: entry.file,
-              queries: [...entry.queries].sort((a, b) => a - b),
+            return {
+              query,
+              effectiveQuery,
+              matchMode,
+              index,
+              targets,
+              cacheKey,
+              cached,
+              compiledProbe,
+            }
+          })
 
-              // Effective rank entering the line-probe stage.
-              initial_rank:
-                rankedFiles.findIndex(
-                  (candidate) => candidate.file === entry.file,
-                ) + 1,
+          const freshPlan = queryPlan.filter(
+            (item) => !item.cached && !item.compiledProbe,
+          )
 
-              // Independent routing provenance. These values prove whether
-              // BM25F/RRF changed lexical ordering; they are never authority.
-              lexical_rank:
-                entry.retrievalLexicalRank ?? null,
-              retrieval_rank:
-                entry.retrievalRank ?? null,
-              bm25_rank:
-                entry.retrievalBm25Rank ?? null,
-              bm25f_score:
-                entry.retrievalBm25fScore ?? null,
-              rrf_score:
-                entry.retrievalRrfScore ?? null,
-              structural_complete:
-                entry.retrievalStructuralComplete ?? null,
-            })),
-            lexical_probed_files: probeFileSet.size,
-            impact_probed_files: impactValidation.queryCount,
-            probed_files: probeFileSet.size + impactValidation.queryCount,
-            lexical_emitted_files: selectedLexicalFileSet.size,
-            impact_emitted_files_count: selectedImpactFiles.length,
-            emitted_files: selectedFileSet.size,
-            selected_files: selectedFiles.map((entry) => ({
-              file: entry.file,
-              origin: entry.origin ?? "lexical",
-              queries: [...(entry.queries ?? [])].sort((a, b) => a - b),
-              coverage: entry.coverage,
-              path_affinity: entry.pathAffinity,
-              rarity: entry.rarity,
-              initial_rank: entry.origin === "impact" ? null : entry.initialRank ?? null,
-              probe_line_hits: entry.origin === "impact" ? null : entry.probeLineHits ?? 0,
-              probe_exact_matches: entry.origin === "impact" ? null : entry.probeExactMatches ?? 0,
-              probe_definition_hints: entry.origin === "impact" ? null : entry.probeDefinitionHints ?? 0,
-              probe_rank:
-                entry.origin === "impact"
-                  ? null
-                  : probeRankedFiles.findIndex((candidate) => candidate.file === entry.file) + 1,
-              impact_seed: entry.impact?.seed ?? null,
-              impact_direction: entry.impact?.direction ?? null,
-              impact_bindings: entry.impact?.bindings ?? [],
-              impact_validation_kind: entry.impact?.validationKind ?? null,
-            })),
-            retained_unread_files: Math.max(0, rankedFiles.length - probeFileSet.size),
-            retained_unemitted_files: routeRendered.retained,
-            probed_unemitted_files: Math.max(0, probeFileSet.size - selectedLexicalFileSet.size),
-            discovery_files_by_query: discoveryResults.map((result) => ({
-              query_index: result.queryIndex,
-              files: result.files?.length ?? 0,
-              complete: result.scanComplete,
-              capped: result.scanCapped,
-              timed_out: result.timedOut,
-              error: result.error ?? null,
-              match_mode: result.matchMode ?? "exact",
-              effective_query: result.effectiveQuery ?? result.query,
-              compiler_tokens: result.compilerTokens ?? [],
-              query_formulation_protocol:
-                result.queryFormulation?.protocol ?? null,
-              query_formulation:
-                result.queryFormulation ?? null,
-            })),
-            query_compiler_fallbacks: discoveryResults
-              .filter((result) => result.matchMode && result.matchMode !== "exact")
-              .map((result) => ({
-                query_index: result.queryIndex,
-                match_mode: result.matchMode,
-              })),
-            query_formulation_protocol: QUERY_FORMULATION_PROTOCOL,
-            query_formulation_fallbacks: discoveryResults
-              .filter((result) => result.queryFormulation)
-              .map((result) => ({
-                query_index: result.queryIndex,
-                match_mode: result.matchMode,
-                branches:
-                  result.queryFormulation?.branches?.length ?? 0,
-                selected_files:
-                  result.queryFormulation?.selected_files ?? 0,
-              })),
-            reused_query_count: reusedQueryCount,
-            executed_query_count: executedQueryCount,
-            reused_queries: queryPlan
-              .filter((item) => item.cached)
-              .map((item) => item.query),
-            query_cache_entries: state?.queryCache?.size ?? null,
-            query_cache_matches: state?.queryCacheMatches ?? null,
-            representation,
-            source_representation: sourceRepresentation,
-            unique_hits: hits.size,
-            probed_unique_hits: probeHits.size,
-            exact_span_hits: exactSpanHits,
-            probed_exact_span_hits: probedExactSpanHits,
-            distill_input_hits: distillInput.length,
-            capsule_exact_probe_attempted:
-              capsuleExactProbeAttempted,
-            capsule_exact_probe_reason:
-              capsuleExactProbeReason,
-            capsule_exact_probe_elapsed_ms:
-              capsuleExactProbeElapsedMs,
-            capsule_exact_probe_groups:
-              Array.isArray(capsuleExactProbeGroups)
-                ? capsuleExactProbeGroups.length
-                : null,
+          const reusedQueryCount = queryPlan.filter(
+            (item) => Boolean(item.cached),
+          ).length
 
-            owner_recovery_input_hits: ownerRecoveryInput.length,
-            owner_recovery_attempted: ownerRecoveryAttempted,
-            owner_recovery_reason: ownerRecoveryReason,
-            owner_recovery_elapsed_ms: ownerRecoveryElapsedMs,
-            owner_recovery_observed: ownerRecoveryObserved,
-            owner_recovery_distill_complete:
-              ownerRecoveryDistillComplete,
-            owner_recovery_location_complete:
-              ownerRecoveryLocationComplete,
-            owner_recovery_anchor_complete:
-              ownerRecoveryAnchorComplete,
-            owner_recovery_witness_complete:
-              ownerRecoveryWitnessComplete,
-            owner_recovery_ir_complete:
-              ownerRecoveryIrComplete,
-            owner_recovery_exact_span_hits:
-              ownerRecoveryExactSpanHits,
-            owner_recovery_mapped_hits:
-              ownerRecoveryMappedHits,
-            owner_recovery_group_count:
-              ownerRecoveryGroupCount,
-            owner_recovery_files_attempted:
-              ownerRecoveryFilesAttempted,
-            owner_recovery_files_accepted:
-              ownerRecoveryFilesAccepted,
-            owner_recovery_files_rejected:
+          const compiledQueryCount = queryPlan.filter(
+            (item) => Boolean(item.compiledProbe),
+          ).length
+
+          const executedQueryCount =
+            freshPlan.filter(
+              (item) => item.targets.length > 0,
+            ).length +
+            compiledQueryCount
+
+          const refineStarted = performance.now()
+
+          const freshResults = await Promise.all(
+            freshPlan.map(async (item) => {
+              const raw = await runQuery(
+                root,
+                item.effectiveQuery,
+                item.index,
+                item.targets,
+                glob,
+              )
+
+              return queryCompilerProbeResult(
+                raw,
+                item.query,
+                item.matchMode,
+              )
+            }),
+          )
+
+          const refineElapsedMs =
+            Math.round((performance.now() - refineStarted) * 100) / 100
+
+          const freshByIndex = new Map(
+            freshResults.map((result) => [result.queryIndex, result]),
+          )
+
+          if (state) {
+            for (const item of queryPlan) {
+              if (item.cached) continue
+
+              const result =
+                item.compiledProbe ??
+                freshByIndex.get(item.index)
+
+              if (result) {
+                rememberQueryResult(
+                  state,
+                  item.cacheKey,
+                  result,
+                )
+              }
+            }
+          }
+
+          const probeResults = queryPlan
+            .map((item) => {
+              if (item.cached) {
+                return reindexQueryResult(
+                  item.cached,
+                  item.index,
+                  true,
+                )
+              }
+
+              if (item.compiledProbe) {
+                return reindexQueryResult(
+                  item.compiledProbe,
+                  item.index,
+                  false,
+                )
+              }
+
+              const result = freshByIndex.get(item.index)
+
+              return result
+                ? reindexQueryResult(
+                    result,
+                    item.index,
+                    false,
+                  )
+                : null
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.queryIndex - b.queryIndex)
+
+          const probeRankedFiles = rankProbedFiles(
+            rankedFiles,
+            probeResults,
+          )
+          const structuralReservationCandidate =
+            bestStructuralProbeCandidate(probeRankedFiles)
+
+          const impactValidation = await validateImpactHypotheses(
+            root,
+            target,
+            glob,
+            probeFiles,
+            probeResults,
+          )
+          const impactIndexShadow = impactValidation.indexStats
+          const semanticImpactShadow =
+            await runSemanticImpactShadow(
+              root,
+              impactValidation.validated,
+            )
+
+          // v2.24 shadow only: existing source-validated Impact routing remains
+          // authoritative until real-repo semantic telemetry proves zero false
+          // confirmations.
+          const selectedFiles = selectEmitFilesWithImpact(
+            probeRankedFiles,
+            discoveryResults,
+            impactValidation.validated,
+          )
+          const selectedFileSet = new Set(
+            selectedFiles.map((entry) => evidenceFileKey(entry.file)),
+          )
+          const selectedLexicalFiles = selectedFiles.filter(
+            (entry) => entry?.origin !== "impact",
+          )
+          const selectedLexicalFileSet = new Set(
+            selectedLexicalFiles.map((entry) => evidenceFileKey(entry.file)),
+          )
+          const selectedImpactFiles = selectedFiles.filter(
+            (entry) => entry?.origin === "impact",
+          )
+          const allDiscoveredFilesSelected =
+            rankedFiles.length === selectedLexicalFileSet.size
+          const routingActive =
+            !discoveryComplete || !allDiscoveredFilesSelected || selectedImpactFiles.length > 0
+          const results = filterQueryResultsToFiles(probeResults, selectedLexicalFiles)
+
+          const probeHits = mergeHits(probeResults)
+          const hits = mergeHits(results)
+          const exactSpanHits = [...hits.values()].reduce(
+            (total, hit) => total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
+            0,
+          )
+          const probedExactSpanHits = [...probeHits.values()].reduce(
+            (total, hit) =>
+              total + (Array.isArray(hit.exactSpans) ? hit.exactSpans.length : 0),
+            0,
+          )
+          const selectedScanComplete = probeResults.every(
+            (result) => result.scanComplete,
+          )
+          const scanComplete =
+            discoveryComplete &&
+            allDiscoveredFilesProbed &&
+            selectedScanComplete
+          const querySummary = [
+            ...discoverySummaryFor(discoveryResults),
+            ...querySummaryFor(probeResults),
+          ]
+          const callBudgetBytes = Math.min(MAX_OUTPUT_BYTES, remainingEvidenceBytes)
+          const provisionalRoute = routingActive
+            ? renderRouteMap(
+                rankedFiles,
+                selectedFiles,
+                ROUTE_BODY_BUDGET_BYTES,
+              )
+            : { body: [], bodyBytes: 0, retained: 0 }
+
+          const reserveHeader = rawHeaderReserveLines({
+            scanComplete,
+            discoveryComplete,
+            selectedScanComplete,
+            candidateFiles: rankedFiles.length,
+            selectedFiles: selectedFileSet.size,
+            uniqueHits: hits.size,
+            querySummary,
+          })
+
+          const headerReserve = bytes([
+            ...reserveHeader,
+            ...(provisionalRoute.body.length > 0
+              ? ["", ...provisionalRoute.body]
+              : []),
+            "",
+          ].join("\n"))
+
+          if (callBudgetBytes <= headerReserve) {
+            return await blockSearch("evidence_budget", {
+              limit_bytes: MAX_TURN_EVIDENCE_BYTES,
+              remaining_bytes: remainingEvidenceBytes,
+              required_header_bytes: headerReserve,
+            })
+          }
+
+          const bodyBudget = Math.min(
+            BODY_BUDGET_BYTES,
+            Math.max(0, callBudgetBytes - headerReserve),
+          )
+
+          const routeRendered = routingActive
+            ? renderRouteMap(rankedFiles, selectedFiles, provisionalRoute.bodyBytes)
+            : { body: [], bodyBytes: 0, retained: 0 }
+
+          const rawRendered = await renderEvidence(root, hits, bodyBudget)
+          const selectedEvidenceComplete = rawRendered.shown.size === hits.size
+          const rawEvidenceComplete =
+            scanComplete && allDiscoveredFilesSelected && selectedEvidenceComplete
+          const rawComplete = scanComplete && rawEvidenceComplete
+          const rawReasons = []
+
+          if (!discoveryComplete) rawReasons.push("lexical_discovery_incomplete")
+          else if (!allDiscoveredFilesProbed) rawReasons.push("probe_subset")
+          else if (!selectedScanComplete) rawReasons.push("scan_incomplete")
+          else if (!allDiscoveredFilesSelected) rawReasons.push("budgeted_emit_subset")
+          if (!selectedEvidenceComplete) rawReasons.push("output_budget")
+
+          const rawHeader = [
+            ...(globResolution.corrected
+              ? [
+                  `GLOB_CORRECTED requested=${JSON.stringify(requestedGlob)} effective=${JSON.stringify(glob ?? null)} reason=${globResolution.reason}`,
+                ]
+              : []),
+            `SEARCH complete=${rawComplete} scan_complete=${scanComplete} lexical_discovery_complete=${discoveryComplete} selected_scan_complete=${selectedScanComplete} evidence_complete=${rawEvidenceComplete} selected_evidence_complete=${selectedEvidenceComplete} candidate_files=${rankedFiles.length} selected_files=${selectedFileSet.size} unique_hits=${hits.size} shown_hits=${rawRendered.shown.size}`,
+            ...querySummary,
+          ]
+
+          if (rawReasons.length) {
+            rawHeader.push(`INCOMPLETE reasons=${rawReasons.join(",")}`)
+          }
+
+          const rawContent = [
+            ...rawHeader,
+            ...(routeRendered.body.length > 0 ? ["", ...routeRendered.body] : []),
+            "",
+            ...rawRendered.body,
+          ].join("\n")
+          const rawResultBytes = bytes(rawContent)
+
+          if (rawResultBytes > callBudgetBytes) {
+            return await blockSearch("internal_budget_guard", {
+              stage: "raw_pack",
+              result_bytes: rawResultBytes,
+              call_budget_bytes: callBudgetBytes,
+              reserved_header_bytes: headerReserve,
+              rendered_body_bytes: rawRendered.bodyBytes,
+              route_body_bytes: routeRendered.bodyBytes,
+              overflow_bytes: rawResultBytes - callBudgetBytes,
+            })
+          }
+
+          const pressure = evidencePressure(
+            hits,
+            rawRendered,
+            selectedEvidenceComplete,
+          )
+          const distillInput = distillerHitsFromMerged(hits)
+          const ownerRecoveryInput = ownerRecoveryHitsFromMerged(hits)
+          const spansComplete = spanCaptureComplete(results)
+
+          let representation = "raw"
+          let content = rawContent
+          let resultBytes = rawResultBytes
+          let bodyBytes = rawRendered.bodyBytes
+          let shownHits = rawRendered.shown.size
+          let evidenceComplete = rawEvidenceComplete
+          let complete = rawComplete
+
+          let distillAttempted = false
+          let distillReason = "not_needed"
+          let distillElapsedMs = null
+          let distillerElapsedMs = null
+          let distillIrComplete = null
+          let distillWitnessComplete = null

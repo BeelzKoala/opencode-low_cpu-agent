@@ -1,4 +1,1247 @@
 
+function buildQueryFormulationPlan(query) {
+  const rawBranches = splitTopLevelRegexAlternatives(query)
+  if (
+    !Array.isArray(rawBranches) ||
+    rawBranches.length < 1 ||
+    rawBranches.length > QUERY_FORMULATION_MAX_BRANCHES
+  ) {
+    return null
+  }
+
+  const branches = []
+  const atoms = []
+  const seen = new Set()
+
+  for (const raw of rawBranches) {
+    const branchAtoms = queryFormulationAtoms(raw)
+
+    if (
+      branchAtoms.length < 1 ||
+      branchAtoms.length > QUERY_FORMULATION_MAX_ATOMS_PER_BRANCH
+    ) {
+      return null
+    }
+
+    branches.push({ raw, atoms: branchAtoms })
+
+    for (const atom of branchAtoms) {
+      if (seen.has(atom)) continue
+      seen.add(atom)
+      atoms.push(atom)
+      if (atoms.length > QUERY_FORMULATION_MAX_ATOMS) return null
+    }
+  }
+
+  if (
+    atoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
+    !atoms.some((atom) => /[a-z]/.test(atom))
+  ) {
+    return null
+  }
+
+  return {
+    protocol: QUERY_FORMULATION_PROTOCOL,
+    branches,
+    atoms,
+  }
+}
+
+function queryFormulationLineHasAtom(text, atom) {
+  const line = String(text ?? "").toLowerCase()
+  if (!line || !atom) return false
+
+  if (/^\d+$/.test(atom)) {
+    const escaped = escapeRegexLiteral(atom)
+    return new RegExp(`(?:^|\\D)${escaped}(?=\\D|$)`).test(line)
+  }
+
+  return line.includes(atom)
+}
+
+async function runQueryFormulationDiscovery(
+  root,
+  query,
+  queryIndex,
+  target,
+  glob,
+  plan = null,
+) {
+  const formulation = plan ?? buildQueryFormulationPlan(query)
+  if (!formulation) return null
+
+  const anchorQuery =
+    `(?i:${formulation.atoms.map(escapeRegexLiteral).join("|")})`
+
+  const probe = await runQuery(
+    root,
+    anchorQuery,
+    queryIndex,
+    [target],
+    glob,
+  )
+
+  if (
+    probe.scanComplete !== true ||
+    probe.timedOut === true ||
+    probe.scanCapped === true ||
+    probe.error
+  ) {
+    return null
+  }
+
+  const atomsByFile = new Map()
+  const globalObserved = new Set()
+
+  for (const match of probe.matches ?? []) {
+    const file = evidenceFileKey(match?.file)
+    if (!file) continue
+
+    let fileAtoms = atomsByFile.get(file)
+    if (!fileAtoms) {
+      fileAtoms = new Set()
+      atomsByFile.set(file, fileAtoms)
+    }
+
+    for (const atom of formulation.atoms) {
+      if (!queryFormulationLineHasAtom(match?.text, atom)) continue
+      fileAtoms.add(atom)
+      globalObserved.add(atom)
+    }
+  }
+
+  const scoreByFile = new Map()
+  const branchEvidence = []
+
+  formulation.branches.forEach((branch, branchIndex) => {
+    const sourceBackedAtoms = branch.atoms.filter((atom) =>
+      globalObserved.has(atom),
+    )
+
+    if (
+      sourceBackedAtoms.length < QUERY_FORMULATION_MIN_FILE_ATOMS ||
+      !sourceBackedAtoms.some((atom) => /[a-z]/.test(atom))
+    ) {
+      return
+    }
+
+    const requiredAtoms = Math.max(
+      QUERY_FORMULATION_MIN_FILE_ATOMS,
+      Math.ceil(
+        sourceBackedAtoms.length * QUERY_FORMULATION_MIN_COVERAGE_RATIO,
+      ),
+    )
+
+    branchEvidence.push({
+      branchIndex,
+      sourceBackedAtoms,
+      requiredAtoms,
+    })
+
+    for (const [file, observedAtoms] of atomsByFile.entries()) {
+      const matchedAtoms = sourceBackedAtoms.filter((atom) =>
+        observedAtoms.has(atom),
+      )
+
+      if (matchedAtoms.length < requiredAtoms) continue
+
+      const ratio = matchedAtoms.length / sourceBackedAtoms.length
+      const prior = scoreByFile.get(file) ?? {
+        file,
+        maxAtoms: 0,
+        maxRatio: 0,
+        matchedBranches: 0,
+      }
+
+      prior.maxAtoms = Math.max(prior.maxAtoms, matchedAtoms.length)
+      prior.maxRatio = Math.max(prior.maxRatio, ratio)
+      prior.matchedBranches += 1
+      scoreByFile.set(file, prior)
+    }
+  })
+
+  const ranked = [...scoreByFile.values()].sort(
+    (a, b) =>
+      b.maxAtoms - a.maxAtoms ||
+      b.maxRatio - a.maxRatio ||
+      b.matchedBranches - a.matchedBranches ||
+      a.file.localeCompare(b.file),
+  )
+
+  if (
+    ranked.length < 1 ||
+    ranked.length > QUERY_FORMULATION_MAX_FILES
+  ) {
+    return null
+  }
+
+  const files = ranked.map((entry) => entry.file)
+  const allowed = new Set(files)
+  const matches = (probe.matches ?? [])
+    .filter((match) => allowed.has(evidenceFileKey(match?.file)))
+    .map((match) => ({
+      ...match,
+      exactSpans: [],
+      matchTexts: [],
+    }))
+
+  if (matches.length < 1) return null
+
+  const compiledProbe = {
+    ...probe,
+    query,
+    requestedQuery: query,
+    matchMode: "token_file_cooccurrence",
+    matches,
+  }
+
+  return {
+    query,
+    requestedQuery: query,
+    effectiveQuery: anchorQuery,
+    cacheQuery: `token-file:${formulation.branches
+      .map((branch) => branch.atoms.join("&"))
+      .join("||")}`,
+    queryIndex,
+    files,
+    timedOut: false,
+    scanCapped: false,
+    error: null,
+    scanComplete: true,
+    matchMode: "token_file_cooccurrence",
+    compilerTokens: formulation.atoms,
+    compiledProbe,
+    queryFormulation: {
+      protocol: QUERY_FORMULATION_PROTOCOL,
+      branches: formulation.branches.map((branch) => branch.atoms),
+      source_backed_branches: branchEvidence.map((entry) => ({
+        branch_index: entry.branchIndex,
+        atoms: entry.sourceBackedAtoms,
+        required_atoms: entry.requiredAtoms,
+      })),
+      selected_files: files.length,
+    },
+  }
+}
+
+function queryCompilerProbeResult(
+  result,
+  requestedQuery,
+  matchMode,
+) {
+  const fallback = matchMode !== "exact"
+
+  return {
+    ...result,
+    query: requestedQuery,
+    matchMode,
+    matches: (result?.matches ?? []).map((match) => ({
+      ...match,
+
+      // A fallback hit is real source evidence, but it is NOT an exact
+      // match for the model-supplied regex. Never allow it to masquerade
+      // as exact structural replacement evidence.
+      exactSpans: fallback ? [] : (match.exactSpans ?? []),
+      matchTexts: fallback ? [] : (match.matchTexts ?? []),
+    })),
+  }
+}
+
+function restrictProbeResultToTargets(result, targets) {
+  const allowed = new Set(
+    (targets ?? []).map((file) => evidenceFileKey(file)),
+  )
+
+  return {
+    ...result,
+    matches: (result?.matches ?? []).filter((match) =>
+      allowed.has(evidenceFileKey(match.file)),
+    ),
+  }
+}
+
+async function runCompiledDiscovery(
+  root,
+  query,
+  queryIndex,
+  target,
+  glob,
+) {
+  const exact = await runFileDiscovery(
+    root,
+    query,
+    queryIndex,
+    target,
+    glob,
+  )
+
+  const exactResult = {
+    ...exact,
+    query,
+    requestedQuery: query,
+    effectiveQuery: query,
+    cacheQuery: `exact:${query}`,
+    matchMode: "exact",
+    compilerTokens: [],
+    compiledProbe: null,
+  }
+
+  const exactCompleteZero =
+    exact.scanComplete === true &&
+    exact.timedOut !== true &&
+    exact.scanCapped !== true &&
+    !exact.error &&
+    (exact.files?.length ?? 0) === 0
+
+  if (
+    !exactCompleteZero ||
+    !queryCompilerEligible(query)
+  ) {
+    return exactResult
+  }
+
+  // Stage 1: preserve regex semantics and only relax case.
+  const foldedQuery = queryCompilerCasefoldRegex(query)
+
+  const folded = await runFileDiscovery(
+    root,
+    foldedQuery,
+    queryIndex,
+    target,
+    glob,
+  )
+
+  if ((folded.files?.length ?? 0) > 0) {
+    return {
+      ...folded,
+      query,
+      requestedQuery: query,
+      effectiveQuery: foldedQuery,
+      cacheQuery: `casefold:${foldedQuery}`,
+      matchMode: "casefold",
+      compilerTokens: queryCompilerTokens(query),
+      compiledProbe: null,
+    }
+  }
+
+  // Do not build stronger routing claims on top of an incomplete fallback.
+  const foldedCompleteZero =
+    folded.scanComplete === true &&
+    folded.timedOut !== true &&
+    folded.scanCapped !== true &&
+    !folded.error &&
+    (folded.files?.length ?? 0) === 0
+
+  if (!foldedCompleteZero) {
+    return exactResult
+  }
+
+  const formulationPlan = buildQueryFormulationPlan(query)
+
+  // Stage 2a: top-level alternation is usually a set of independent search
+  // hypotheses. Requiring every token from every alternative on one line is
+  // structurally impossible, so try bounded same-file co-occurrence first.
+  if ((formulationPlan?.branches?.length ?? 0) > 1) {
+    const formulated = await runQueryFormulationDiscovery(
+      root,
+      query,
+      queryIndex,
+      target,
+      glob,
+      formulationPlan,
+    )
+    if (formulated) return formulated
+  }
+
+  // Stage 2b: order-independent recovery, but only when ALL significant
+  // query tokens occur on the SAME physical source line.
+  //
+  // One longest token is used as a cheap rg anchor; JS then validates
+  // complete co-occurrence. This avoids permutations/lookaheads and keeps
+  // the operation bounded to one additional rg scan.
+  const tokens = queryCompilerTokens(query)
+
+  if (tokens.length < QUERY_COMPILER_MIN_TOKENS) {
+    return exactResult
+  }
+
+  const anchorToken = queryCompilerAnchorToken(tokens)
+  if (!anchorToken) return exactResult
+
+  const anchorQuery =
+    `(?i:${escapeRegexLiteral(anchorToken)})`
+
+  const anchorProbe = await runQuery(
+    root,
+    anchorQuery,
+    queryIndex,
+    [target],
+    glob,
+  )
+
+  if (
+    anchorProbe.scanComplete !== true ||
+    anchorProbe.timedOut === true ||
+    anchorProbe.scanCapped === true ||
+    anchorProbe.error
+  ) {
+    return exactResult
+  }
+
+  const matches = (anchorProbe.matches ?? [])
+    .filter((match) => {
+      const line = String(match?.text ?? "").toLowerCase()
+      return tokens.every((token) => line.includes(token))
+    })
+    .map((match) => ({
+      ...match,
+      exactSpans: [],
+      matchTexts: [],
+    }))
+
+  if (matches.length < 1) {
+    const formulated = await runQueryFormulationDiscovery(
+      root,
+      query,
+      queryIndex,
+      target,
+      glob,
+      formulationPlan,
+    )
+    return formulated ?? exactResult
+  }
+
+  const files = [
+    ...new Set(
+      matches
+        .map((match) => match.file)
+        .filter((file) => typeof file === "string" && file.length > 0),
+    ),
+  ]
+
+  const compiledProbe = {
+    ...anchorProbe,
+    query,
+    requestedQuery: query,
+    matchMode: "token_line_cooccurrence",
+    matches,
+  }
+
+  return {
+    query,
+    requestedQuery: query,
+    effectiveQuery: anchorQuery,
+    cacheQuery: `token-line:${tokens.join("|")}`,
+    queryIndex,
+    files,
+    timedOut: false,
+    scanCapped: false,
+    error: null,
+    scanComplete: true,
+    matchMode: "token_line_cooccurrence",
+    compilerTokens: tokens,
+    compiledProbe,
+  }
+}
+
+function pathAffinity(file, queryIndices, queryTokensByIndex) {
+  const normalized = evidenceFileKey(file).toLowerCase()
+  const base = path.posix.basename(normalized)
+  const stem = base.replace(/\.[^.]+$/, "")
+  let score = 0
+
+  for (const queryIndex of queryIndices ?? []) {
+    for (const token of queryTokensByIndex.get(queryIndex) ?? []) {
+      if (stem === token) score += 4
+      else if (stem.includes(token)) score += 2
+      else if (normalized.includes(token)) score += 1
+    }
+  }
+
+  return score
+}
+
+function rankDiscoveredFiles(discoveryResults) {
+  const byFile = new Map()
+  const queryFileCounts = new Map()
+  const queryTokensByIndex = new Map(
+    (discoveryResults ?? []).map((result) => [
+      result.queryIndex,
+      queryPathTokens(result.query),
+    ]),
+  )
+
+  for (const result of discoveryResults ?? []) {
+    const unique = [...new Set(result?.files ?? [])]
+    queryFileCounts.set(result.queryIndex, unique.length)
+
+    for (const file of unique) {
+      let entry = byFile.get(file)
+
+      if (!entry) {
+        entry = {
+          file,
+          queries: new Set(),
+          coverage: 0,
+          pathAffinity: 0,
+          rarity: 0,
+        }
+        byFile.set(file, entry)
+      }
+
+      entry.queries.add(result.queryIndex)
+    }
+  }
+
+  for (const entry of byFile.values()) {
+    entry.coverage = entry.queries.size
+    entry.pathAffinity = pathAffinity(
+      entry.file,
+      entry.queries,
+      queryTokensByIndex,
+    )
+    entry.rarity = [...entry.queries].reduce((score, queryIndex) => {
+      const count = Math.max(1, queryFileCounts.get(queryIndex) ?? 1)
+      return score + 1 / count
+    }, 0)
+  }
+
+  // Relevance stays separate from fairness.
+  //
+  // Query specificity is intentionally only a tertiary tie-break:
+  //
+  //   coverage > path affinity > provenance specificity > stable path
+  //
+  // Therefore a weak rare query can never outrank stronger multi-query
+  // coverage or a better path match. It only replaces the previous
+  // arbitrary filename tie-break when lexical evidence is otherwise equal.
+  //
+  // The signal is free: discovery already measured the number of files
+  // matched by every query, so this adds no repository scan or model call.
+  return [...byFile.values()].sort(
+    (a, b) =>
+      b.coverage - a.coverage ||
+      b.pathAffinity - a.pathAffinity ||
+      b.rarity - a.rarity ||
+      a.file.localeCompare(b.file),
+  )
+}
+
+
+
+function semanticResolverBinary() {
+  const override = process.env.OPENCODE_SEMANTIC_RESOLVER
+  if (typeof override === "string" && override.length > 0) {
+    return override
+  }
+
+  const dir = runtimeStackDirectory()
+  if (!dir) return null
+
+  return path.join(dir, "opencode-semantic-resolver")
+}
+
+function semanticLanguageForFile(file) {
+  const lower = String(file ?? "").toLowerCase()
+
+  if (lower.endsWith(".py") || lower.endsWith(".pyi")) {
+    return "python"
+  }
+
+  if (
+    lower.endsWith(".ts") ||
+    lower.endsWith(".tsx") ||
+    lower.endsWith(".mts") ||
+    lower.endsWith(".cts")
+  ) {
+    return "typescript"
+  }
+
+  if (
+    lower.endsWith(".js") ||
+    lower.endsWith(".jsx") ||
+    lower.endsWith(".mjs") ||
+    lower.endsWith(".cjs")
+  ) {
+    return "javascript"
+  }
+
+  return null
+}
+
+function semanticExpectedImpactTarget(relation) {
+  if (relation?.direction === "forward") {
+    return evidenceFileKey(relation?.file)
+  }
+
+  if (relation?.direction === "reverse") {
+    return evidenceFileKey(relation?.seed)
+  }
+
+  return ""
+}
+
+function semanticSpecCursorOffset(spec) {
+  const value = String(spec ?? "")
+  if (!value) return 0
+
+  const slash = Math.max(
+    value.lastIndexOf("/"),
+    value.lastIndexOf("\\"),
+  )
+
+  if (slash >= 0 && slash + 1 < value.length) {
+    return slash + 1
+  }
+
+  const dot = value.lastIndexOf(".")
+  if (dot >= 0 && dot + 1 < value.length) {
+    return dot + 1
+  }
+
+  return 0
+}
+
+function semanticLineWindow(text, oneBasedLine, maxLines) {
+  if (
+    !Number.isInteger(oneBasedLine) ||
+    oneBasedLine < 1 ||
+    !Number.isInteger(maxLines) ||
+    maxLines < 1
+  ) {
+    return null
+  }
+
+  let line = 1
+  let start = 0
+
+  while (line < oneBasedLine) {
+    const next = text.indexOf("\n", start)
+    if (next < 0) return null
+    start = next + 1
+    line += 1
+  }
+
+  let end = start
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const next = text.indexOf("\n", end)
+    if (next < 0) {
+      end = text.length
+      break
+    }
+
+    end = next + 1
+  }
+
+  return { start, end }
+}
+
+async function semanticImpactQueryForRelation(
+  root,
+  relation,
+  id,
+) {
+  const witnessFile = evidenceFileKey(relation?.witness_file)
+  const expectedFile = semanticExpectedImpactTarget(relation)
+  const spec =
+    typeof relation?.spec === "string"
+      ? relation.spec
+      : ""
+  const witnessLine = relation?.witness_line
+  const language = semanticLanguageForFile(witnessFile)
+
+  if (
+    !witnessFile ||
+    !expectedFile ||
+    !spec ||
+    !language ||
+    !Number.isInteger(witnessLine) ||
+    witnessLine < 1
+  ) {
+    return {
+      ok: false,
+      reason: "unsupported_relation",
+    }
+  }
+
+  const resolved = path.resolve(root, witnessFile)
+
+  if (
+    resolved !== root &&
+    !resolved.startsWith(root + path.sep)
+  ) {
+    return {
+      ok: false,
+      reason: "witness_outside_root",
+    }
+  }
+
+  let canonical
+  let info
+  let source
+
+  try {
+    canonical = await realpath(resolved)
+
+    if (
+      canonical !== root &&
+      !canonical.startsWith(root + path.sep)
+    ) {
+      return {
+        ok: false,
+        reason: "witness_realpath_outside_root",
+      }
+    }
+
+    info = await stat(canonical)
+
+    if (
+      !info.isFile() ||
+      info.size > MAX_CONTEXT_FILE_BYTES
+    ) {
+      return {
+        ok: false,
+        reason: "witness_file_budget",
+      }
+    }
+
+    source = await readFile(canonical, "utf8")
+  } catch {
+    return {
+      ok: false,
+      reason: "witness_unavailable",
+    }
+  }
+
+  const window = semanticLineWindow(
+    source,
+    witnessLine,
+    SEMANTIC_IMPACT_WITNESS_WINDOW_LINES,
+  )
+
+  if (!window) {
+    return {
+      ok: false,
+      reason: "witness_line_invalid",
+    }
+  }
+
+  const fragment = source.slice(window.start, window.end)
+  const occurrences = []
+
+  let cursor = 0
+
+  while (true) {
+    const found = fragment.indexOf(spec, cursor)
+    if (found < 0) break
+
+    occurrences.push(found)
+
+    if (occurrences.length > 1) break
+
+    cursor = found + Math.max(1, spec.length)
+  }
+
+  if (occurrences.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        occurrences.length === 0
+          ? "module_spec_not_found"
+          : "module_spec_ambiguous",
+    }
+  }
+
+  const charOffset =
+    window.start +
+    occurrences[0] +
+    semanticSpecCursorOffset(spec)
+
+  const byteOffset =
+    Buffer.byteLength(
+      source.slice(0, charOffset),
+      "utf8",
+    )
+
+  return {
+    ok: true,
+    language,
+    expectedFile,
+    relation: {
+      file: evidenceFileKey(relation?.file),
+      seed: evidenceFileKey(relation?.seed),
+      direction: relation?.direction ?? null,
+      witness_file: witnessFile,
+      witness_line: witnessLine,
+      spec,
+    },
+    query: {
+      id,
+      operation: "definition",
+      file: witnessFile,
+      byte_offset: byteOffset,
+      max_results: SEMANTIC_IMPACT_MAX_RESULTS,
+    },
+  }
+}
+
+function runSemanticResolverBatch(
+  root,
+  language,
+  planned,
+) {
+  return new Promise((resolve) => {
+    const binary = semanticResolverBinary()
+
+    if (!binary) {
+      resolve({
+        ok: false,
+        reason: "binary_unavailable",
+        language,
+        elapsedMs: 0,
+      })
+      return
+    }
+
+    const started = performance.now()
+
+    let child
+
+    try {
+      child = spawn(binary, [], {
+        cwd: root,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    } catch {
+      resolve({
+        ok: false,
+        reason: "spawn_error",
+        language,
+        elapsedMs:
+          Math.round(
+            (performance.now() - started) * 100,
+          ) / 100,
+      })
+      return
+    }
+
+    let stdout = []
+    let stdoutBytes = 0
+    let stderr = ""
+    let timedOut = false
+    let outputLimited = false
+    let settled = false
+
+    const elapsed = () =>
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100
+
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, SEMANTIC_RESOLVER_TIMEOUT_MS)
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length
+
+      if (
+        stdoutBytes >
+        SEMANTIC_RESOLVER_MAX_STDOUT_BYTES
+      ) {
+        outputLimited = true
+        child.kill("SIGKILL")
+        return
+      }
+
+      stdout.push(Buffer.from(chunk))
+    })
+
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) {
+        stderr += chunk.toString("utf8")
+      }
+    })
+
+    child.on("error", () => {
+      finish({
+        ok: false,
+        reason: "spawn_error",
+        language,
+        elapsedMs: elapsed(),
+      })
+    })
+
+    child.on("close", (code) => {
+      if (timedOut) {
+        finish({
+          ok: false,
+          reason: "timeout",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      if (outputLimited) {
+        finish({
+          ok: false,
+          reason: "stdout_limit",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      if (code !== 0) {
+        finish({
+          ok: false,
+          reason: "exit_error",
+          language,
+          elapsedMs: elapsed(),
+          error: stderr.trim() || null,
+        })
+        return
+      }
+
+      let response
+
+      try {
+        response = JSON.parse(
+          Buffer.concat(stdout).toString("utf8"),
+        )
+      } catch {
+        finish({
+          ok: false,
+          reason: "invalid_json",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      const expectedIds =
+        new Set(
+          planned.map((entry) => entry.query.id),
+        )
+
+      const results = response?.results
+
+      const ids =
+        Array.isArray(results)
+          ? results.map((entry) => entry?.id)
+          : []
+
+      const validIds =
+        ids.length === expectedIds.size &&
+        new Set(ids).size === ids.length &&
+        ids.every((id) => expectedIds.has(id))
+
+      if (
+        response?.protocol !== SEMANTIC_RESOLVER_PROTOCOL ||
+        response?.authority !== SEMANTIC_RESOLVER_AUTHORITY ||
+        typeof response?.engine !== "string" ||
+        !response.engine ||
+        !Array.isArray(results) ||
+        !validIds
+      ) {
+        finish({
+          ok: false,
+          reason: "response_contract_invalid",
+          language,
+          elapsedMs: elapsed(),
+        })
+        return
+      }
+
+      finish({
+        ok: true,
+        reason: "resolved",
+        language,
+        engine: response.engine,
+        elapsedMs: elapsed(),
+        response,
+      })
+    })
+
+    const request = {
+      protocol: SEMANTIC_RESOLVER_PROTOCOL,
+      root,
+      language,
+      queries:
+        planned.map((entry) => entry.query),
+    }
+
+    child.stdin.end(
+      JSON.stringify(request),
+      "utf8",
+    )
+  })
+}
+
+async function runSemanticImpactShadow(
+  root,
+  validatedImpact,
+) {
+  const sourceValidated =
+    Array.isArray(validatedImpact)
+      ? validatedImpact
+      : []
+
+  if (sourceValidated.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_source_validated_impact",
+      elapsedMs: 0,
+      queries: 0,
+      confirmed: 0,
+      contradicted: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      unavailable: 0,
+      skipped: 0,
+      engines: [],
+      outcomes: [],
+    }
+  }
+
+  const started = performance.now()
+  const planned = []
+  const seen = new Set()
+  let skipped = 0
+
+  outer:
+  for (const hypothesis of sourceValidated) {
+    for (const relation of hypothesis?.relations ?? []) {
+      if (planned.length >= SEMANTIC_IMPACT_MAX_QUERIES) {
+        break outer
+      }
+
+      const expectedFile =
+        semanticExpectedImpactTarget(relation)
+
+      const key = [
+        evidenceFileKey(relation?.witness_file),
+        relation?.witness_line,
+        relation?.spec,
+        expectedFile,
+      ].join("\0")
+
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      const entry =
+        await semanticImpactQueryForRelation(
+          root,
+          relation,
+          `impact-semantic-${planned.length + 1}`,
+        )
+
+      if (!entry.ok) {
+        skipped += 1
+        continue
+      }
+
+      planned.push(entry)
+    }
+  }
+
+  if (planned.length < 1) {
+    return {
+      attempted: false,
+      ok: true,
+      reason: "no_supported_semantic_witnesses",
+      elapsedMs:
+        Math.round(
+          (performance.now() - started) * 100,
+        ) / 100,
+      queries: 0,
+      confirmed: 0,
+      contradicted: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      unavailable: 0,
+      skipped,
+      engines: [],
+      outcomes: [],
+    }
+  }
+
+  const byLanguage = new Map()
+
+  for (const entry of planned) {
+    const batch =
+      byLanguage.get(entry.language) ?? []
+    batch.push(entry)
+    byLanguage.set(entry.language, batch)
+  }
+
+  const batches =
+    await Promise.all(
+      [...byLanguage.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([language, entries]) =>
+          runSemanticResolverBatch(
+            root,
+            language,
+            entries,
+          ),
+        ),
+    )
+
+  const batchByLanguage =
+    new Map(
+      batches.map((batch) => [
+        batch.language,
+        batch,
+      ]),
+    )
+
+  const outcomes = []
+
+  for (const plan of planned) {
+    const batch =
+      batchByLanguage.get(plan.language)
+
+    if (!batch?.ok) {
+      outcomes.push({
+        verdict: "unavailable",
+        expected_file: plan.expectedFile,
+        actual_file: null,
+        engine: null,
+        reason:
+          batch?.reason ??
+          "batch_unavailable",
+        ...plan.relation,
+      })
+      continue
+    }
+
+    const result =
+      batch.response.results.find(
+        (entry) =>
+          entry?.id === plan.query.id,
+      )
+
+    if (!result) {
+      outcomes.push({
+        verdict: "unavailable",
+        expected_file: plan.expectedFile,
+        actual_file: null,
+        engine: batch.engine,
+        reason: "result_missing",
+        ...plan.relation,
+      })
+      continue
+    }
+
+    const locations =
+      Array.isArray(result?.locations)
+        ? result.locations
+        : []
+
+    let verdict = "unresolved"
+    let actualFile = null
+    let reason = result?.status ?? "unknown"
+
+    if (
+      result?.status === "resolved" &&
+      result?.bounded_complete === true &&
+      locations.length === 1
+    ) {
+      actualFile =
+        evidenceFileKey(locations[0]?.file)
+
+      verdict =
+        actualFile === plan.expectedFile
+          ? "confirmed"
+          : "contradicted"
+
+      reason =
+        verdict === "confirmed"
+          ? "semantic_target_match"
+          : "semantic_target_mismatch"
+    } else if (
+      result?.status === "ambiguous" ||
+      result?.bounded_complete !== true ||
+      locations.length > 1
+    ) {
+      verdict = "ambiguous"
+      reason = "semantic_result_ambiguous"
+    } else if (
+      result?.status === "unsupported" ||
+      result?.status === "error"
+    ) {
+      verdict = "unavailable"
+    }
+
+    outcomes.push({
+      verdict,
+      expected_file: plan.expectedFile,
+      actual_file: actualFile,
+      engine: batch.engine,
+      reason,
+      ...plan.relation,
+    })
+  }
+
+  const count = (verdict) =>
+    outcomes.filter(
+      (entry) => entry.verdict === verdict,
+    ).length
+
+  const confirmed = count("confirmed")
+  const contradicted = count("contradicted")
+  const ambiguous = count("ambiguous")
+  const unresolved = count("unresolved")
+  const unavailable = count("unavailable")
+  const allBatchesOk =
+    batches.every((batch) => batch.ok)
+
+  return {
+    attempted: true,
+    ok: allBatchesOk,
+    reason:
+      !allBatchesOk
+        ? "resolver_partial"
+        : contradicted > 0
+          ? "semantic_contradictions_observed"
+          : confirmed > 0
+            ? "semantic_confirmations_observed"
+            : "semantic_no_confirmation",
+    elapsedMs:
+      Math.round(
+        (performance.now() - started) * 100,
+      ) / 100,
+    queries: planned.length,
+    confirmed,
+    contradicted,
+    ambiguous,
+    unresolved,
+    unavailable,
+    skipped,
+    engines:
+      [...new Set(
+        batches
+          .map((batch) => batch.engine)
+          .filter(Boolean),
+      )].sort(),
+    outcomes: outcomes.slice(
+      0,
+      SEMANTIC_IMPACT_MAX_QUERIES,
+    ),
+  }
+}
+
 function retrievalRankerBinary() {
   const override = process.env.OPENCODE_RETRIEVAL_RANKER
   if (typeof override === "string" && override.length > 0) {
@@ -1712,691 +2955,4 @@ if (
     ok: true,
     capsule,
   }
-}
-
-async function materializeCapabilityBoundMutation(
-  root,
-  state,
-  input,
-) {
-  const loaded = await readAuthorizedEditCapsule(root, state)
-  if (!loaded.ok) return { ...loaded, rescout: false }
-
-  const authorizedScopes = loaded.capsule.scopes.filter(
-    (scope) =>
-      scope?.context === "full" &&
-      scope?.mutation_authorized === true,
-  )
-  if (authorizedScopes.length !== 1) {
-    return {
-      ok: false,
-      reason: "mutation_capability_invalid",
-      detail: `authorized_scope_count_${authorizedScopes.length}`,
-      rescout: false,
-    }
-  }
-
-  const primaryTarget = authorizedScopes[0]
-  const primaryCapability = state?.localMutationCapability ?? null
-
-  let target = null
-  let capability = null
-  let activeHandoffPath = null
-
-  if (input.kind === "replace_node") {
-    if (
-      primaryCapability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
-      primaryCapability?.replaceNodeReady !== true ||
-      !sameAuthorizedScopeIdentity(
-        primaryTarget,
-        {
-          file: primaryCapability?.target?.file,
-          symbol_name: primaryCapability?.target?.symbol_name,
-          symbol_kind: primaryCapability?.target?.symbol_kind,
-          start_line: primaryCapability?.target?.start_line,
-          end_line: primaryCapability?.target?.end_line,
-        },
-      )
-    ) {
-      return {
-        ok: false,
-        reason: "mutation_capability_unavailable",
-        detail: "local_capability_target_mismatch",
-        rescout: false,
-      }
-    }
-
-    const binding =
-      await bindReplaceNodeMutationCandidate(
-        root,
-        state,
-        input.before,
-      )
-
-    if (!binding.ok) {
-      return {
-        ok: false,
-        reason: binding.reason,
-        detail: binding.reason,
-        repairable: binding.repairable === true,
-        rescout: false,
-        candidate_count: binding.candidate_count ?? null,
-      }
-    }
-
-    target = binding.candidate.target
-    capability = binding.candidate.capability
-
-    if (
-      !Array.isArray(capability.allowedMutations) ||
-      !capability.allowedMutations.includes("replace_node")
-    ) {
-      return {
-        ok: false,
-        reason: "mutation_not_authorized_by_handoff",
-        detail: "replace_node_not_in_local_capability",
-        rescout: false,
-      }
-    }
-
-    activeHandoffPath = capability.localHandoffPath
-    state.boundMutationTarget = mutationCandidateIdentity(target)
-  } else if (input.kind === "rename_symbol") {
-    const renameCapability = state?.renameMutationCapability ?? null
-    target = renameCapability?.target ?? null
-    capability = renameCapability
-
-    const identitySha256 = target
-      ? createHash("sha256")
-          .update(JSON.stringify(target))
-          .digest("hex")
-      : null
-
-    if (
-      renameCapability?.protocol !== SCOUT_RENAME_TARGET_PROTOCOL ||
-      renameCapability?.operation !== "rename_symbol" ||
-      renameCapability?.ready !== true ||
-      renameCapability?.globalReady !== true ||
-      renameCapability?.sourceHandoffPath !== state?.scoutHandoffPath ||
-      renameCapability?.targetIdentitySha256 !== identitySha256 ||
-      typeof state?.scoutHandoffPath !== "string"
-    ) {
-      return {
-        ok: false,
-        reason: "rename_target_capability_invalid",
-        detail: "rename_target_capability_invalid",
-        rescout: true,
-      }
-    }
-
-    const renameFile = canonicalMutationFile(root, target?.file)
-    let currentBody
-    try {
-      currentBody = await readFile(path.resolve(root, renameFile ?? ""))
-    } catch {
-      return {
-        ok: false,
-        reason: "rename_target_file_unavailable",
-        detail: "rename_target_file_unavailable",
-        rescout: true,
-      }
-    }
-
-    const currentSha256 = createHash("sha256")
-      .update(currentBody)
-      .digest("hex")
-    if (currentSha256 !== renameCapability.targetSourceSha256) {
-      return {
-        ok: false,
-        reason: "rename_target_stale",
-        detail: "rename_target_stale",
-        rescout: true,
-      }
-    }
-
-    activeHandoffPath = state.scoutHandoffPath
-    state.boundMutationTarget = mutationCandidateIdentity(target)
-  }
-
-  const file = canonicalMutationFile(root, target?.file)
-  const symbol =
-    typeof target?.symbol_name === "string" ? target.symbol_name : ""
-
-  if (!file || !symbol) {
-    return {
-      ok: false,
-      reason: "mutation_capability_invalid",
-      detail: "authorized_target_identity_invalid",
-      rescout: false,
-    }
-  }
-
-  if (
-    typeof activeHandoffPath !== "string" ||
-    activeHandoffPath.length < 1
-  ) {
-    return {
-      ok: false,
-      reason: "mutation_handoff_unavailable",
-      detail: "operation_handoff_missing",
-      rescout: false,
-    }
-  }
-
-  const mutation = {
-    file,
-    kind: input.kind,
-    symbol,
-    ...(typeof input.before === "string" ? { before: input.before } : {}),
-    ...(typeof input.replacement === "string"
-      ? { replacement: input.replacement }
-      : {}),
-    ...(typeof input.new_name === "string" ? { new_name: input.new_name } : {}),
-    ...(input.kind === "rename_symbol" ? { scope: "handoff" } : {}),
-  }
-
-  return {
-    ok: true,
-    mutation,
-    handoff_path: activeHandoffPath,
-    scope_context: target.context,
-    target: {
-      file,
-      symbol,
-      symbol_kind: target.symbol_kind ?? null,
-      start_line: target.start_line ?? null,
-      end_line: target.end_line ?? null,
-    },
-  }
-}
-const PATCH_COMPILER_RETRY_REASONS = new Set([
-  "mutation_contract_invalid",
-  "mutation_kind_invalid",
-  "mutation_file_invalid",
-  "symbol_not_found",
-  "symbol_ambiguous",
-  "expression_pattern_invalid",
-  "expression_not_found",
-  "expression_ambiguous",
-  "rename_context_ambiguous",
-  "rename_scope_too_large",
-  "lowered_edit_budget_exceeded",
-  "no_effect_plan",
-  "mutation_slice_not_exact",
-  "mutation_slice_ambiguous",
-  "mutation_slice_not_structural",
-  "mutation_slice_too_wide",
-  "mutation_fragment_invalid",
-  "mutation_replacement_invalid",
-  "candidate_language_invalid",
-])
-
-const PATCH_COMPILER_RESCOUT_REASONS = new Set([
-  "handoff_not_ready",
-  "local_capability_invalid",
-  "handoff_scope_mode_invalid",
-  "mutation_not_authorized_by_handoff",
-  "handoff_scope_empty",
-  "handoff_file_invalid",
-  "handoff_file_unavailable",
-  "file_outside_handoff",
-  "evidence_anchor_missing",
-  "rename_scope_incomplete",
-])
-
-const PATCH_RETRY_REASONS = new Set([
-  "edit_contract_invalid",
-  "check_contract_invalid",
-  "precondition_not_unique",
-  "ast_pattern_invalid",
-  "ast_metavariables_unsupported",
-  "ast_precondition_ambiguous",
-  "ast_precondition_not_found",
-  "no_effect",
-  "candidate_syntax_invalid",
-  "postcondition_failed",
-  "changed_file_budget_exceeded",
-  "changed_line_budget_exceeded",
-  "patch_budget_exceeded",
-])
-
-const PATCH_RESCOUT_REASONS = new Set([
-  "handoff_not_ready",
-  "handoff_scope_too_large",
-  "handoff_scope_empty",
-  "handoff_file_invalid",
-  "handoff_fingerprint_weak",
-  "handoff_fingerprint_missing",
-  "handoff_file_unavailable",
-  "stale_fingerprint",
-  "file_outside_handoff",
-  "check_file_outside_handoff",
-  "evidence_anchor_missing",
-  "edit_outside_evidence_radius",
-  "worktree_baseline_missing",
-  "worktree_baseline_mismatch",
-  "source_changed_during_execution",
-])
-
-function proofObligationsForMutations(mutations) {
-  const obligations = [
-    { id: "changed_file_set", check_kind: "changed_file_set", disposition: "fatal" },
-    { id: "replay_exact", check_kind: "replay_exact", disposition: "fatal" },
-    { id: "ast_parse", check_kind: "ast_parse", disposition: "fatal" },
-    { id: "candidate_validity_barrier", check_kind: "candidate_validity_barrier", disposition: "fatal" },
-    { id: "top_level_conservation", check_kind: "top_level_conservation", disposition: "repair" },
-    { id: "target_cardinality", check_kind: "target_cardinality", disposition: "repair" },
-  ]
-  if ((mutations ?? []).some((mutation) => mutation?.kind === "replace_node")) {
-    obligations.push(
-      { id: "replace_node_confinement", check_kind: "replace_node_confinement", disposition: "repair" },
-    )
-  }
-  if ((mutations ?? []).some((mutation) => mutation?.kind === "rename_symbol")) {
-    obligations.push(
-      { id: "rename_identifier_delta", check_kind: "rename_identifier_delta", disposition: "repair" },
-      { id: "rename_syntactic_closure", check_kind: "rename_global_closure", disposition: "rescout" },
-    )
-  }
-  return obligations.map((obligation) => ({ protocol: PROOF_OBLIGATION_PROTOCOL, ...obligation }))
-}
-
-function assessProofObligations(verificationResponse, obligations) {
-  const checks = Array.isArray(verificationResponse?.checks) ? verificationResponse.checks : []
-  const byKind = new Map()
-  for (const check of checks) {
-    if (!check || typeof check.kind !== "string") continue
-    if (!byKind.has(check.kind)) byKind.set(check.kind, [])
-    byKind.get(check.kind).push(check)
-  }
-
-  const failed = []
-  for (const obligation of obligations ?? []) {
-    const rows = byKind.get(obligation.check_kind) ?? []
-    const pass = rows.length > 0 && rows.every((row) => row?.pass === true)
-    if (!pass) failed.push({
-      id: obligation.id,
-      check_kind: obligation.check_kind,
-      disposition: obligation.disposition,
-      details: rows.filter((row) => row?.pass !== true).map((row) => ({ file: row?.file ?? null, detail: row?.detail ?? null })),
-    })
-  }
-  if (verificationResponse?.worktree_cleaned !== true) {
-    failed.push({ id: "worktree_cleanup", check_kind: "worktree_cleaned", disposition: "fatal", details: [] })
-  }
-
-  let disposition = "pass"
-  if (failed.some((item) => item.disposition === "fatal")) disposition = "fatal"
-  else if (failed.some((item) => item.disposition === "rescout")) disposition = "rescout"
-  else if (failed.length > 0) disposition = "repair"
-
-  return {
-    protocol: PROOF_OBLIGATION_PROTOCOL,
-    ok: failed.length === 0,
-    disposition,
-    obligations: obligations ?? [],
-    failed,
-  }
-}
-
-function compactProofFailure(assessment) {
-  return (assessment?.failed ?? []).map((item) => item.id).join(",") || "unknown"
-}
-
-function runJsonBinary(binary, root, request, protocol, timeoutMs, stdoutLimit) {
-  return new Promise((resolve) => {
-    if (!binary) {
-      resolve({ ok: false, reason: "binary_path_unavailable", elapsedMs: 0 })
-      return
-    }
-    const started = performance.now()
-    const child = spawn(binary, [], { cwd: root, stdio: ["pipe", "pipe", "pipe"] })
-    const stdout = []
-    const stderr = []
-    let stdoutBytes = 0
-    let stderrBytes = 0
-    let timedOut = false
-    let outputLimited = false
-    let settled = false
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 })
-    }
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL") }, timeoutMs)
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length
-      if (stdoutBytes > stdoutLimit) {
-        outputLimited = true
-        child.kill("SIGKILL")
-        return
-      }
-      stdout.push(Buffer.from(chunk))
-    })
-    child.stderr.on("data", (chunk) => {
-      if (stderrBytes >= 4096) return
-      const remaining = 4096 - stderrBytes
-      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
-      stderr.push(Buffer.from(kept))
-      stderrBytes += kept.length
-    })
-    child.stdin.on("error", () => {})
-    child.on("error", (error) => finish({ ok: false, reason: "spawn_error", error: String(error?.message ?? error) }))
-    child.on("close", (code, signal) => {
-      if (settled) return
-      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
-      if (timedOut) return finish({ ok: false, reason: "timeout", error: stderrText || null })
-      if (outputLimited) return finish({ ok: false, reason: "stdout_limit", error: stderrText || null })
-      if (code !== 0) return finish({ ok: false, reason: "exit_error", exitCode: code, signal: signal ?? null, error: stderrText || null })
-      let response
-      try {
-        response = JSON.parse(Buffer.concat(stdout).toString("utf8"))
-      } catch (error) {
-        return finish({ ok: false, reason: "invalid_json", error: String(error?.message ?? error) })
-      }
-      if (response?.protocol !== protocol) {
-        return finish({ ok: false, reason: "protocol_mismatch", response })
-      }
-      finish({
-        ok: true,
-        reason: "ok",
-        response,
-        diagnostic: stderrText || null,
-      })
-    })
-    try {
-      child.stdin.end(JSON.stringify(request))
-    } catch (error) {
-      child.kill("SIGKILL")
-      finish({ ok: false, reason: "stdin_error", error: String(error?.message ?? error) })
-    }
-  })
-}
-
-function runPatchCompiler(root, request) {
-  return runJsonBinary(
-    patchCompilerBinary(),
-    root,
-    request,
-    PATCH_COMPILER_PROTOCOL,
-    PATCH_COMPILER_TIMEOUT_MS,
-    PATCH_COMPILER_MAX_STDOUT_BYTES,
-  )
-}
-
-function runPatchExecutor(root, request) {
-  return runJsonBinary(
-    patchExecutorBinary(),
-    root,
-    request,
-    PATCH_EXECUTOR_PROTOCOL,
-    PATCH_EXECUTOR_TIMEOUT_MS,
-    PATCH_EXECUTOR_MAX_STDOUT_BYTES,
-  )
-}
-
-function runInvariantVerifier(root, request) {
-  return runJsonBinary(
-    invariantVerifierBinary(),
-    root,
-    request,
-    INVARIANT_VERIFIER_PROTOCOL,
-    INVARIANT_VERIFIER_TIMEOUT_MS,
-    INVARIANT_VERIFIER_MAX_STDOUT_BYTES,
-  )
-}
-
-function runCompletionAuthorizer(root, request) {
-  return runJsonBinary(
-    completionAuthorizerBinary(),
-    root,
-    request,
-    COMPLETION_AUTHORIZER_PROTOCOL,
-    COMPLETION_AUTHORIZER_TIMEOUT_MS,
-    COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES,
-  )
-}
-
-function completionAuthorizationPermitsTerminal(observation) {
-  return (
-    observation?.applicable === true &&
-    observation?.transport_ok === true &&
-    observation?.decision === "CERTIFY" &&
-    typeof observation?.certificate_sha256 === "string" &&
-    /^[0-9a-f]{64}$/.test(observation.certificate_sha256)
-  )
-}
-
-async function observeCompletionAuthorization(
-  root,
-  sessionID,
-  state,
-  persisted,
-  proofAssessment,
-  dispatchOrigin,
-  actionCommit,
-) {
-  const applicable =
-    dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
-    actionCommit?.protocol === ACTION_COMMIT_PROTOCOL &&
-    state?.taskAction?.protocol === TASK_ACTION_PROTOCOL &&
-    state.taskAction.status === "exact" &&
-    state.taskAction.operation === "rename_symbol"
-
-  if (!applicable) {
-    return {
-      applicable: false,
-      transport_ok: false,
-      decision: null,
-      reason: "completion_authorizer_not_applicable",
-      certificate_sha256: null,
-      elapsed_ms: 0,
-    }
-  }
-
-  const request = {
-    protocol: COMPLETION_AUTHORIZER_REQUEST_PROTOCOL,
-    policy: COMPLETION_AUTHORIZER_POLICY,
-    user_turn_id: state.taskTurnID,
-    task_action: state.taskAction,
-    action_commit: actionCommit,
-    patch_receipt_path: persisted.path,
-    patch_receipt_body: JSON.stringify(persisted.receipt, null, 2) + "\n",
-    verification_receipt_path: persisted.verificationPath,
-    verification_receipt_body:
-      JSON.stringify(persisted.verificationReceipt, null, 2) + "\n",
-    proof_assessment: proofAssessment,
-  }
-
-  const result = await runCompletionAuthorizer(root, request)
-  const response = result?.ok === true ? result.response : null
-  const certificateSha256 =
-    response?.decision === "CERTIFY" &&
-    typeof response?.certificate?.certificate_sha256 === "string"
-      ? response.certificate.certificate_sha256
-      : null
-
-  const observation = {
-    applicable: true,
-    transport_ok: result?.ok === true,
-    decision: response?.decision ?? null,
-    reason:
-      response?.reason ??
-      result?.reason ??
-      "completion_authorizer_unknown",
-    certificate_sha256: certificateSha256,
-    elapsed_ms: result?.elapsedMs ?? null,
-  }
-
-  await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
-    ts: nowMs(),
-    protocol: AGENT_PROTOCOL,
-    kind: "completion_authorizer",
-    completion_authorizer_protocol: COMPLETION_AUTHORIZER_PROTOCOL,
-    completion_authorizer_policy: COMPLETION_AUTHORIZER_POLICY,
-    completion_authorizer_authority: "terminal_permission",
-    completion_authorizer_applicable: observation.applicable,
-    completion_authorizer_transport_ok: observation.transport_ok,
-    completion_authorizer_decision: observation.decision,
-    completion_authorizer_reason: observation.reason,
-    completion_certificate_sha256: observation.certificate_sha256,
-    completion_authorizer_elapsed_ms: observation.elapsed_ms,
-    sessionID,
-    turnID: state.turnID,
-    task_turn_id: state.taskTurnID,
-    task_sha256: state.taskTextSha256,
-    action_commit_sha256: actionCommit?.commit_sha256 ?? null,
-    patch_receipt: persisted.path,
-    verification_receipt: persisted.verificationPath,
-    patch_sha256: persisted.receipt?.patch_sha256 ?? null,
-    project_root: root,
-  })
-
-  return observation
-}
-
-async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment, dispatch = null) {
-  const patch = typeof executorResponse?.patch === "string" ? executorResponse.patch : null
-  if (!patch || !sessionID || !state?.turnID) return null
-
-  const dir = path.join(root, ".opencode", "patches")
-  const key = scoutOpaqueKey(`${sessionID}:${state.turnID}`)
-  const patchPath = path.join(dir, `${key}.diff`)
-  const receiptPath = path.join(dir, `${key}.json`)
-  const verificationPath = path.join(dir, `${key}.verify.json`)
-  const nonce = `${process.pid}.${nowMs()}`
-  const patchTemp = `${patchPath}.${nonce}.tmp`
-  const receiptTemp = `${receiptPath}.${nonce}.tmp`
-  const verificationTemp = `${verificationPath}.${nonce}.tmp`
-  const receipt = {
-    protocol: PATCH_RECEIPT_PROTOCOL,
-    verification_protocol: VERIFICATION_RECEIPT_PROTOCOL,
-    verification_receipt: path.relative(root, verificationPath),
-    execution_protocol: EXECUTION_LOOP_PROTOCOL,
-    mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
-    mutation_dispatch_origin: dispatch?.origin ?? "model_tool",
-    action_commit_protocol: dispatch?.actionCommit?.protocol ?? null,
-    action_commit_sha256: dispatch?.actionCommit?.commit_sha256 ?? null,
-    mutation_tool: state.activeMutationTool,
-    visible_tool_schema_sha256: state.visibleToolSchemaSha256,
-    tool_contract_failures: state.contractFailures,
-    compiler_protocol: PATCH_COMPILER_PROTOCOL,
-    mutation_protocol: PATCH_MUTATION_PROTOCOL,
-    executor_protocol: PATCH_EXECUTOR_PROTOCOL,
-    edit_protocol: PATCH_EDIT_PROTOCOL,
-    search_protocol: SEARCH_PROTOCOL,
-    turn_key: scoutOpaqueKey(state.turnID),
-    generated_at_ms: nowMs(),
-    scout_handoff:
-      state.activeMutationHandoffPath ?? state.scoutHandoffPath,
-    discovery_handoff: state.scoutHandoffPath,
-    mutation_capability_protocol:
-      state.activeMutationTool === EXECUTE_RENAME_SYMBOL_TOOL
-        ? state.renameMutationCapability?.protocol ?? null
-        : state.localMutationCapability?.protocol ?? null,
-    mutation_capability_target:
-      state.activeMutationTool === EXECUTE_RENAME_SYMBOL_TOOL
-        ? state.renameMutationCapability?.target ?? null
-        : state.localMutationCapability?.target ?? null,
-    rename_target_capability_protocol:
-      state.renameMutationCapability?.protocol ?? null,
-    rename_target_capability_target:
-      state.renameMutationCapability?.target ?? null,
-    mutation_confinement_protocol:
-      (compilerResponse?.edits ?? []).some((edit) => edit?.kind === "replace_slice")
-        ? MUTATION_CONFINEMENT_PROTOCOL
-        : null,
-    mutation_confinements:
-      (compilerResponse?.edits ?? [])
-        .filter((edit) => edit?.kind === "replace_slice" && edit?.confinement)
-        .map((edit) => edit.confinement),
-    edit_capsule_protocol: EDIT_CAPSULE_PROTOCOL,
-    edit_capsule: state.editCapsulePath,
-    edit_capsule_sha256: state.editCapsuleHash,
-    execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-    proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
-    proof_obligations: proofAssessment?.obligations ?? [],
-    proof_disposition: proofAssessment?.disposition ?? null,
-    patch_path: path.relative(root, patchPath),
-    patch_sha256: createHash("sha256").update(patch).digest("hex"),
-    attempts_used: state.mutationAttempts,
-    mutation_attempts_used: state.mutationAttempts,
-    repair_attempts_used: state.repairAttempts,
-    compiler_runs: state.compilerRuns,
-    patch_attempts_used: state.patchAttempts,
-    executor_runs: state.executorRuns,
-    mutations_requested: compilerResponse?.mutations_requested ?? null,
-    mutations_effective: compilerResponse?.mutations_effective ?? null,
-    compiler_dropped_noops: compilerResponse?.dropped_noops ?? null,
-    compiler_dropped_duplicates: compilerResponse?.dropped_duplicates ?? null,
-    compiler_lowered_edits: compilerResponse?.lowered_edits ?? null,
-    compiler_checks_generated: compilerResponse?.checks_generated ?? null,
-    changed_files: executorResponse.changed_files ?? [],
-    changed_lines: executorResponse.changed_lines ?? 0,
-    patch_bytes: executorResponse.patch_bytes ?? bytes(patch),
-    changes: executorResponse.changes ?? [],
-    syntax_checked_files: executorResponse.syntax_checked_files ?? [],
-    postconditions_checked: executorResponse.postconditions_checked ?? 0,
-    structural_edits: executorResponse.structural_edits ?? 0,
-    git_diff_check: executorResponse.git_diff_check === true,
-    git_apply_check: executorResponse.git_apply_check === true,
-    repo_mutated: executorResponse.repo_mutated === true,
-    invariant_verifier_protocol: verificationResponse?.protocol ?? null,
-    invariants_total: verificationResponse?.invariants_total ?? null,
-    invariants_passed: verificationResponse?.invariants_passed ?? null,
-    invariants_failed: verificationResponse?.invariants_failed ?? null,
-  }
-
-  try {
-    await mkdir(dir, { recursive: true })
-    const verificationReceipt = {
-      protocol: VERIFICATION_RECEIPT_PROTOCOL,
-      generated_at_ms: nowMs(),
-      patch_receipt: path.relative(root, receiptPath),
-      patch_sha256: receipt.patch_sha256,
-      edit_capsule: state.editCapsulePath,
-      edit_capsule_sha256: state.editCapsuleHash,
-      proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
-      proof_assessment: proofAssessment,
-      verifier: verificationResponse,
-    }
-    const receiptBody = JSON.stringify(receipt, null, 2) + "\n"
-    const verificationBody = JSON.stringify(verificationReceipt, null, 2) + "\n"
-    const receiptSha256 =
-      createHash("sha256").update(receiptBody).digest("hex")
-    const verificationSha256 =
-      createHash("sha256").update(verificationBody).digest("hex")
-    await writeFile(patchTemp, patch, "utf8")
-    await writeFile(receiptTemp, receiptBody, "utf8")
-    await writeFile(verificationTemp, verificationBody, "utf8")
-    await rename(patchTemp, patchPath)
-    await rename(receiptTemp, receiptPath)
-    await rename(verificationTemp, verificationPath)
-    return {
-      path: path.relative(root, receiptPath),
-      verificationPath: path.relative(root, verificationPath),
-      receipt,
-      verificationReceipt,
-      receiptSha256,
-      verificationSha256,
-    }
-  } catch {
-    await rm(patchTemp, { force: true }).catch(() => {})
-    await rm(receiptTemp, { force: true }).catch(() => {})
-    await rm(verificationTemp, { force: true }).catch(() => {})
-    await rm(patchPath, { force: true }).catch(() => {})
-    await rm(receiptPath, { force: true }).catch(() => {})
-    await rm(verificationPath, { force: true }).catch(() => {})
-    return null
-  }
-}
-
-
-function impactIndexBinary() {
-  const override = process.env.OPENCODE_IMPACT_INDEX
-  if (typeof override === "string" && override.length > 0) return override
-  const home = process.env.HOME
-  if (typeof home !== "string" || home.length === 0) return null
-  return path.join(home, ".local", "libexec", "opencode-cpu-agent", "opencode-impact-index")
 }

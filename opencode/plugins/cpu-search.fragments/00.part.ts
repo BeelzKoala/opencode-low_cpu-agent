@@ -8,6 +8,88 @@ import {
   unresolvedTaskAction,
 } from "./cpu-search-core/task-action-v1.mjs"
 import {
+  TASK_REQUIREMENTS_PROTOCOL,
+  compileTaskRequirements,
+  unresolvedTaskRequirements,
+} from "./cpu-search-core/task-requirements-v1.mjs"
+import {
+  classifyEvidenceAuthority,
+} from "./cpu-search-core/evidence-authority-v1.mjs"
+import {
+  LOCALIZATION_STATUS,
+  decideLocalization,
+} from "./cpu-search-core/localization-decision-v1.mjs"
+import {
+  REPO_CAPABILITY_PROTOCOL,
+  SOURCE_FAMILY_PLAN_PROTOCOL,
+  compileRepoCapabilityProfile,
+  planTaskSourceFamilies,
+} from "./cpu-search-core/repo-capability-v1.mjs"
+import {
+  FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+  inspectFrameworkResourceFile,
+} from "./cpu-search-core/framework-resource-bridge-v1.mjs"
+
+import {
+  RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
+  inspectResourceAdapterFile,
+} from "./cpu-search-core/resource-adapter-bridge-v1.mjs"
+
+import {
+  TASK_ANCHOR_PROTOCOL,
+  compileTaskAnchors,
+} from "./cpu-search-core/task-anchor-v1.mjs"
+
+import {
+  TASK_CAUSAL_SHADOW_PROTOCOL,
+  runTaskCausalShadow,
+} from "./cpu-search-core/task-causal-shadow-v1.mjs"
+
+import {
+  TASK_SHAPE_PROTOCOL,
+  compileTaskShape,
+} from "./cpu-search-core/task-shape-v1.mjs"
+
+import {
+  ADDITIVE_LOCALIZATION_PLAN_PROTOCOL,
+  planAdditiveLocalization,
+} from "./cpu-search-core/additive-localization-plan-v1.mjs"
+
+
+import {
+  HOST_INTEGRATION_SHADOW_PROTOCOL,
+  runHostIntegrationShadow,
+} from "./cpu-search-core/host-integration-shadow-v1.mjs"
+
+
+import {
+  resolveAnchorFrontier,
+  routeAnchorValues,
+} from "./cpu-search-core/anchor-resolution-frontier-v1.mjs"
+
+import {
+  hostResourceClosureSummary,
+  mergeHostAliases,
+  resolveHostAliasesForNodes,
+  resolveHostClosureContext,
+} from "./cpu-search-core/host-resource-closure-v2.mjs"
+
+import {
+  projectAnchoredHostObligationProofs,
+} from "./cpu-search-core/host-obligation-projector-v1.mjs"
+
+import {
+  mergeTaskRoleEvidence,
+  projectTaskBoundObligationProofs,
+} from "./cpu-search-core/task-bound-obligation-evidence-v1.mjs"
+
+import {
+  solveObligationCoverage,
+} from "./cpu-search-core/obligation-coverage-v1.mjs"
+
+
+
+import {
   TASK_SEARCH_PLAN_PROTOCOL,
   compileTaskSearchPlanForState,
 } from "./cpu-search-core/task-search-plan-v1.mjs"
@@ -44,6 +126,17 @@ const INDEX_FACET_TEXT_MAX = 80
 const MAX_OUTPUT_BYTES = 6500
 const BODY_BUDGET_BYTES = 5000
 const MAX_CONTEXT_FILE_BYTES = 2 * 1024 * 1024
+const FRAMEWORK_ROUTING_MAX_FILES = 8
+const FRAMEWORK_ROUTING_MAX_FILE_BYTES = 512 * 1024
+const FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE = 32
+const FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN = 96
+const RESOURCE_ROUTING_MAX_FILES = 8
+const RESOURCE_ROUTING_MAX_FILE_BYTES = 512 * 1024
+const RESOURCE_ROUTING_MAX_EDGES_PER_FILE = 32
+const RESOURCE_ROUTING_MAX_EDGES_PER_TURN = 96
+const TASK_CAUSAL_SHADOW_MAX_HOPS = 3
+const TASK_CAUSAL_SHADOW_MAX_NODES = 48
+const TASK_CAUSAL_SHADOW_MAX_EDGES = 96
 const QUERY_TIMEOUT_MS = 1500
 
 // Structural BM25F/RRF is routing-only. Failure must preserve the existing
@@ -223,7 +316,7 @@ let runtimeStackManifestCache = null
 const EXECUTION_FSM_PROTOCOL = "causal-execution-fsm-v1"
 const TOOL_FRONTIER_PROTOCOL = "causal-tool-frontier-v2.5-deterministic-action"
 const TASK_CONTEXT_PROTOCOL = "task-context-v1"
-const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.1-json-string"
+const TASK_CONTEXT_ADAPTER_PROTOCOL = "task-context-adapter-v1.2-json-string-controls"
 const MUTATION_INTENT_PROTOCOL = "mutation-intent-grammar-v1"
 const TASK_CONTEXT_MAX_TEXT_BYTES = 16 * 1024
 const TASK_CONTEXT_MAX_PARTS = 64
@@ -622,6 +715,84 @@ async function resolveSearchLanguageGlob(root, target, requestedGlob, state) {
   }
 }
 
+
+async function resolveTaskSourceFamilyGlob(
+  root,
+  target,
+  requestedGlob,
+  state,
+) {
+  const legacy =
+    await resolveSearchLanguageGlob(
+      root,
+      target,
+      requestedGlob,
+      state,
+    )
+
+  const profile =
+    compileRepoCapabilityProfile({
+      inventoryProtocol: legacy.protocol,
+      complete: legacy.inventoryComplete === true,
+      files: legacy.inventoryFiles ?? 0,
+      extensions: legacy.inventoryExtensions ?? {},
+    })
+
+  const parsed =
+    parseSimpleLanguageGlob(legacy.effectiveGlob)
+
+  const sourceFamilyPlan =
+    planTaskSourceFamilies({
+      taskRequirements: state?.taskRequirements,
+      profile,
+      requestedExtensions:
+        parsed?.extensions ?? [],
+      maxExtensions:
+        SOURCE_GLOB_FALLBACK_MAX_EXTENSIONS,
+    })
+
+  const base = {
+    ...legacy,
+
+    repoCapability: profile,
+    sourceFamilyPlan,
+
+    roleBroadened: false,
+  }
+
+  if (
+    !parsed ||
+    sourceFamilyPlan?.applied !== true
+  ) {
+    return base
+  }
+
+  const effectiveGlob =
+    buildLanguageGlob(
+      parsed.prefix,
+      sourceFamilyPlan.effective_extensions,
+    )
+
+  if (
+    !effectiveGlob ||
+    effectiveGlob === legacy.effectiveGlob
+  ) {
+    return base
+  }
+
+  return {
+    ...base,
+
+    /*
+     * This is routing expansion, not correction of the model request.
+     * Keep legacy `corrected/reason` semantics intact and expose a separate
+     * role-broadening fact.
+     */
+    effectiveGlob,
+    roleBroadened: true,
+  }
+}
+
 function isReservedAgentEvidencePath(raw) {
   const normalized = String(raw ?? "")
     .replaceAll("\\", "/")
@@ -954,6 +1125,1166 @@ async function writeScoutHandoff(root, sessionID, bundle) {
     await rm(tempPath, { force: true }).catch(() => {})
     return null
   }
+}
+
+
+function frameworkResourceEdgeFact(edge) {
+  return evidenceFact("framework_edge", [
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+function frameworkResourceEdgeKey(edge) {
+  return JSON.stringify([
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+const ANCHOR_FRONTIER_MAX_CANDIDATE_FILES = 8
+const ANCHOR_FRONTIER_TIMEOUT_MS = 500
+const ANCHOR_FRONTIER_MAX_STDOUT_BYTES = 128 * 1024
+
+const NAVIGATION_REVERSE_MAX_CANDIDATE_FILES = 8
+const NAVIGATION_REVERSE_TIMEOUT_MS = 500
+const NAVIGATION_REVERSE_MAX_STDOUT_BYTES = 128 * 1024
+
+const HOST_RESOURCE_INVENTORY_MAX_FILES = 20_000
+const HOST_RESOURCE_INVENTORY_TIMEOUT_MS = 500
+const HOST_RESOURCE_INVENTORY_MAX_STDOUT_BYTES = 2 * 1024 * 1024
+
+
+function boundedInternalRgNullList(
+  root,
+  args,
+  {
+    maxFiles,
+    timeoutMs,
+    maxStdoutBytes,
+  },
+) {
+  return new Promise((resolve) => {
+    const started =
+      performance.now()
+
+    let stdoutBytes = 0
+    const chunks = []
+
+    let timedOut = false
+    let byteCapped = false
+    let spawnError = null
+    let settled = false
+
+    let child
+
+    try {
+      child = spawn(
+        "rg",
+        args,
+        {
+          cwd: root,
+          stdio: [
+            "ignore",
+            "pipe",
+            "ignore",
+          ],
+        },
+      )
+    } catch (error) {
+      resolve({
+        files: [],
+        complete: false,
+        timedOut: false,
+        scanCapped: false,
+        error:
+          String(
+            error?.message ??
+            error,
+          ),
+        elapsedMs:
+          Math.round(
+            (
+              performance.now() -
+              started
+            ) * 100,
+          ) / 100,
+      })
+
+      return
+    }
+
+    const timer =
+      setTimeout(
+        () => {
+          timedOut = true
+
+          try {
+            child.kill(
+              "SIGKILL",
+            )
+          } catch {
+            // Best effort watchdog.
+          }
+        },
+        timeoutMs,
+      )
+
+    child.on(
+      "error",
+      (error) => {
+        spawnError =
+          String(
+            error?.message ??
+            error,
+          )
+      },
+    )
+
+    child.stdout.on(
+      "data",
+      (chunk) => {
+        if (byteCapped) {
+          return
+        }
+
+        const buffer =
+          Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk)
+
+        if (
+          stdoutBytes +
+            buffer.length >
+          maxStdoutBytes
+        ) {
+          byteCapped = true
+
+          try {
+            child.kill(
+              "SIGKILL",
+            )
+          } catch {
+            // Best effort cap.
+          }
+
+          return
+        }
+
+        stdoutBytes +=
+          buffer.length
+
+        chunks.push(buffer)
+      },
+    )
+
+    child.on(
+      "close",
+      (code) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        clearTimeout(timer)
+
+        const raw =
+          Buffer.concat(
+            chunks,
+          ).toString(
+            "utf8",
+          )
+
+        const observed =
+          [
+            ...new Set(
+              raw
+                .split("\0")
+                .map(
+                  (value) =>
+                    evidenceFileKey(
+                      value,
+                    ),
+                )
+                .filter(
+                  (value) =>
+                    value &&
+                    value !== "." &&
+                    !value.startsWith("../") &&
+                    !path.isAbsolute(value),
+                ),
+            ),
+          ].sort()
+
+        const fileCapped =
+          observed.length >
+          maxFiles
+
+        const files =
+          observed.slice(
+            0,
+            maxFiles,
+          )
+
+        /*
+         * rg:
+         *   0 = matches/files
+         *   1 = complete zero-result search
+         *
+         * Both are deterministic complete outcomes.
+         */
+        const cleanExit =
+          code === 0 ||
+          code === 1
+
+        const scanCapped =
+          byteCapped ||
+          fileCapped
+
+        const complete =
+          cleanExit &&
+          !timedOut &&
+          !scanCapped &&
+          !spawnError
+
+        resolve({
+          files,
+          complete,
+          timedOut,
+          scanCapped,
+          error:
+            spawnError,
+
+          elapsedMs:
+            Math.round(
+              (
+                performance.now() -
+                started
+              ) * 100,
+            ) / 100,
+        })
+      },
+    )
+  })
+}
+
+
+async function discoverTaskAnchorFrontierFiles(
+  root,
+  taskAnchors,
+) {
+  const routeAnchors =
+    routeAnchorValues(
+      taskAnchors,
+    )
+
+  if (routeAnchors.length < 1) {
+    return {
+      protocol:
+        "anchor-frontier-discovery-v1",
+
+      route_anchors: [],
+      candidate_files: [],
+
+      route_results: [],
+
+      search_complete: true,
+      search_truncated: false,
+
+      elapsed_ms: 0,
+    }
+  }
+
+  const started =
+    performance.now()
+
+  const routeResults = []
+
+  for (const route of routeAnchors) {
+    const args = [
+      "--files-with-matches",
+      "--null",
+      "--fixed-strings",
+      "--no-messages",
+
+      /*
+       * Current first-class route-bearing source families.
+       * Unsupported languages simply fail closed at parser
+       * validation rather than becoming heuristic evidence.
+       */
+      "-g",
+      "*.{py,pyi,js,jsx,ts,tsx,mjs,cjs}",
+    ]
+
+    for (const pattern of EXCLUDES) {
+      args.push(
+        "-g",
+        pattern,
+      )
+    }
+
+    args.push(
+      "--",
+      route,
+      ".",
+    )
+
+    const result =
+      await boundedInternalRgNullList(
+        root,
+        args,
+        {
+          maxFiles:
+            ANCHOR_FRONTIER_MAX_CANDIDATE_FILES +
+            1,
+
+          timeoutMs:
+            ANCHOR_FRONTIER_TIMEOUT_MS,
+
+          maxStdoutBytes:
+            ANCHOR_FRONTIER_MAX_STDOUT_BYTES,
+        },
+      )
+
+    routeResults.push({
+      route,
+      ...result,
+    })
+  }
+
+  const allFiles =
+    [
+      ...new Set(
+        routeResults
+          .flatMap(
+            (result) =>
+              result.files,
+          ),
+      ),
+    ].sort()
+
+  const totalCapped =
+    allFiles.length >
+    ANCHOR_FRONTIER_MAX_CANDIDATE_FILES
+
+  const candidateFiles =
+    allFiles.slice(
+      0,
+      ANCHOR_FRONTIER_MAX_CANDIDATE_FILES,
+    )
+
+  const searchTruncated =
+    totalCapped ||
+    routeResults.some(
+      (result) =>
+        result.scanCapped ===
+        true,
+    )
+
+  const searchComplete =
+    !searchTruncated &&
+    routeResults.every(
+      (result) =>
+        result.complete ===
+        true,
+    )
+
+  return {
+    protocol:
+      "anchor-frontier-discovery-v1",
+
+    route_anchors:
+      routeAnchors,
+
+    candidate_files:
+      candidateFiles,
+
+    route_results:
+      routeResults,
+
+    search_complete:
+      searchComplete,
+
+    search_truncated:
+      searchTruncated,
+
+    elapsed_ms:
+      Math.round(
+        (
+          performance.now() -
+          started
+        ) * 100,
+      ) / 100,
+  }
+}
+
+
+function navigationIncludeTargetLiterals(
+  resourceNodes,
+) {
+  const nodes =
+    Array.isArray(resourceNodes)
+      ? resourceNodes
+      : []
+
+  return [
+    ...new Set(
+      nodes
+        .map(
+          (node) => {
+            if (
+              typeof node !== "string" ||
+              !node.startsWith(
+                "template:",
+              )
+            ) {
+              return null
+            }
+
+            const value =
+              node.slice(
+                "template:".length,
+              )
+
+            if (
+              value.length < 1 ||
+              value.startsWith("/") ||
+              value.includes("..")
+            ) {
+              return null
+            }
+
+            return value
+          },
+        )
+        .filter(Boolean),
+    ),
+  ].sort()
+}
+
+
+async function discoverNavigationReverseIncluderFiles(
+  root,
+  resourceNodes,
+) {
+  const targetLiterals =
+    navigationIncludeTargetLiterals(
+      resourceNodes,
+    )
+
+  if (targetLiterals.length < 1) {
+    return {
+      protocol:
+        "navigation-reverse-frontier-v1",
+
+      target_literals: [],
+      candidate_files: [],
+
+      search_complete: true,
+      search_truncated: false,
+
+      elapsed_ms: 0,
+    }
+  }
+
+  const started =
+    performance.now()
+
+  const results = []
+
+  for (const target of targetLiterals) {
+    const args = [
+      "--files-with-matches",
+      "--null",
+      "--fixed-strings",
+      "--no-messages",
+
+      /*
+       * Current first-class template/resource-bearing source
+       * family. Parser validation remains authoritative for
+       * relation evidence.
+       */
+      "-g",
+      "*.{html,htm,jinja,jinja2,j2}",
+    ]
+
+    for (const pattern of EXCLUDES) {
+      args.push(
+        "-g",
+        pattern,
+      )
+    }
+
+    args.push(
+      "--",
+      target,
+      ".",
+    )
+
+    const result =
+      await boundedInternalRgNullList(
+        root,
+        args,
+        {
+          /*
+           * +1 detects that the observed candidate set is not
+           * exhaustive. Positive sharedness proof does not
+           * require exhaustive discovery.
+           */
+          maxFiles:
+            NAVIGATION_REVERSE_MAX_CANDIDATE_FILES +
+            1,
+
+          timeoutMs:
+            NAVIGATION_REVERSE_TIMEOUT_MS,
+
+          maxStdoutBytes:
+            NAVIGATION_REVERSE_MAX_STDOUT_BYTES,
+        },
+      )
+
+    results.push({
+      target,
+      ...result,
+    })
+  }
+
+  const allFiles =
+    [
+      ...new Set(
+        results.flatMap(
+          (result) =>
+            result.files,
+        ),
+      ),
+    ].sort()
+
+  const totalCapped =
+    allFiles.length >
+    NAVIGATION_REVERSE_MAX_CANDIDATE_FILES
+
+  const candidateFiles =
+    allFiles.slice(
+      0,
+      NAVIGATION_REVERSE_MAX_CANDIDATE_FILES,
+    )
+
+  const searchTruncated =
+    totalCapped ||
+    results.some(
+      (result) =>
+        result.scanCapped === true,
+    )
+
+  const searchComplete =
+    !searchTruncated &&
+    results.every(
+      (result) =>
+        result.complete === true,
+    )
+
+  return {
+    protocol:
+      "navigation-reverse-frontier-v1",
+
+    target_literals:
+      targetLiterals,
+
+    candidate_files:
+      candidateFiles,
+
+    search_complete:
+      searchComplete,
+
+    search_truncated:
+      searchTruncated,
+
+    elapsed_ms:
+      Math.round(
+        (
+          performance.now() -
+          started
+        ) * 100,
+      ) / 100,
+  }
+}
+
+
+async function observedHostResourceInventory(
+  root,
+  state,
+) {
+  const cacheKey =
+    `host-resource-inventory-v2:${root}`
+
+  const cached =
+    state
+      ?.sourceInventoryCache
+      ?.get(
+        cacheKey,
+      )
+
+  if (
+    cached &&
+    cached.protocol ===
+      "host-resource-inventory-v2"
+  ) {
+    return {
+      ...cached,
+      cache_hit: true,
+    }
+  }
+
+  const args = [
+    "--files",
+    "--null",
+    "--no-messages",
+  ]
+
+  for (const pattern of EXCLUDES) {
+    args.push(
+      "-g",
+      pattern,
+    )
+  }
+
+  const result =
+    await boundedInternalRgNullList(
+      root,
+      args,
+      {
+        maxFiles:
+          HOST_RESOURCE_INVENTORY_MAX_FILES,
+
+        timeoutMs:
+          HOST_RESOURCE_INVENTORY_TIMEOUT_MS,
+
+        maxStdoutBytes:
+          HOST_RESOURCE_INVENTORY_MAX_STDOUT_BYTES,
+      },
+    )
+
+  const inventory = {
+    protocol:
+      "host-resource-inventory-v2",
+
+    authority:
+      "routing_inventory_only",
+
+    files:
+      result.files,
+
+    complete:
+      result.complete ===
+      true,
+
+    timed_out:
+      result.timedOut ===
+      true,
+
+    truncated:
+      result.scanCapped ===
+      true,
+
+    error:
+      result.error ??
+      null,
+
+    elapsed_ms:
+      result.elapsedMs,
+
+    cache_hit:
+      false,
+
+    mutation_authority:
+      false,
+  }
+
+  if (
+    state?.sourceInventoryCache
+      instanceof Map
+  ) {
+    state.sourceInventoryCache.set(
+      cacheKey,
+      inventory,
+    )
+  }
+
+  return inventory
+}
+
+
+async function inspectFrameworkRoutingForSelected(
+  root,
+  selectedFiles,
+  state,
+  options = null,
+) {
+  const routeFacts = new Set()
+  const frameworks = new Set()
+  const edgeKinds = new Set()
+
+  let filesScanned = 0
+  let witnesses = 0
+  let edgeCandidates = 0
+  let validatedEdges = 0
+  let rejectedEdges = 0
+  let skippedFiles = 0
+  let truncated = false
+
+  const selected = (
+    Array.isArray(selectedFiles)
+      ? selectedFiles
+      : []
+  ).slice(0, FRAMEWORK_ROUTING_MAX_FILES)
+
+  if (
+    Array.isArray(selectedFiles) &&
+    selectedFiles.length > selected.length
+  ) {
+    truncated = true
+  }
+
+  for (const entry of selected) {
+    const rawFile =
+      typeof entry === "string"
+        ? entry
+        : entry?.file
+
+    const file = evidenceFileKey(rawFile)
+
+    if (
+      !file ||
+      file === "." ||
+      file.startsWith("../") ||
+      path.isAbsolute(file)
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let safeFile
+
+    try {
+      safeFile = await safeTarget(root, file)
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (safeFile === ".") {
+      skippedFiles += 1
+      continue
+    }
+
+    const absolute = path.join(root, safeFile)
+
+    let info
+
+    try {
+      info = await stat(absolute)
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (
+      !info.isFile() ||
+      info.size > FRAMEWORK_ROUTING_MAX_FILE_BYTES
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let text
+
+    try {
+      text = await readFile(absolute, "utf8")
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    let inspected
+
+    try {
+      inspected = inspectFrameworkResourceFile({
+        sourcePath: file,
+        text,
+        maxWitnesses:
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE * 2,
+        maxEdges:
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_FILE,
+
+        routeTargets:
+          options?.routeTargets ??
+          null,
+
+        includeTargets:
+          options?.includeTargets ??
+          null,
+      })
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    filesScanned += 1
+    witnesses += inspected.witnesses.length
+    edgeCandidates += inspected.edge_candidates.length
+    rejectedEdges +=
+      inspected.rejected_edge_candidates.length
+
+    truncated ||= inspected.truncated === true
+
+    for (const framework of inspected.frameworks) {
+      frameworks.add(framework)
+    }
+
+    for (const edge of inspected.resource_edges) {
+      if (
+        validatedEdges >=
+        FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        truncated = true
+        break
+      }
+
+      validatedEdges += 1
+      edgeKinds.add(edge.kind)
+
+      routeFacts.add(
+        frameworkResourceEdgeFact(edge),
+      )
+
+      if (
+        state?.frameworkResourceEdges instanceof Map &&
+        state.frameworkResourceEdges.size <
+          FRAMEWORK_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        state.frameworkResourceEdges.set(
+          frameworkResourceEdgeKey(edge),
+          edge,
+        )
+      }
+    }
+  }
+
+  return {
+    protocol:
+      FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+
+    authority: "routing_only",
+    mutationAuthority: false,
+
+    filesScanned,
+    skippedFiles,
+
+    frameworks:
+      [...frameworks].sort(),
+
+    witnesses,
+    edgeCandidates,
+    validatedEdges,
+    rejectedEdges,
+
+    edgeKinds:
+      [...edgeKinds].sort(),
+
+    routeFacts,
+    truncated,
+  }
+}
+
+
+function resourceAdapterEdgeKey(edge) {
+  return JSON.stringify([
+    edge?.kind ?? null,
+    edge?.from ?? null,
+    edge?.to ?? null,
+    evidenceFileKey(edge?.witness?.file),
+    edge?.witness?.line ?? null,
+    edge?.witness?.sha256 ?? null,
+  ])
+}
+
+async function inspectResourceRoutingForSelected(
+  root,
+  selectedFiles,
+  state,
+) {
+  const families = new Set()
+  const edgeKinds = new Set()
+
+  let filesScanned = 0
+  let witnesses = 0
+  let edgeCandidates = 0
+  let validatedEdges = 0
+  let rejectedEdges = 0
+  let skippedFiles = 0
+  let truncated = false
+
+  const selected = (
+    Array.isArray(selectedFiles)
+      ? selectedFiles
+      : []
+  ).slice(
+    0,
+    RESOURCE_ROUTING_MAX_FILES,
+  )
+
+  if (
+    Array.isArray(selectedFiles) &&
+    selectedFiles.length >
+      selected.length
+  ) {
+    truncated = true
+  }
+
+  for (const entry of selected) {
+    const rawFile =
+      typeof entry === "string"
+        ? entry
+        : entry?.file
+
+    const file =
+      evidenceFileKey(rawFile)
+
+    if (
+      !file ||
+      file === "." ||
+      file.startsWith("../") ||
+      path.isAbsolute(file)
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let safeFile
+
+    try {
+      safeFile =
+        await safeTarget(
+          root,
+          file,
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (safeFile === ".") {
+      skippedFiles += 1
+      continue
+    }
+
+    const absolute =
+      path.join(
+        root,
+        safeFile,
+      )
+
+    let info
+
+    try {
+      info =
+        await stat(
+          absolute,
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    if (
+      !info.isFile() ||
+      info.size >
+        RESOURCE_ROUTING_MAX_FILE_BYTES
+    ) {
+      skippedFiles += 1
+      continue
+    }
+
+    let text
+
+    try {
+      text =
+        await readFile(
+          absolute,
+          "utf8",
+        )
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    let inspected
+
+    try {
+      inspected =
+        inspectResourceAdapterFile({
+          sourcePath:
+            file,
+
+          text,
+
+          maxWitnesses:
+            RESOURCE_ROUTING_MAX_EDGES_PER_FILE
+            * 2,
+
+          maxEdges:
+            RESOURCE_ROUTING_MAX_EDGES_PER_FILE,
+        })
+    } catch {
+      skippedFiles += 1
+      continue
+    }
+
+    filesScanned += 1
+
+    witnesses +=
+      inspected.witnesses.length
+
+    edgeCandidates +=
+      inspected.edge_candidates.length
+
+    rejectedEdges +=
+      inspected
+        .rejected_edge_candidates
+        .length
+
+    truncated ||=
+      inspected.truncated === true
+
+    for (
+      const family of
+      inspected.families
+    ) {
+      families.add(family)
+    }
+
+    for (
+      const edge of
+      inspected.resource_edges
+    ) {
+      if (
+        validatedEdges >=
+        RESOURCE_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        truncated = true
+        break
+      }
+
+      validatedEdges += 1
+
+      edgeKinds.add(
+        edge.kind,
+      )
+
+      /*
+       * Shadow state only.
+       *
+       * Do NOT add these edges to:
+       * - evidenceLedger
+       * - routeLedger
+       * - taskRoleEvidence
+       *
+       * E0 observes topology; it does not change Scout decisions.
+       */
+      if (
+        state?.resourceAdapterEdges
+          instanceof Map &&
+        state.resourceAdapterEdges.size <
+          RESOURCE_ROUTING_MAX_EDGES_PER_TURN
+      ) {
+        state.resourceAdapterEdges.set(
+          resourceAdapterEdgeKey(
+            edge,
+          ),
+          edge,
+        )
+      }
+    }
+  }
+
+  return {
+    protocol:
+      RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
+
+    authority:
+      "routing_only",
+
+    mutationAuthority:
+      false,
+
+    filesScanned,
+    skippedFiles,
+
+    families:
+      [...families].sort(),
+
+    witnesses,
+    edgeCandidates,
+    validatedEdges,
+    rejectedEdges,
+
+    edgeKinds:
+      [...edgeKinds].sort(),
+
+    truncated,
+  }
+}
+
+function taskCausalShadowForState(
+  state,
+) {
+  const edges = []
+
+  if (
+    state?.frameworkResourceEdges
+      instanceof Map
+  ) {
+    edges.push(
+      ...state
+        .frameworkResourceEdges
+        .values(),
+    )
+  }
+
+  if (
+    state?.resourceAdapterEdges
+      instanceof Map
+  ) {
+    edges.push(
+      ...state
+        .resourceAdapterEdges
+        .values(),
+    )
+  }
+
+  return runTaskCausalShadow({
+    taskAnchors:
+      state?.taskAnchors,
+
+    edges,
+
+    maxHops:
+      TASK_CAUSAL_SHADOW_MAX_HOPS,
+
+    maxNodes:
+      TASK_CAUSAL_SHADOW_MAX_NODES,
+
+    maxEdges:
+      TASK_CAUSAL_SHADOW_MAX_EDGES,
+  })
 }
 
 function scoutEvidenceWitnesses(hits, selectedFiles) {
@@ -1293,976 +2624,4 @@ function buildOwnerAttestation(editCapsule, target, targetFile) {
   }
 
   return reject("owner_attestation_structural_identity_unproven")
-}
-
-function ownerRecoveryResponseSafe(response, probe, inputCount) {
-  return (
-    probe?.ok === false &&
-    probe?.reason === "unsafe_ir" &&
-    response?.protocol === "evidence-distiller-v3" &&
-    response?.representation === "evidence_ir" &&
-    response?.raw_hits === inputCount &&
-    response?.mapped_hits === inputCount &&
-    response?.exact_span_hits === 0 &&
-    response?.location_complete === false &&
-    response?.anchor_complete === true &&
-    response?.witness_complete === true &&
-    response?.distill_complete === true &&
-    response?.ir_complete === false &&
-    response?.v2_grouping_preserved === true &&
-    response?.truncated === false &&
-    Array.isArray(response?.groups) &&
-    response.groups.length > 0 &&
-    response?.groups_shown === response.groups.length &&
-    response?.variants_shown === response?.variants_total
-  )
-}
-
-function mutationCandidateIdentity(scope) {
-  if (!scope) return null
-  return {
-    file: normalizeMutationFile(scope.file),
-    symbol_kind: scope.symbol_kind,
-    symbol_name: scope.symbol_name,
-    start_line: scope.start_line,
-    end_line: scope.end_line,
-  }
-}
-
-function normalizeMutationCandidateEol(value) {
-  return String(value ?? "")
-    .replaceAll("\r\n", "\n")
-    .replaceAll("\r", "\n")
-}
-
-function mutationCandidateStrictAncestor(outer, inner) {
-  if (!outer || !inner) return false
-  const outerFile = normalizeMutationFile(outer.file)
-  const innerFile = normalizeMutationFile(inner.file)
-  if (!outerFile || outerFile !== innerFile) return false
-  if (
-    !Number.isInteger(outer.start_line) ||
-    !Number.isInteger(outer.end_line) ||
-    !Number.isInteger(inner.start_line) ||
-    !Number.isInteger(inner.end_line)
-  ) return false
-
-  const contains =
-    outer.start_line <= inner.start_line &&
-    outer.end_line >= inner.end_line
-  const strict =
-    outer.start_line < inner.start_line ||
-    outer.end_line > inner.end_line
-  return contains && strict
-}
-
-function reduceMostSpecificMutationCandidates(candidates) {
-  const values = Array.isArray(candidates) ? candidates : []
-  return values.filter(
-    (candidate) =>
-      !values.some(
-        (other) =>
-          other !== candidate &&
-          mutationCandidateStrictAncestor(candidate, other),
-      ),
-  )
-}
-
-function normalizeMutationCandidateSlice(value) {
-  return normalizeMutationCandidateEol(value).trim()
-}
-
-function mutationCandidateContainsBefore(candidate, before) {
-  if (
-    !candidate ||
-    typeof candidate.live_source !== "string" ||
-    typeof before !== "string" ||
-    before.length < 1
-  ) return false
-
-  const wanted = normalizeMutationCandidateSlice(before)
-  if (wanted.length < 1) return false
-
-  const source = normalizeMutationCandidateSlice(candidate.live_source)
-  if (source.includes(wanted)) return true
-
-  const sourceLines = source.split("\n")
-  const wantedLines = wanted.split("\n")
-  const width = wantedLines.length
-
-  for (let start = 0; start + width <= sourceLines.length; start++) {
-    const slice = sourceLines.slice(start, start + width).join("\n")
-    if (normalizeMutationCandidateSlice(slice) === wanted) return true
-  }
-
-  return false
-}
-
-function selectExactMutationCandidate(candidates, before, boundTarget = null) {
-  const values = Array.isArray(candidates) ? candidates : []
-
-  if (boundTarget) {
-    const bound =
-      values.find((entry) =>
-        sameAuthorizedScopeIdentity(entry.target, boundTarget),
-      ) ?? null
-
-    if (!bound || !mutationCandidateContainsBefore(bound, before)) {
-      return {
-        ok: false,
-        reason: "mutation_owner_repair_target_mismatch",
-        repairable: false,
-        candidate: null,
-        matches: [],
-      }
-    }
-
-    return {
-      ok: true,
-      reason: "mutation_owner_sticky_exact_match",
-      repairable: false,
-      candidate: bound,
-      matches: [bound],
-    }
-  }
-
-  const exact =
-    values.filter((entry) =>
-      mutationCandidateContainsBefore(entry, before),
-    )
-
-  if (exact.length < 1) {
-    return {
-      ok: false,
-      reason: "mutation_owner_no_exact_match",
-      repairable: true,
-      candidate: null,
-      matches: [],
-    }
-  }
-
-  const mostSpecific =
-    reduceMostSpecificMutationCandidates(
-      exact.map((entry) => entry.target),
-    )
-
-  if (mostSpecific.length !== 1) {
-    return {
-      ok: false,
-      reason: "mutation_owner_ambiguous_exact_match",
-      repairable: true,
-      candidate: null,
-      matches: mostSpecific,
-    }
-  }
-
-  const selectedTarget = mostSpecific[0]
-  const selected =
-    exact.find((entry) =>
-      sameAuthorizedScopeIdentity(entry.target, selectedTarget),
-    ) ?? null
-
-  return {
-    ok: selected !== null,
-    reason:
-      selected !== null
-        ? "mutation_owner_unique_exact_match"
-        : "mutation_owner_ambiguous_exact_match",
-    repairable: selected === null,
-    candidate: selected,
-    matches: mostSpecific,
-  }
-}
-
-function validatedImpactMutationCandidateHits(selectedImpactFiles) {
-  const unique = new Map()
-
-  for (const entry of selectedImpactFiles ?? []) {
-    if (
-      entry?.origin !== "impact" ||
-      entry?.impact?.validationKind !== "forward_scope_definition"
-    ) continue
-
-    const file = evidenceFileKey(entry?.file)
-    const line = entry?.impact?.sample?.line
-    if (!file || !Number.isInteger(line) || line < 1) continue
-
-    const queryIndex =
-      [...(entry?.queries ?? [])]
-        .filter((value) => Number.isInteger(value) && value >= 0)
-        .sort((a, b) => a - b)[0]
-
-    if (!Number.isInteger(queryIndex)) continue
-
-    const key = `${file}\\0${line}\\0${queryIndex}`
-    if (!unique.has(key)) {
-      unique.set(key, {
-        file,
-        line,
-        query: queryIndex + 1,
-      })
-    }
-  }
-
-  return [...unique.values()].sort(
-    (a, b) =>
-      a.file.localeCompare(b.file) ||
-      a.line - b.line ||
-      a.query - b.query,
-  )
-}
-
-async function recoverValidatedImpactMutationCandidateGroups(
-  root,
-  selectedImpactFiles,
-) {
-  const hits = validatedImpactMutationCandidateHits(selectedImpactFiles)
-
-  if (hits.length < 1) {
-    return {
-      attempted: false,
-      ok: true,
-      reason: "no_validated_forward_impact_candidate",
-      groups: [],
-      hits: 0,
-      files: 0,
-      rejected_files: [],
-    }
-  }
-
-  if (hits.length > FOCUSED_PROBE_MAX_LINE_HITS) {
-    return {
-      attempted: false,
-      ok: false,
-      reason: "impact_candidate_hit_budget_exceeded",
-      groups: [],
-      hits: hits.length,
-      files: 0,
-      rejected_files: [],
-    }
-  }
-
-  const byFile = new Map()
-  for (const hit of hits) {
-    const batch = byFile.get(hit.file) ?? []
-    batch.push(hit)
-    byFile.set(hit.file, batch)
-  }
-
-  const groups = []
-  const rejected = []
-
-  for (
-    const [file, fileHits]
-    of [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b))
-  ) {
-    const probe = await runDistiller(root, fileHits)
-    const response = probe?.response
-
-    if (!ownerRecoveryResponseSafe(response, probe, fileHits.length)) {
-      rejected.push({
-        file,
-        reason:
-          probe?.reason ??
-          "impact_candidate_structural_validation_failed",
-      })
-      continue
-    }
-
-    for (const group of response.groups ?? []) {
-      if (
-        typeof group?.symbol_kind !== "string" ||
-        typeof group?.symbol_name !== "string" ||
-        group.symbol_kind === "module" ||
-        group.symbol_name === "<module>" ||
-        group.symbol_name === "<evidence>"
-      ) continue
-
-      groups.push({
-        ...group,
-        mutation_candidate_basis:
-          "validated_forward_impact_definition",
-      })
-    }
-  }
-
-  return {
-    attempted: true,
-    ok: rejected.length === 0,
-    reason:
-      rejected.length === 0
-        ? "validated_forward_impact_candidates_recovered"
-        : "impact_candidate_structural_validation_partial",
-    groups: rejected.length === 0 ? groups : [],
-    hits: hits.length,
-    files: byFile.size,
-    rejected_files: rejected.slice(0, 16),
-  }
-}
-
-async function loadLivePreauthorizedMutationCandidates(root, state) {
-  const loaded = await readAuthorizedEditCapsule(root, state)
-  if (!loaded.ok) return { ...loaded, candidates: [] }
-
-  const capsule = loaded.capsule
-  const preauthorized =
-    Array.isArray(state?.localMutationCandidates)
-      ? state.localMutationCandidates
-      : []
-
-  if (
-    capsule?.mutation_candidate_protocol !== MUTATION_CANDIDATE_SET_PROTOCOL ||
-    !Number.isInteger(capsule?.mutation_candidate_count) ||
-    capsule.mutation_candidate_count < 1 ||
-    capsule.mutation_candidate_count > MUTATION_CANDIDATE_MAX ||
-    !Array.isArray(capsule?.mutation_candidates) ||
-    capsule.mutation_candidates.length !== capsule.mutation_candidate_count ||
-    preauthorized.length < 1 ||
-    preauthorized.length > MUTATION_CANDIDATE_MAX
-  ) {
-    return {
-      ok: false,
-      reason: "mutation_candidate_set_contract_invalid",
-      candidates: [],
-    }
-  }
-
-  const sealed = capsule.mutation_candidates
-  const candidates = []
-  const bodies = new Map()
-
-  for (const entry of preauthorized) {
-    const capability = entry?.capability
-    const target = entry?.target
-    if (
-      capability?.protocol !== SCOUT_LOCAL_CAPABILITY_PROTOCOL ||
-      capability?.replaceNodeReady !== true ||
-      !Array.isArray(capability?.allowedMutations) ||
-      !capability.allowedMutations.includes("replace_node") ||
-      typeof capability?.localHandoffPath !== "string" ||
-      !target
-    ) {
-      return {
-        ok: false,
-        reason: "mutation_candidate_capability_invalid",
-        candidates: [],
-      }
-    }
-
-    const metadata =
-      sealed.find((candidate) =>
-        sameAuthorizedScopeIdentity(candidate, target),
-      ) ?? null
-
-    if (!metadata) {
-      return {
-        ok: false,
-        reason: "mutation_candidate_not_sealed",
-        candidates: [],
-      }
-    }
-
-    const file = canonicalMutationFile(root, target.file)
-    if (!file) {
-      return {
-        ok: false,
-        reason: "mutation_candidate_file_invalid",
-        candidates: [],
-      }
-    }
-
-    let body = bodies.get(file)
-    if (!body) {
-      try {
-        body = await readFile(path.resolve(root, file))
-      } catch {
-        return {
-          ok: false,
-          reason: "mutation_candidate_file_unavailable",
-          candidates: [],
-        }
-      }
-      bodies.set(file, body)
-    }
-
-    const currentSha256 =
-      createHash("sha256").update(body).digest("hex")
-
-    if (
-      currentSha256 !== metadata.source_sha256 ||
-      currentSha256 !== capability.targetSourceSha256
-    ) {
-      return {
-        ok: false,
-        reason: "mutation_candidate_source_stale",
-        candidates: [],
-      }
-    }
-
-    const lines =
-      normalizeMutationCandidateEol(
-        body.toString("utf8"),
-      ).split("\n")
-
-    if (
-      !Number.isInteger(target.start_line) ||
-      !Number.isInteger(target.end_line) ||
-      target.start_line < 1 ||
-      target.end_line < target.start_line ||
-      target.end_line > lines.length
-    ) {
-      return {
-        ok: false,
-        reason: "mutation_candidate_live_range_invalid",
-        candidates: [],
-      }
-    }
-
-    candidates.push({
-      target,
-      capability,
-      live_source:
-        lines.slice(target.start_line - 1, target.end_line).join("\n"),
-    })
-  }
-
-  return {
-    ok: true,
-    capsule,
-    candidates,
-  }
-}
-
-async function bindReplaceNodeMutationCandidate(root, state, before) {
-  const loaded =
-    await loadLivePreauthorizedMutationCandidates(root, state)
-
-  if (!loaded.ok) {
-    return {
-      ...loaded,
-      repairable: false,
-      candidate: null,
-    }
-  }
-
-  const selected =
-    selectExactMutationCandidate(
-      loaded.candidates,
-      before,
-      state?.boundMutationTarget ?? null,
-    )
-
-  return {
-    ...selected,
-    candidate_count: loaded.candidates.length,
-  }
-}
-
-async function confirmLocalMutationCompetitors(
-  root,
-  state,
-  scoutHandoff,
-  editCapsule,
-  rankedFiles,
-  discoveryResults,
-  queries,
-  glob,
-) {
-  const reject = (reason, detail = null, extra = {}) => ({
-    ok: false,
-    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    reason,
-    detail,
-    checked_files: 0,
-    ...extra,
-  })
-
-  if (scoutHandoff?.status === "ready") {
-    return {
-      ok: true,
-      protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-      reason: "global_handoff_ready",
-      checked_files: 0,
-      competing_owners: [],
-    }
-  }
-
-  const target = editCapsule?.authorizedMutationScope
-  const targetFile = canonicalMutationFile(root, target?.file)
-  if (!targetFile) return reject("competitor_target_invalid")
-
-  const targetStateFile = [...(state?.scoutFiles?.values?.() ?? [])]
-    .find((entry) =>
-      canonicalMutationFile(root, entry?.file) === targetFile,
-    )
-
-  const observedTargetQueries = [...(targetStateFile?.queries ?? [])]
-    .filter((value) => Number.isInteger(value) && value >= 0)
-
-  if (observedTargetQueries.length < 1) {
-    return reject("competitor_query_provenance_missing")
-  }
-
-  // Compare against the most discriminative direct provenance first.
-  // Generic task terms (configuration/database/etc.) must not make every
-  // incidental source file a mutation competitor.
-  const queryFileCounts = new Map(
-    (discoveryResults ?? []).map((result) => [
-      result.queryIndex,
-      new Set(
-        (result?.files ?? [])
-          .map((file) => canonicalMutationFile(root, file))
-          .filter(Boolean),
-      ).size,
-    ]),
-  )
-  const rankedTargetQueries = observedTargetQueries
-    .map((queryIndex) => ({
-      queryIndex,
-      files: queryFileCounts.get(queryIndex) ?? Number.MAX_SAFE_INTEGER,
-    }))
-    .sort((a, b) => a.files - b.files || a.queryIndex - b.queryIndex)
-
-  const minimumQueryFiles = rankedTargetQueries[0]?.files
-  const targetQueries = new Set(
-    rankedTargetQueries
-      .filter((entry) => entry.files === minimumQueryFiles)
-      .map((entry) => entry.queryIndex),
-  )
-
-  const targetIsTest = likelyTestFile(targetFile)
-  const candidates = (rankedFiles ?? []).filter((entry) => {
-    const file = canonicalMutationFile(root, entry?.file)
-    if (!file || file === targetFile) return false
-    if (!targetIsTest && likelyTestFile(file)) return false
-    for (const query of entry?.queries ?? []) {
-      if (targetQueries.has(query)) return true
-    }
-    return false
-  })
-
-  if (candidates.length > SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES) {
-    return reject(
-      "competitor_budget_exceeded",
-      `${candidates.length}>${SCOUT_LOCAL_CAPABILITY_MAX_COMPETITOR_FILES}`,
-      { candidate_files: candidates.map((entry) => entry.file).slice(0, 16) },
-    )
-  }
-
-  if (candidates.length < 1) {
-    return {
-      ok: true,
-      protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-      reason: "no_query_provenance_competitors",
-      checked_files: 0,
-      competing_owners: [],
-    }
-  }
-
-  const results = []
-
-  for (const queryIndex of [...targetQueries].sort((a, b) => a - b)) {
-    const targets = candidates
-      .filter((entry) => entry?.queries?.has?.(queryIndex))
-      .map((entry) => entry.file)
-      .sort()
-
-    if (targets.length < 1) continue
-
-    const discovery = (discoveryResults ?? []).find(
-      (entry) => entry?.queryIndex === queryIndex,
-    )
-    const requestedQuery = queries?.[queryIndex]
-
-    if (!discovery || typeof requestedQuery !== "string") {
-      return reject("competitor_query_plan_missing", String(queryIndex))
-    }
-
-    let result
-    if (discovery.compiledProbe) {
-      result = restrictProbeResultToTargets(
-        discovery.compiledProbe,
-        targets,
-      )
-    } else {
-      const raw = await runQuery(
-        root,
-        discovery.effectiveQuery ?? requestedQuery,
-        queryIndex,
-        targets,
-        glob,
-      )
-      result = queryCompilerProbeResult(
-        raw,
-        requestedQuery,
-        discovery.matchMode ?? "exact",
-      )
-    }
-
-    if (
-      result?.scanComplete !== true ||
-      result?.timedOut === true ||
-      result?.scanCapped === true ||
-      result?.error
-    ) {
-      return reject(
-        "competitor_scan_incomplete",
-        `query_${queryIndex + 1}`,
-      )
-    }
-
-    results.push(result)
-  }
-
-  const competitorHits = mergeHits(results)
-  const recoveryHits = ownerRecoveryHitsFromMerged(competitorHits)
-  const byFile = new Map()
-
-  for (const hit of recoveryHits) {
-    const file = canonicalMutationFile(root, hit.file)
-    if (!file) continue
-    const batch = byFile.get(file) ?? []
-    batch.push({ ...hit, file })
-    byFile.set(file, batch)
-  }
-
-  const competingOwners = []
-
-  for (const entry of candidates) {
-    const file = canonicalMutationFile(root, entry.file)
-    if (!file) return reject("competitor_file_invalid", entry.file)
-
-    const fileHits = byFile.get(file) ?? []
-    if (fileHits.length < 1) continue
-
-    const probe = await runDistiller(root, fileHits)
-    const response = probe?.response
-
-    if (!ownerRecoveryResponseSafe(response, probe, fileHits.length)) {
-      return reject(
-        "competitor_structural_validation_failed",
-        file,
-        { checked_files: byFile.size },
-      )
-    }
-
-    for (const group of response.groups ?? []) {
-      const symbolKind = group?.symbol_kind
-      const symbolName = group?.symbol_name
-      if (
-        typeof symbolKind !== "string" ||
-        typeof symbolName !== "string" ||
-        symbolKind === "module" ||
-        symbolName === "<module>" ||
-        symbolName === "<evidence>"
-      ) {
-        continue
-      }
-
-      competingOwners.push({
-        file,
-        symbol_kind: symbolKind,
-        symbol_name: symbolName,
-        start_line: group.start_line ?? null,
-        end_line: group.end_line ?? null,
-      })
-    }
-  }
-
-  if (competingOwners.length > 0) {
-    return reject(
-      "competing_structural_owner",
-      `${competingOwners[0].file}:${competingOwners[0].symbol_name}`,
-      {
-        checked_files: candidates.length,
-        competing_owners: competingOwners.slice(0, 8),
-      },
-    )
-  }
-
-  return {
-    ok: true,
-    protocol: SCOUT_LOCAL_CAPABILITY_PROTOCOL,
-    reason: "bounded_competitor_confirmation_passed",
-    checked_files: candidates.length,
-    competing_owners: [],
-  }
-}
-
-function simpleRenameIdentifierQuery(value) {
-  const query = String(value ?? "")
-  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(query)
-    ? query
-    : null
-}
-
-function selectRenameTargetFromExactEvidence(
-  root,
-  queries,
-  discoveryResults,
-  exactStructuralGroups,
-  handoffFiles,
-) {
-  const reject = (reason, detail = null) => ({
-    ok: false,
-    reason,
-    detail,
-    target: null,
-  })
-
-  if (
-    typeof root !== "string" ||
-    !Array.isArray(queries) ||
-    !Array.isArray(discoveryResults) ||
-    !Array.isArray(exactStructuralGroups) ||
-    !Array.isArray(handoffFiles)
-  ) {
-    return reject("rename_target_inputs_incomplete")
-  }
-
-  const handoffFileKeys = new Set(
-    handoffFiles
-      .map((entry) => canonicalMutationFile(root, entry?.file))
-      .filter(Boolean),
-  )
-  const candidates = new Map()
-
-  for (let queryIndex = 0; queryIndex < queries.length; queryIndex++) {
-    const identifier = simpleRenameIdentifierQuery(queries[queryIndex])
-    if (!identifier) continue
-
-    const result = discoveryResults[queryIndex]
-    if (
-      result?.scanComplete !== true ||
-      result?.timedOut === true ||
-      result?.scanCapped === true ||
-      result?.error ||
-      result?.queryFormulation != null
-    ) {
-      continue
-    }
-
-    const discoveryFiles = [
-      ...new Set(
-        (result.files ?? [])
-          .map((file) => canonicalMutationFile(root, file))
-          .filter(Boolean),
-      ),
-    ].sort()
-
-    // A global rename target is not bound from an emitted subset. Every file
-    // discovered for the exact identifier query must survive into the sealed
-    // complete handoff; otherwise later closure validation would start from
-    // incomplete source evidence.
-    if (
-      discoveryFiles.length < 1 ||
-      discoveryFiles.some((file) => !handoffFileKeys.has(file))
-    ) {
-      continue
-    }
-
-    const queryNumber = queryIndex + 1
-    const definitions = new Map()
-
-    for (const group of exactStructuralGroups) {
-      if (!validateEvidenceGroup(group)) continue
-      if (group.role !== "definition") continue
-      if (group.symbol_name !== identifier) continue
-      if (!(group.queries ?? []).includes(queryNumber)) continue
-
-      const file = canonicalMutationFile(root, group.file)
-      if (!file || !discoveryFiles.includes(file)) continue
-      if (
-        !Number.isInteger(group.start_line) ||
-        !Number.isInteger(group.end_line) ||
-        group.start_line < 1 ||
-        group.end_line < group.start_line
-      ) {
-        continue
-      }
-
-      const identity = {
-        file,
-        symbol_kind: group.symbol_kind,
-        symbol_name: identifier,
-        start_line: group.start_line,
-        end_line: group.end_line,
-      }
-      const key = JSON.stringify(identity)
-
-      if (!definitions.has(key)) {
-        definitions.set(key, {
-          target: identity,
-          queryIndex,
-          queryNumber,
-          identifier,
-          evidenceLines: [...new Set(group.hit_lines ?? [])]
-            .filter((line) => Number.isInteger(line) && line > 0)
-            .sort((a, b) => a - b),
-          discoveryFiles,
-          exactHitCount: Number.isInteger(group.hit_count)
-            ? group.hit_count
-            : 0,
-        })
-      }
-    }
-
-    if (definitions.size > 1) {
-      return reject(
-        "rename_target_ambiguous_definition",
-        `query_${queryNumber}:${identifier}:definitions_${definitions.size}`,
-      )
-    }
-
-    if (definitions.size === 1) {
-      const candidate = [...definitions.values()][0]
-      candidates.set(JSON.stringify(candidate.target), candidate)
-    }
-  }
-
-  if (candidates.size < 1) {
-    return reject("rename_target_not_proven")
-  }
-  if (candidates.size > 1) {
-    return reject(
-      "rename_target_multiple_exact_definitions",
-      `targets_${candidates.size}`,
-    )
-  }
-
-  return {
-    ok: true,
-    reason: "unique_exact_identifier_definition",
-    ...[...candidates.values()][0],
-  }
-}
-
-async function attestRenameTargetCapability(
-  root,
-  state,
-  queries,
-  discoveryResults,
-  exactStructuralGroups,
-) {
-  const reject = (reason, detail = null) => ({
-    ok: false,
-    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
-    reason,
-    detail,
-    ready: false,
-    globalReady: false,
-    target: null,
-  })
-
-  const rel = normalizeMutationFile(state?.scoutHandoffPath)
-  if (!rel.startsWith(".opencode/scout-handoffs/")) {
-    return reject("rename_target_handoff_unavailable")
-  }
-
-  const handoffRoot = path.resolve(root, ".opencode", "scout-handoffs")
-  const absolute = path.resolve(root, rel)
-  if (
-    absolute !== handoffRoot &&
-    !absolute.startsWith(handoffRoot + path.sep)
-  ) {
-    return reject("rename_target_handoff_escape")
-  }
-
-  let raw
-  let bundle
-  try {
-    raw = await readFile(absolute)
-    bundle = JSON.parse(raw.toString("utf8"))
-  } catch {
-    return reject("rename_target_handoff_unreadable")
-  }
-
-  const blockingReasons = Array.isArray(bundle?.blocking_reasons)
-    ? bundle.blocking_reasons
-    : []
-  const partialReasons = Array.isArray(bundle?.partial_reasons)
-    ? bundle.partial_reasons
-    : []
-
-  if (
-    bundle?.protocol !== SCOUT_HANDOFF_PROTOCOL ||
-    bundle?.status !== "ready" ||
-    blockingReasons.length > 0 ||
-    partialReasons.length > 0
-  ) {
-    return reject(
-      "rename_target_requires_complete_handoff",
-      `${bundle?.status ?? "missing"}:${[
-        ...blockingReasons,
-        ...partialReasons,
-      ].join(",")}`,
-    )
-  }
-
-  const handoffFiles = Array.isArray(bundle.files) ? bundle.files : []
-  const selected = selectRenameTargetFromExactEvidence(
-    root,
-    queries,
-    discoveryResults,
-    exactStructuralGroups,
-    handoffFiles,
-  )
-  if (selected.ok !== true) {
-    return reject(selected.reason, selected.detail ?? null)
-  }
-
-  const target = selected.target
-  const targetFile = handoffFiles.find(
-    (entry) => canonicalMutationFile(root, entry?.file) === target.file,
-  )
-  const fingerprint = targetFile?.fingerprint
-  if (
-    fingerprint?.kind !== "sha256" ||
-    fingerprint?.strong !== true ||
-    fingerprint?.evidence_fresh !== true ||
-    typeof fingerprint?.sha256 !== "string" ||
-    !/^[0-9a-f]{64}$/i.test(fingerprint.sha256) ||
-    targetFile?.changed_during_scout === true
-  ) {
-    return reject("rename_target_fingerprint_not_strong_current")
-  }
-
-  let body
-  try {
-    body = await readFile(path.resolve(root, target.file))
-  } catch {
-    return reject("rename_target_file_unavailable")
-  }
-
-  const currentSha256 = createHash("sha256").update(body).digest("hex")
-  if (currentSha256 !== fingerprint.sha256) {
-    return reject("rename_target_fingerprint_stale")
-  }
-
-  const targetIdentitySha256 = createHash("sha256")
-    .update(JSON.stringify(target))
-    .digest("hex")
-  const sourceHandoffSha256 = createHash("sha256")
-    .update(raw)
-    .digest("hex")
-
-  return {
-    ok: true,
-    protocol: SCOUT_RENAME_TARGET_PROTOCOL,
-    operation: "rename_symbol",
-    reason: selected.reason,
-    ready: true,
-    globalReady: true,
-    sourceHandoffPath: rel,
-    sourceHandoffSha256,
-    target,
-    targetIdentitySha256,
-    targetSourceSha256: currentSha256,
-    queryIndex: selected.queryIndex,
-    queryNumber: selected.queryNumber,
-    identifier: selected.identifier,
-    evidenceLines: selected.evidenceLines,
-    exactHitCount: selected.exactHitCount,
-    discoveryFiles: selected.discoveryFiles,
-  }
 }
