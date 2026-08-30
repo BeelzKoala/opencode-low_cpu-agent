@@ -232,8 +232,14 @@ pub fn audit_candidate_hygiene(
             });
         }
 
-        let baseline = fs::read(baseline_root.join(file))
-            .with_context(|| format!("cannot read baseline file {file}"))?;
+        let baseline_path = baseline_root.join(file);
+        let baseline = match fs::read(&baseline_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read baseline file {file}"));
+            }
+        };
         let candidate = fs::read(candidate_root.join(file))
             .with_context(|| format!("cannot read candidate file {file}"))?;
 
@@ -384,6 +390,43 @@ mod tests {
     fn cleanup_fixture(baseline_root: &Path, candidate_root: &Path) {
         let parent = baseline_root.parent().unwrap();
         assert_eq!(candidate_root.parent(), Some(parent));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn new_file_with_intent_to_add_is_hygienic() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "candidate-hygiene-new-{}-{nonce}",
+            std::process::id()
+        ));
+        let baseline_root = parent.join("baseline");
+        let candidate_root = parent.join("candidate");
+        std::fs::create_dir_all(&baseline_root).unwrap();
+        std::fs::create_dir_all(&candidate_root).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(&candidate_root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(git(&["init", "-q"]));
+        assert!(git(&["config", "user.email", "hygiene@example.invalid"]));
+        assert!(git(&["config", "user.name", "Candidate Hygiene"]));
+        assert!(git(&["commit", "--allow-empty", "-qm", "baseline"]));
+        std::fs::write(candidate_root.join("new.html"), b"<html>ok</html>\n").unwrap();
+        assert!(git(&["add", "-N", "--", "new.html"]));
+        let report = audit_candidate_hygiene(
+            &baseline_root,
+            &candidate_root,
+            &["new.html".to_string()],
+        ).unwrap();
+        assert!(report.ok, "{report:?}");
         let _ = std::fs::remove_dir_all(parent);
     }
 

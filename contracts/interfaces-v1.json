@@ -1,10 +1,53 @@
 {
   "budgets": {
+    "additive_semantic_repair_attempts": 1,
     "executed_searches_per_turn": 4,
+    "execution_phase_latency_margin_max_ms": 15000,
+    "execution_phase_latency_margin_min_ms": 5000,
+    "execution_phase_latency_margin_ratio": 0.1,
+    "execution_phase_wall_kind": "adaptive_base",
+    "execution_phase_wall_ms": 120000,
     "model_calls_per_turn": 4,
-    "mutation_attempts_per_turn": 2
+    "mutation_attempts_per_turn": 2,
+    "task_wall_ms": 360000
   },
   "model_tools": {
+    "execute_additive_plan": {
+      "forbidden": [
+        "file",
+        "symbol",
+        "scope"
+      ],
+      "forbidden_markers": [
+        "operations: {",
+        "required: [\"operations\"]",
+        "oneOf:",
+        "anyOf:",
+        "insertions: {",
+        "evidence_line: {",
+        "required: [\"slot\", \"evidence_line\", \"content\"]"
+      ],
+      "required": [
+        "python_imports",
+        "python_declarations",
+        "replacements",
+        "creations"
+      ],
+      "required_markers": [
+        "required: [\"python_imports\", \"python_declarations\", \"replacements\", \"creations\"]",
+        "required: [\"slot\", \"modules\", \"from_imports\"]",
+        "required: [\"module\", \"name\"]",
+        "required: [\"slot\", \"content\"]",
+        "required: [\"slot\", \"before\", \"replacement\"]",
+        "required: [\"slot\", \"relative_path\", \"content\"]",
+        "python_imports: {",
+        "python_declarations: {",
+        "from_imports: {",
+        "replacements: {",
+        "creations: {",
+        "relative_path: {"
+      ]
+    },
     "execute_rename_symbol": {
       "forbidden": [
         "kind",
@@ -36,7 +79,17 @@
   },
   "protocol": "interface-freeze-v1",
   "protocols": {
+    "additive_host_binding": "typed-host-attestation-v2",
+    "additive_mutation_abi": "closed-additive-mutation-abi-v3",
+    "obligation_bound_synthesis": "obligation-bound-synthesis-v1",
+    "time_semantics": "time-semantics-v1",
+    "additive_mutation_authority": "sealed-additive-handoff-v1",
+    "additive_mutation_capability": "scout-additive-capability-v1",
+    "additive_mutation_plan": "additive-mutation-plan-v1",
+    "additive_repair_hint": "additive-repair-hint-v1",
     "candidate_validity": "candidate-validity-v1",
+    "execution_readiness": "execution-readiness-v1",
+    "governor_latency": "governor-latency-v1",
     "invariant_verifier": "invariant-verifier-v2",
     "local_capability": "scout-local-capability-v1",
     "mutation_confinement": "mutation-slice-v1",
@@ -45,7 +98,11 @@
     "patch_executor": "patch-executor-v3",
     "rename_target": "scout-rename-target-v2",
     "scout_handoff": "scout-handoff-v1",
-    "tool_frontier": "causal-tool-frontier-v2.5-deterministic-action"
+    "tool_frontier": "causal-tool-frontier-v2.5-deterministic-action",
+    "python_additive_compiler": "typed-python-additive-compiler-v1",
+    "candidate_static_preflight": "candidate-static-preflight-v1",
+    "python_ir_canonicalizer": "python-ir-canonicalizer-v1",
+    "runtime_cost_observation": "runtime-cost-observation-v1"
   },
   "status": "frozen_after_stabilization"
 }

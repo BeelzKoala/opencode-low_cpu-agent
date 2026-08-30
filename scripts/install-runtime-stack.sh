@@ -12,6 +12,7 @@ RUNTIME_MANIFEST=".runtime-stack-v1.json"
 
 COMPONENTS=(
   opencode-evidence-distiller
+  opencode-context-planner
   opencode-patch-compiler
   opencode-patch-executor
   opencode-invariant-verifier
@@ -19,6 +20,8 @@ COMPONENTS=(
   opencode-retrieval-ranker
   opencode-semantic-resolver
   opencode-completion-authorizer
+  opencode-sealed-edit-site
+  opencode-sealed-slice-store
 )
 
 build_stack() {
@@ -26,13 +29,16 @@ build_stack() {
     --manifest-path "$CARGO" \
     --release \
     --bin opencode-evidence-distiller \
+    --bin opencode-context-planner \
     --bin opencode-patch-compiler \
     --bin opencode-patch-executor \
     --bin opencode-invariant-verifier \
     --bin opencode-impact-index \
     --bin opencode-retrieval-ranker \
     --bin opencode-semantic-resolver \
-    --bin opencode-completion-authorizer
+    --bin opencode-completion-authorizer \
+    --bin opencode-sealed-edit-site \
+    --bin opencode-sealed-slice-store
 }
 
 write_manifest() {

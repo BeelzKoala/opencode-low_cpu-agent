@@ -1,3 +1,22 @@
+          const elapsedMs = Math.round((performance.now() - started) * 100) / 100
+
+          await writeProjectTrace(root, "search-trace.jsonl", {
+            ts: nowMs(),
+            protocol: SEARCH_PROTOCOL,
+            sessionID,
+            turnID: state?.turnID ?? null,
+            project_root: root,
+            attempt_index: attemptIndex,
+            requested_queries: input?.queries,
+            queries,
+            path: target,
+            glob: glob ?? null,
+            requested_glob: requestedGlob ?? null,
+            effective_glob: glob ?? null,
+            glob_corrected: globResolution.corrected === true,
+            glob_correction_reason: globResolution.reason,
+            glob_inventory_complete: globResolution.inventoryComplete,
+            glob_inventory_files: globResolution.inventoryFiles,
             glob_inventory_extensions: globResolution.inventoryExtensions,
             glob_inventory_cache_hit: globResolution.inventoryCacheHit,
 
@@ -279,6 +298,23 @@
             anchor_frontier_mutation_authority:
               anchorFrontier.mutation_authority,
 
+            host_owner_refinement_protocol:
+              hostOwnerRefinementPlan.protocol,
+            host_owner_refinement_status:
+              hostOwnerRefinementPlan.status,
+            host_owner_refinement_reason:
+              hostOwnerRefinementPlan.reason,
+            host_owner_refinement_candidate_files:
+              hostOwnerRefinementPlan.candidate_files,
+            host_owner_refinement_files_scanned:
+              hostOwnerRefinement.filesScanned,
+            host_owner_refinement_edges_validated:
+              hostOwnerRefinement.validatedEdges,
+            host_owner_refinement_truncated:
+              hostOwnerRefinement.truncated === true,
+            host_owner_refinement_mutation_authority:
+              false,
+
             host_resource_inventory_protocol:
               hostResourceInventory.protocol,
             host_resource_inventory_files:
@@ -356,22 +392,188 @@
                   }),
                 ),
 
+            data_obligation_projector_protocol:
+              dataObligationProjection
+                ?.protocol ??
+              DATA_OBLIGATION_PROJECTOR_PROTOCOL,
+            data_obligation_projector_status:
+              dataObligationProjection
+                ?.status ??
+              null,
+            data_obligation_projector_reason:
+              dataObligationProjection
+                ?.reason ??
+              null,
+            data_provider_identity_observations:
+              (
+                dataCapabilityObservation
+                  ?.providerResolution
+                  ?.observations ??
+                []
+              ).map(
+                (row) => ({
+                  identity: row.identity,
+                  search_complete:
+                    row.search_complete === true,
+                  truncated:
+                    row.truncated === true,
+                  reason:
+                    row.reason ?? null,
+                  candidates:
+                    (row.candidates ?? []).map(
+                      (candidate) => ({
+                        file: candidate.file,
+                        symbol: candidate.symbol,
+                        configuration_identity:
+                          candidate.configuration_identity,
+                        constructor_family:
+                          candidate.constructor_family,
+                      }),
+                    ),
+                }),
+              ),
+            data_provider_host_binding_observations:
+              Object.entries(
+                dataCapabilityObservation
+                  ?.bindingByProvider ??
+                {},
+              )
+                .map(
+                  ([key, observation]) => {
+                    const [
+                      identity,
+                      providerFile,
+                      providerSymbol,
+                    ] = key.split("\0")
+
+                    return {
+                    key,
+                    identity:
+                      identity ?? null,
+                    provider_file:
+                      providerFile ?? null,
+                    provider_symbol:
+                      providerSymbol ?? null,
+                    mode:
+                      observation?.mode ??
+                      null,
+                    ready:
+                      observation?.ready ===
+                      true,
+                    complete:
+                      observation?.complete ===
+                      true,
+                    reason:
+                      observation?.reason ??
+                      null,
+                    source_file:
+                      observation?.source_file ??
+                      null,
+                    source_symbol:
+                      observation?.source_symbol ??
+                      null,
+                    importer_file:
+                      observation?.importer_file ??
+                      null,
+                    bindings:
+                      (
+                        observation?.bindings ??
+                        []
+                      ).map(
+                        (binding) => ({
+                          importer:
+                            binding.importer,
+                          target:
+                            binding.target,
+                          source_symbol:
+                            binding.source_symbol,
+                          local_symbol:
+                            binding.local_symbol,
+                          confidence:
+                            binding.confidence,
+                          witness_line:
+                            binding.witness_line,
+                        }),
+                      ),
+                    }
+                  },
+                )
+                .sort(
+                  (a, b) =>
+                    a.key.localeCompare(
+                      b.key,
+                    ),
+                ),
+
+            task_bound_data_evidence_protocol:
+              taskBoundDataEvidence.protocol,
+            task_bound_data_evidence_status:
+              taskBoundDataEvidence.status,
+            task_bound_data_evidence:
+              taskBoundDataEvidence.evidence.map(
+                (item) => ({
+                  role: item.role,
+                  tier: item.tier,
+                  ambiguous: item.ambiguous,
+                  localization_authority:
+                    item.localization_authority,
+                  mutation_authority:
+                    item.mutation_authority,
+                }),
+              ),
+
             task_role_evidence_merge_status:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .status,
 
             task_role_evidence_merge_truncated:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .truncated ===
               true,
 
             task_role_evidence_roles:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .evidence
                 .map(
                   (item) =>
                     item.role,
                 ),
+
+            scout_evidence_closure_protocol:
+              scoutEvidenceClosure.protocol ??
+              SCOUT_EVIDENCE_CLOSURE_PROTOCOL,
+            scout_evidence_closure_status:
+              scoutEvidenceClosure.status,
+            scout_evidence_closure_reason:
+              scoutEvidenceClosure.reason,
+            scout_evidence_closure_coverage_status:
+              scoutEvidenceClosure.coverage_status,
+            scout_evidence_closure_required_roles:
+              scoutEvidenceClosure.required_roles,
+            scout_evidence_closure_covered_roles:
+              scoutEvidenceClosure.covered_roles,
+            scout_evidence_closure_missing_roles:
+              scoutEvidenceClosure.missing_roles,
+            scout_evidence_closure_ambiguous_roles:
+              scoutEvidenceClosure.ambiguous_roles,
+            scout_evidence_closure_files:
+              scoutEvidenceClosure.files.map(
+                (item) => item.file,
+              ),
+            scout_evidence_closure_truncated:
+              scoutEvidenceClosure.truncated === true,
+            scout_evidence_closure_localization_authority:
+              scoutEvidenceClosure.localization_authority,
+            scout_evidence_closure_mutation_authority:
+              false,
+            scout_evidence_projection_files_shown:
+              scoutEvidenceProjection.filesShown,
+            scout_evidence_projection_bytes:
+              scoutEvidenceProjection.bytes,
+            scout_evidence_projection_truncated:
+              scoutEvidenceProjection.truncated === true,
+            scout_evidence_projection_abstained_files:
+              scoutEvidenceProjection.abstainedFiles,
 
 
             host_resource_closure_protocol:
@@ -990,6 +1192,60 @@
               editCapsule?.readinessWarnings ?? [],
             edit_capsule_coverage: editCapsule?.coverage ?? null,
             execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_readiness_protocol: EXECUTION_READINESS_PROTOCOL,
+            execution_readiness_status: executionReadiness.status,
+            execution_readiness_reason: executionReadiness.reason,
+            execution_readiness_failure_kind:
+              executionReadiness.failure_kind,
+            execution_readiness_required_mutation_shape:
+              executionReadiness.required_mutation_shape,
+            execution_readiness_available_mutation_operations:
+              executionReadiness.available_mutation_operations,
+            execution_readiness_evidence:
+              executionReadiness.evidence,
+            execution_readiness_mutation_authority:
+              executionReadiness.mutation_authority,
+            execution_readiness_additive:
+              additiveMutationCapability?.ready === true,
+            additive_capability_protocol:
+              additiveMutationCapability?.protocol ??
+              ADDITIVE_MUTATION_CAPABILITY_PROTOCOL,
+            additive_host_binding_protocol:
+              additiveMutationCapability?.host_binding_protocol ??
+              ADDITIVE_HOST_BINDING_PROTOCOL,
+            additive_binding_ready:
+              additiveMutationCapability?.binding_ready === true,
+            additive_authority_protocol:
+              additiveMutationCapability?.authority_protocol ??
+              ADDITIVE_MUTATION_AUTHORITY_PROTOCOL,
+            additive_authority_sha256:
+              additiveMutationCapability?.authority_sha256 ?? null,
+            additive_authority_verified:
+              additiveMutationAuthority?.ok === true,
+            additive_authority_reason:
+              additiveMutationAuthority?.reason ?? null,
+            additive_host_bindings:
+              additiveMutationCapability?.host_bindings ?? null,
+            additive_capability_status:
+              additiveMutationCapability?.status ?? null,
+            additive_capability_reason:
+              additiveMutationCapability?.reason ?? null,
+            additive_capability_sha256:
+              additiveMutationCapability?.capability_sha256 ?? null,
+            additive_existing_slots:
+              additiveMutationCapability?.existing_slots?.map((slot) => slot.slot) ?? [],
+            additive_create_slots:
+              additiveMutationCapability?.create_slots?.map((slot) => slot.slot) ?? [],
+            additive_handoff_path:
+              additiveMutationHandoffPath,
+            additive_model_context_bytes:
+              additiveMutationContext?.bytes ?? 0,
+            additive_model_context_files:
+              additiveMutationContext?.files_shown ?? 0,
+            additive_model_context_truncated:
+              additiveMutationContext?.truncated === true,
+            additive_mutation_authority:
+              additiveMutationCapability?.mutation_authority === true,
             execution_state: state?.executionState ?? null,
             execution_reason: state?.executionReason ?? null,
             execution_event: state?.executionEvent ?? null,
@@ -1381,6 +1637,9 @@
             contextualized_hit_lines:
               state?.contextualizedHitLines?.size ?? null,
             turn_model_calls: state?.modelCalls ?? null,
+            observed_model_latency_ms: observedModelLatencyMs,
+            model_latency_samples: state?.modelLatencySamples ?? 0,
+            model_latency_max_ms: state?.modelLatencyMaxMs ?? 0,
             turn_search_attempts: state?.searchAttempts ?? null,
             turn_executed_searches: state?.executedSearches ?? null,
             turn_evidence_bytes: state?.evidenceBytes ?? null,
@@ -1395,15 +1654,33 @@
           //
           // Full Scout evidence remains persisted in search trace / handoff
           // artifacts; this changes only the next model-facing projection.
-          const mutationFrontier = mutationToolsForState(state)
-          const frontierResolution = resolveMutationActionForState(state)
-          const actionCommitResult = deriveActionCommit({
-            state,
-            editCapsule,
-            frontier: frontierResolution,
-            renameToolName: EXECUTE_RENAME_SYMBOL_TOOL,
-            renameCapabilityProtocol: SCOUT_RENAME_TARGET_PROTOCOL,
-          })
+          const primaryMutationReady =
+            executionReadiness.status ===
+            EXECUTION_READINESS_STATUS.READY_TO_MUTATE
+          const mutationFrontier =
+            primaryMutationReady
+              ? mutationToolsForState(state)
+              : []
+          const frontierResolution =
+            primaryMutationReady
+              ? resolveMutationActionForState(state)
+              : {
+                  tool: null,
+                  reason: `execution_readiness_${executionReadiness.status}`,
+                }
+          const actionCommitResult =
+            primaryMutationReady
+              ? deriveActionCommit({
+                  state,
+                  editCapsule,
+                  frontier: frontierResolution,
+                  renameToolName: EXECUTE_RENAME_SYMBOL_TOOL,
+                  renameCapabilityProtocol: SCOUT_RENAME_TARGET_PROTOCOL,
+                })
+              : {
+                  ok: false,
+                  reason: `execution_readiness_${executionReadiness.status}`,
+                }
 
           let actionCommitClaim = null
           let deterministicMutationResult = null
@@ -1429,15 +1706,41 @@
             }
           }
 
-          const baseActionContent = editCapsule?.text ?? content
+          const additiveMutationReady =
+            executionReadiness.status ===
+              EXECUTION_READINESS_STATUS.READY_TO_MUTATE &&
+            executionReadiness.required_mutation_shape ===
+              EXECUTION_MUTATION_SHAPE.ADDITIVE_SURFACE &&
+            additiveMutationCapability?.ready === true &&
+            additiveMutationContext?.ok === true
+
+          const additiveCapsuleContent =
+            additiveMutationReady
+              ? [
+                  renderAdditiveMutationCapability(additiveMutationCapability),
+                  renderObligationBoundSynthesisContract(
+                    additiveMutationCapability,
+                    state.taskRequirements,
+                  ),
+                  additiveMutationContext.content,
+                ].filter(Boolean).join("\n\n")
+              : null
+
+          const baseActionContent =
+            additiveCapsuleContent ?? editCapsule?.text ?? content
+          const readinessStopContent =
+            executionReadiness.status === EXECUTION_READINESS_STATUS.SAFE_FAIL
+              ? `SEARCH_STOP reason=${executionReadiness.reason} failure_kind=${executionReadiness.failure_kind ?? "unspecified"} required_mutation_shape=${executionReadiness.required_mutation_shape} action=report_blocked`
+              : null
           const actionableContent =
-            deterministicMutationResult
+            readinessStopContent ??
+            (deterministicMutationResult
               ? `${baseActionContent}\nACTION_COMMIT protocol=${ACTION_COMMIT_PROTOCOL} sha256=${actionCommitResult.commit.commit_sha256} origin=${ACTION_COMMIT_DISPATCH_ORIGIN}\n${deterministicMutationResult.content}`
               : actionCommitResult.ok === true && actionCommitClaim?.ok !== true
                 ? `${baseActionContent}\nACTION_COMMIT_STOP reason=${actionCommitClaim?.reason ?? "action_commit_claim_failed"} action=report_blocked`
                 : mutationFrontier.length > 0
-                  ? `${baseActionContent}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=edit_capsule_ready search_locked=true`
-                  : content
+                  ? `${baseActionContent}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=execution_readiness_ready search_locked=true`
+                  : content)
 
           return {
             content: actionableContent,
@@ -1478,105 +1781,3 @@
               selected_scan_complete: selectedScanComplete,
               probe_scan_complete: selectedScanComplete,
               all_discovered_files_probed: allDiscoveredFilesProbed,
-              all_discovered_files_emitted: allDiscoveredFilesSelected,
-              routing_active: routingActive,
-              route_strategy: "query_fair_lexical8_plus_task_local_impact",
-              scout_handoff_protocol: scoutHandoff?.protocol ?? SCOUT_HANDOFF_PROTOCOL,
-              scout_handoff_path: scoutHandoff?.path ?? null,
-              scout_handoff_status: scoutHandoff?.status ?? null,
-              scout_handoff_files: scoutHandoff?.files ?? null,
-              scout_handoff_elapsed_ms: scoutHandoff?.elapsedMs ?? null,
-              scout_handoff_blocking_reasons: scoutHandoff?.blockingReasons ?? [],
-              scout_handoff_partial_reasons: scoutHandoff?.partialReasons ?? [],
-              scout_local_capability_protocol:
-                localMutationCapability?.protocol ?? null,
-              scout_local_capability_reason:
-                localMutationCapability?.reason ?? null,
-              scout_local_capability_detail:
-                localMutationCapability?.detail ?? null,
-              scout_local_replace_node_ready:
-                localMutationCapability?.replaceNodeReady === true,
-              scout_global_rename_ready:
-                renameMutationCapability?.ok === true &&
-                renameMutationCapability?.ready === true,
-              scout_rename_target_protocol:
-                renameMutationCapability?.protocol ?? SCOUT_RENAME_TARGET_PROTOCOL,
-              scout_rename_target_reason:
-                renameMutationCapability?.reason ?? null,
-              scout_rename_target_ready:
-                renameMutationCapability?.ok === true &&
-                renameMutationCapability?.ready === true,
-              scout_rename_target:
-                renameMutationCapability?.target ?? null,
-              scout_local_mutation_handoff:
-                localMutationCapability?.localHandoffPath ?? null,
-              scout_local_mutation_target:
-                localMutationCapability?.target ?? null,
-              scout_local_allowed_mutations:
-                localMutationCapability?.allowedMutations ?? [],
-              scout_owner_attestation:
-                localMutationCapability?.ownerAttestation ?? null,
-              scout_competitor_check:
-                localCompetitorCheck ?? null,
-              mutation_candidate_protocol:
-                editCapsule?.mutationCandidateProtocol ?? null,
-              mutation_candidate_count:
-                editCapsule?.mutationCandidateCount ?? 0,
-              mutation_candidates_preauthorized:
-                localMutationCandidateSet?.candidates?.length ?? 0,
-              mutation_candidates_rejected:
-                localMutationCandidateSet?.rejected?.length ?? 0,
-              impact_mutation_candidate_recovery_reason:
-                impactMutationCandidateRecovery?.reason ?? null,
-              impact_mutation_candidate_recovery_groups:
-                impactMutationCandidateRecovery?.groups?.length ?? 0,
-              edit_capsule_protocol: editCapsule?.protocol ?? null,
-              edit_capsule_path: editCapsule?.path ?? null,
-              edit_capsule_sha256: editCapsule?.sha256 ?? null,
-              edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
-              edit_capsule_coverage: editCapsule?.coverage ?? null,
-              execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
-              patch_permission_action: PATCH_PERMISSION_ACTION,
-              execution_state: state?.executionState ?? null,
-              execution_reason: state?.executionReason ?? null,
-              execution_event: state?.executionEvent ?? null,
-              task_context_protocol: state?.taskContextProtocol ?? TASK_CONTEXT_PROTOCOL,
-              task_context_adapter_protocol: state?.taskContextAdapterProtocol ?? TASK_CONTEXT_ADAPTER_PROTOCOL,
-              task_turn_id: state?.taskTurnID ?? null,
-              task_text_sha256: state?.taskTextSha256 ?? null,
-              task_text_bytes: state?.taskTextBytes ?? null,
-              task_text_sources: state?.taskTextSources ?? [],
-              task_context_reason: state?.taskContextReason ?? null,
-              task_context_drift: state?.taskContextDrift === true,
-              mutation_intent_protocol: MUTATION_INTENT_PROTOCOL,
-              mutation_intent_router_protocol: "mutation-intent-router-v1.1-task-context",
-              mutation_intent: state?.mutationIntent ?? "unknown",
-              mutation_intent_reason: state?.mutationIntentReason ?? null,
-              task_action_protocol:
-                state?.taskAction?.protocol ?? TASK_ACTION_PROTOCOL,
-              task_action_status: state?.taskAction?.status ?? null,
-              task_action_operation: state?.taskAction?.operation ?? null,
-              mutation_action_frontier: mutationFrontier,
-              mutation_action_reason: frontierResolution.reason,
-              action_commit_protocol: ACTION_COMMIT_PROTOCOL,
-              action_commit_ready: actionCommitResult.ok === true,
-              action_commit_reason: actionCommitResult.reason,
-              action_commit_sha256:
-                actionCommitResult.commit?.commit_sha256 ?? null,
-              action_commit_claimed: actionCommitClaim?.ok === true,
-              action_commit_dispatches: state?.actionCommitDispatches ?? 0,
-              mutation_dispatch_origin:
-                deterministicMutationResult
-                  ? ACTION_COMMIT_DISPATCH_ORIGIN
-                  : null,
-              next_action: nextActionForExecutionState(state),
-              candidate_files: rankedFiles.length,
-              lexical_candidate_files: lexicalRankedFiles.length,
-              discovery_elapsed_ms: discoveryElapsedMs,
-
-              retrieval_ranker_attempted:
-                retrievalRanking.attempted,
-              retrieval_ranker_ok:
-                retrievalRanking.ok,
-              retrieval_ranker_reason:
-                retrievalRanking.reason,

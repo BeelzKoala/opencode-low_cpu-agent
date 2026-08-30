@@ -2,6 +2,23 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+
+import {
+  DETERMINISTIC_SCOUT_ENTRY_PROTOCOL,
+  mergeDeterministicScoutContext,
+  canMergeDeterministicScoutContext,
+  compileDeterministicScoutRequest,
+} from "./cpu-search-core/deterministic-scout-entry-v1.mjs"
+import {
+  MODEL_CONTEXT_COMPILER_PROTOCOL,
+  buildRepairExecutionProjection,
+  compileAdditiveExecutionCapsule,
+  resolveModelContextBudgetBytes,
+  resolveModelContextCompilerMode,
+  resolveRepairContextBudgetBytes,
+  snapshotCompiledExecutionCapsule,
+} from "./cpu-search-core/model-context-compiler-v1.mjs"
+
 import {
   TASK_ACTION_PROTOCOL,
   compileTaskAction,
@@ -29,54 +46,109 @@ import {
   FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
   inspectFrameworkResourceFile,
 } from "./cpu-search-core/framework-resource-bridge-v1.mjs"
-
 import {
   RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
   inspectResourceAdapterFile,
 } from "./cpu-search-core/resource-adapter-bridge-v1.mjs"
-
 import {
   TASK_ANCHOR_PROTOCOL,
   compileTaskAnchors,
 } from "./cpu-search-core/task-anchor-v1.mjs"
-
 import {
   TASK_CAUSAL_SHADOW_PROTOCOL,
   runTaskCausalShadow,
 } from "./cpu-search-core/task-causal-shadow-v1.mjs"
-
 import {
   TASK_SHAPE_PROTOCOL,
   compileTaskShape,
 } from "./cpu-search-core/task-shape-v1.mjs"
-
 import {
   ADDITIVE_LOCALIZATION_PLAN_PROTOCOL,
   planAdditiveLocalization,
 } from "./cpu-search-core/additive-localization-plan-v1.mjs"
-
-
 import {
   HOST_INTEGRATION_SHADOW_PROTOCOL,
   runHostIntegrationShadow,
 } from "./cpu-search-core/host-integration-shadow-v1.mjs"
-
-
 import {
   resolveAnchorFrontier,
   routeAnchorValues,
 } from "./cpu-search-core/anchor-resolution-frontier-v1.mjs"
-
 import {
   hostResourceClosureSummary,
   mergeHostAliases,
   resolveHostAliasesForNodes,
   resolveHostClosureContext,
 } from "./cpu-search-core/host-resource-closure-v2.mjs"
-
 import {
   projectAnchoredHostObligationProofs,
 } from "./cpu-search-core/host-obligation-projector-v1.mjs"
+import {
+  DATA_OBLIGATION_PROJECTOR_PROTOCOL,
+  projectDataAccessObligation,
+} from "./cpu-search-core/data-obligation-projector-v1.mjs"
+import {
+  SCOUT_EVIDENCE_CLOSURE_PROTOCOL,
+  planTaskBoundHostRefinement,
+  solveScoutEvidenceClosure,
+} from "./cpu-search-core/scout-evidence-closure-v1.mjs"
+import {
+  inspectEvidence,
+} from "./cpu-search-core/evidence-inspect-v1.mjs"
+import {
+  EXECUTION_MUTATION_SHAPE,
+  EXECUTION_READINESS_PROTOCOL,
+  EXECUTION_READINESS_STATUS,
+  initialExecutionReadiness,
+  resolveExecutionReadiness,
+} from "./cpu-search-core/execution-readiness-v1.mjs"
+import {
+  ADDITIVE_HOST_BINDING_PROTOCOL,
+  ADDITIVE_MODEL_CONTEXT_MAX_BYTES,
+  ADDITIVE_MAX_OPERATIONS,
+  ADDITIVE_MAX_CREATE_FILES,
+  ADDITIVE_MAX_REPLACE_BYTES,
+  ADDITIVE_MAX_CREATE_BYTES,
+  ADDITIVE_MAX_REL_PATH_BYTES,
+  ADDITIVE_MUTATION_ABI_PROTOCOL,
+  ADDITIVE_MUTATION_AUTHORITY_PROTOCOL,
+  ADDITIVE_MUTATION_CAPABILITY_PROTOCOL,
+  ADDITIVE_MUTATION_PLAN_PROTOCOL,
+  ADDITIVE_REPAIR_HINT_PROTOCOL,
+  EXECUTE_ADDITIVE_PLAN_TOOL,
+  additiveRepairAuthorityMatches,
+  bindAdditiveToolSchemaToCapability,
+  authorizeAdditiveMutationCapability,
+  buildAdditiveMutationHandoff,
+  buildAdditiveRepairHint,
+  deriveAdditiveMutationCapability,
+  materializeAdditiveMutationContext,
+  materializeAdditiveMutationPlan,
+  renderAdditiveMutationCapability,
+  validateAdditiveMutationRequest,
+  verifyAdditiveMutationAuthority,
+} from "./cpu-search-core/additive-mutation-v3.mjs"
+import {
+  OBLIGATION_BOUND_SYNTHESIS_PROTOCOL,
+  bindObligationBoundToolSchema,
+  materializeObligationBoundAdditiveRequest,
+  renderObligationBoundSynthesisContract,
+} from "./cpu-search-core/obligation-bound-synthesis-v1.mjs"
+import {
+  GOVERNOR_LATENCY_PROTOCOL,
+  TIME_SEMANTICS_PROTOCOL,
+  GOVERNOR_TASK_WINDOW_SEMANTICS,
+  GOVERNOR_TASK_SLA_ENFORCED,
+  GOVERNOR_PRODUCT_WATCHDOG_MODE,
+  GOVERNOR_PRODUCTION_HARD_LEASE_PROMOTED,
+  GOVERNOR_MAX_ACTIVE_PHASES,
+  effectivePhaseBudgetMs,
+  initialLatencyProfile,
+  latencyReserveMs,
+  observeLatency,
+  phaseForExecutionState,
+  resolveGovernorAdmission,
+} from "./cpu-search-core/governor-latency-v1.mjs"
 
 import {
   mergeTaskRoleEvidence,
@@ -199,6 +271,10 @@ const IMPACT_GRAPH_EMIT_MAX_FILES = 1
 const IMPACT_BINDINGS_PER_CANDIDATE = 4
 const IMPACT_EDGE_SYMBOL_CAP = 16
 const IMPACT_VALIDATION_SYMBOL_CAP = IMPACT_EDGE_SYMBOL_CAP
+const DATA_PROVIDER_IDENTITY_MAX_TASK_IDENTITIES = 8
+const DATA_PROVIDER_IDENTITY_MAX_FILES_PER_IDENTITY = 8
+const DATA_PROVIDER_IDENTITY_REQUEST_TIMEOUT_MS = 1800
+const DATA_PROVIDER_SYMBOL_BINDING_TIMEOUT_MS = 800
 const IMPACT_SCOPE_IDENTIFIER_CAP = 160
 const IMPACT_FILTER_SYMBOL_CAP = IMPACT_SCOPE_IDENTIFIER_CAP
 const IMPACT_VALIDATION_TIMEOUT_MS = 350
@@ -260,6 +336,7 @@ const EXECUTE_RENAME_SYMBOL_TOOL = "execute_rename_symbol"
 const MUTATION_TOOL_NAMES = Object.freeze([
   EXECUTE_REPLACE_NODE_TOOL,
   EXECUTE_RENAME_SYMBOL_TOOL,
+  EXECUTE_ADDITIVE_PLAN_TOOL,
 ])
 const PATCH_PERMISSION_ACTION = "execute_patch"
 const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v3"
@@ -307,6 +384,7 @@ const RUNTIME_STACK_COMPONENTS = {
   executor: "opencode-patch-executor",
   verifier: "opencode-invariant-verifier",
   impact_index: "opencode-impact-index",
+  context_planner: "opencode-context-planner",
 }
 
 let runtimeStackManifestCache = null
@@ -339,6 +417,7 @@ const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
 const SEARCH_PROTOCOL = "search-v2.24.0-semantic-impact-shadow"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
+const RUNTIME_COST_OBSERVATION_PROTOCOL = "runtime-cost-observation-v1"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -1052,12 +1131,42 @@ async function scoutFileFingerprint(root, rawFile, witnesses = []) {
     }
     const body = await readFile(resolved)
     const lines = body.toString("utf8").split(/\r?\n/)
+    const bodySha256 = createHash("sha256").update(body).digest("hex")
     let evidenceFresh = true
     let witnessesChecked = 0
     for (const witness of witnesses) {
-      if (!Number.isInteger(witness?.line) || typeof witness?.text !== "string") continue
+      if (!Number.isInteger(witness?.line) || witness.line < 1) continue
+
+      const expectedSha =
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256)
+          ? witness.sha256.toLowerCase()
+          : null
+
+      const expectedText =
+        typeof witness?.text === "string"
+          ? witness.text
+          : null
+
+      if (!expectedSha && expectedText === null) continue
+
       witnessesChecked += 1
-      if (scoutNormalizeWitnessText(lines[witness.line - 1] ?? "") !== scoutNormalizeWitnessText(witness.text)) {
+
+      if (witness.line > lines.length) {
+        evidenceFresh = false
+        break
+      }
+
+      if (expectedSha && expectedSha !== bodySha256) {
+        evidenceFresh = false
+        break
+      }
+
+      if (
+        expectedText !== null &&
+        scoutNormalizeWitnessText(lines[witness.line - 1] ?? "") !==
+          scoutNormalizeWitnessText(expectedText)
+      ) {
         evidenceFresh = false
         break
       }
@@ -1065,7 +1174,7 @@ async function scoutFileFingerprint(root, rawFile, witnesses = []) {
     return {
       kind: "sha256",
       strong: true,
-      sha256: createHash("sha256").update(body).digest("hex"),
+      sha256: bodySha256,
       evidence_fresh: evidenceFresh,
       witnesses_checked: witnessesChecked,
       ...base,
@@ -2339,11 +2448,223 @@ function serializeScoutFile(entry) {
   }
 }
 
+async function buildScoutEvidenceContext(root, evidenceClosure) {
+  const rows = []
+
+  for (const item of evidenceClosure?.files ?? []) {
+    const file = evidenceFileKey(item?.file)
+    if (!file) continue
+
+    const witnesses = (item?.witnesses ?? [])
+      .filter((witness) =>
+        Number.isInteger(witness?.line) &&
+        witness.line >= 1 &&
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256),
+      )
+      .map((witness) => ({
+        line: witness.line,
+        sha256: witness.sha256.toLowerCase(),
+        extractor: witness?.extractor ?? null,
+      }))
+
+    const fingerprint = await scoutFileFingerprint(
+      root,
+      file,
+      witnesses,
+    )
+
+    rows.push({
+      file,
+      roles: [...new Set(item?.roles ?? [])]
+        .filter((role) => typeof role === "string" && role.length > 0)
+        .sort(),
+      evidence_lines: [...new Set(witnesses.map((witness) => witness.line))]
+        .sort((a, b) => a - b),
+      fingerprint,
+      authority: "localization_context_only",
+      mutation_authority: false,
+    })
+  }
+
+  return rows.sort((a, b) => a.file.localeCompare(b.file))
+}
+
+function scoutEvidenceContextPriority(row) {
+  const roles = new Set(row?.roles ?? [])
+  if (roles.has("task_anchor_owner")) return 0
+  if (roles.has("ui_host")) return 1
+  if (roles.has("navigation_host")) return 2
+  if (roles.has("data_access_capability")) return 3
+  return 9
+}
+
+async function renderScoutEvidenceClosureContext(
+  root,
+  evidenceClosure,
+  maxBytes,
+) {
+  const limit = Number.isSafeInteger(maxBytes) && maxBytes > 0
+    ? maxBytes
+    : 0
+
+  if (
+    !evidenceClosure ||
+    evidenceClosure.status === "not_applicable" ||
+    limit < 1
+  ) {
+    return {
+      content: "",
+      bytes: 0,
+      filesShown: 0,
+      truncated: false,
+      abstainedFiles: 0,
+    }
+  }
+
+  const required = (evidenceClosure.required_roles ?? []).join(",") || "none"
+  const covered = (evidenceClosure.covered_roles ?? []).join(",") || "none"
+  const missing = (evidenceClosure.missing_roles ?? []).join(",") || "none"
+  const ambiguous = (evidenceClosure.ambiguous_roles ?? []).join(",") || "none"
+  const header =
+    `SCOUT_EVIDENCE_CLOSURE status=${evidenceClosure.status} ` +
+    `required=${required} covered=${covered} missing=${missing} ambiguous=${ambiguous} ` +
+    `authority=localization_context_only mutation_authority=false`
+
+  if (bytes(header) > limit) {
+    return {
+      content: "",
+      bytes: 0,
+      filesShown: 0,
+      truncated: true,
+      abstainedFiles: 0,
+    }
+  }
+
+  const lines = [header]
+  let used = bytes(header)
+  let filesShown = 0
+  let truncated = evidenceClosure.truncated === true
+  let abstainedFiles = 0
+
+  const rows = [...(evidenceClosure.files ?? [])].sort((a, b) =>
+    scoutEvidenceContextPriority(a) - scoutEvidenceContextPriority(b) ||
+    String(evidenceFileKey(a?.file) ?? "").localeCompare(
+      String(evidenceFileKey(b?.file) ?? ""),
+    ),
+  )
+
+  for (const row of rows) {
+    const file = evidenceFileKey(row?.file)
+    const witnesses = (row?.witnesses ?? [])
+      .filter((witness) =>
+        Number.isInteger(witness?.line) &&
+        witness.line >= 1 &&
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256),
+      )
+      .sort((a, b) => a.line - b.line)
+
+    if (!file || witnesses.length < 1) {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const digests = [...new Set(witnesses.map((witness) => witness.sha256.toLowerCase()))]
+    if (digests.length !== 1) {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    let safeFile
+    try {
+      safeFile = await safeTarget(root, file)
+    } catch {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    let source
+    try {
+      const info = await stat(path.join(root, safeFile))
+      if (!info.isFile() || info.size > SCOUT_HANDOFF_HASH_MAX_BYTES) {
+        abstainedFiles += 1
+        truncated = true
+        continue
+      }
+      source = await readFile(path.join(root, safeFile))
+    } catch {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const inspection = inspectEvidence({
+      request: {
+        file,
+        line: witnesses[0].line,
+        radius: 3,
+      },
+      allowed_files: [{
+        file,
+        sha256: digests[0],
+        evidence_lines: witnesses.map((witness) => witness.line),
+      }],
+      source,
+    })
+
+    if (inspection?.status !== "OK") {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const roles = [...new Set(row?.roles ?? [])]
+      .filter((role) => typeof role === "string" && role.length > 0)
+      .sort()
+      .join(",") || "context"
+
+    const block = [
+      `EVIDENCE_CONTEXT file=${file} roles=${roles} anchor=${inspection.binding.line} ` +
+        `sha256=${inspection.binding.sha256} mutation_authority=false`,
+      ...inspection.excerpt.map((item) =>
+        `  ${String(item.line).padStart(5)} | ${clipLine(item.text)}`,
+      ),
+    ]
+
+    const blockCost = bytes("\n" + block.join("\n"))
+    if (used + blockCost > limit) {
+      truncated = true
+      continue
+    }
+
+    lines.push(...block)
+    used += blockCost
+    filesShown += 1
+  }
+
+  const content = lines.join("\n")
+  return {
+    content,
+    bytes: bytes(content),
+    filesShown,
+    truncated,
+    abstainedFiles,
+  }
+}
+
 async function updateScoutHandoff(root, sessionID, state, snapshot) {
   if (!state || !sessionID) return null
   const started = performance.now()
   const lineMap = scoutEvidenceLines(snapshot.hits, snapshot.selectedFiles)
   const witnessMap = scoutEvidenceWitnesses(snapshot.hits, snapshot.selectedFiles)
+  const contextFiles = await buildScoutEvidenceContext(
+    root,
+    snapshot.evidenceClosure,
+  )
   const fingerprints = await Promise.all((snapshot.selectedFiles ?? []).map(async (selected) => {
     const file = evidenceFileKey(selected?.file)
     return {
@@ -2404,6 +2725,13 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
     retained_unread_files: snapshot.retainedUnreadFiles,
     retained_unemitted_files: snapshot.retainedUnemittedFiles,
     selected_files: (snapshot.selectedFiles ?? []).map((entry) => evidenceFileKey(entry?.file)).filter(Boolean),
+    evidence_closure_protocol: snapshot.evidenceClosure?.protocol ?? null,
+    evidence_closure_status: snapshot.evidenceClosure?.status ?? "not_applicable",
+    evidence_closure_covered_roles: snapshot.evidenceClosure?.covered_roles ?? [],
+    evidence_closure_missing_roles: snapshot.evidenceClosure?.missing_roles ?? [],
+    evidence_closure_ambiguous_roles: snapshot.evidenceClosure?.ambiguous_roles ?? [],
+    evidence_closure_files: (snapshot.evidenceClosure?.files ?? []).map((entry) => evidenceFileKey(entry?.file)).filter(Boolean),
+    evidence_closure_truncated: snapshot.evidenceClosure?.truncated === true,
     impact_index_coverage_complete: snapshot.impactIndexCoverageComplete,
     no_progress: snapshot.noProgress === true,
     no_progress_blocked: snapshot.noProgressBlocked === true,
@@ -2422,6 +2750,16 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
   if (files.some((entry) => entry.fingerprint?.strong !== true)) blockingReasons.push("weak_fingerprint")
   if (files.some((entry) => entry.fingerprint?.evidence_fresh === false)) blockingReasons.push("evidence_changed_before_handoff")
   if (files.some((entry) => entry.changed_during_scout === true)) blockingReasons.push("file_changed_during_scout")
+  if (contextFiles.some((entry) => !entry.fingerprint)) blockingReasons.push("context_fingerprint_unavailable")
+  if (contextFiles.some((entry) => entry.fingerprint?.strong !== true)) blockingReasons.push("weak_context_fingerprint")
+  if (contextFiles.some((entry) => entry.fingerprint?.evidence_fresh === false)) {
+    blockingReasons.push("context_evidence_changed_before_handoff")
+  }
+  if (latest?.evidence_closure_status === "insufficient") blockingReasons.push("evidence_sufficiency_missing")
+  if (latest?.evidence_closure_status === "ambiguous") blockingReasons.push("evidence_sufficiency_ambiguous")
+  if (latest?.evidence_closure_status === "truncated" || latest?.evidence_closure_truncated === true) {
+    blockingReasons.push("evidence_closure_truncated")
+  }
 
   if (latest?.lexical_discovery_complete === false) partialReasons.push("lexical_discovery_incomplete")
   if ((latest?.retained_unread_files ?? 0) > 0) partialReasons.push("retained_unread_files")
@@ -2445,6 +2783,21 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
       executed_searches: state.executedSearches,
       evidence_bytes: state.evidenceBytes,
     },
+    evidence_sufficiency: snapshot.evidenceClosure
+      ? {
+          protocol: snapshot.evidenceClosure.protocol,
+          status: snapshot.evidenceClosure.status,
+          reason: snapshot.evidenceClosure.reason,
+          coverage_status: snapshot.evidenceClosure.coverage_status,
+          required_roles: snapshot.evidenceClosure.required_roles,
+          covered_roles: snapshot.evidenceClosure.covered_roles,
+          missing_roles: snapshot.evidenceClosure.missing_roles,
+          ambiguous_roles: snapshot.evidenceClosure.ambiguous_roles,
+          files: (snapshot.evidenceClosure.files ?? []).map((entry) => entry.file),
+          mutation_authority: false,
+        }
+      : null,
+    context_files: contextFiles,
     searches: state.scoutSearches,
     files,
   }
@@ -2461,6 +2814,7 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
     path: handoffPath,
     status,
     files: files.length,
+    contextFiles,
     blockingReasons: bundle.blocking_reasons,
     partialReasons: bundle.partial_reasons,
     elapsedMs: Math.round((performance.now() - started) * 100) / 100,

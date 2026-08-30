@@ -1,6 +1,9 @@
 pub mod candidate_hygiene;
 pub mod candidate_validity;
+pub mod crypto_hash;
 pub mod impact_index_core;
 pub mod retrieval_ranker_core;
+pub mod sealed_edit_site_core;
+pub mod sealed_slice_store_core;
 pub mod semantic_resolver_core;
 pub mod structural_index_core;

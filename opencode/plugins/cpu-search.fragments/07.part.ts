@@ -685,6 +685,64 @@
                     : [],
             })
 
+          const hostOwnerRefinementPlan =
+            planTaskBoundHostRefinement({
+              taskRequirements:
+                state?.taskRequirements,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              anchorFrontier,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              selectedFiles,
+            })
+
+          /*
+           * E1.7 — deterministic evidence closure.
+           *
+           * Exact task-anchor ownership is already source validated above.
+           * If an additive UI/navigation obligation still needs host
+           * relations and the exact owner was dropped by lexical emission,
+           * inspect that ONE proven owner without a model round-trip.
+           *
+           * This is evidence refinement only. It cannot grant mutation
+           * authority and cannot expand beyond the exact task-bound owner.
+           */
+          const hostOwnerRefinement =
+            hostOwnerRefinementPlan
+              .candidate_files
+              .length > 0
+                ? await inspectFrameworkRoutingForSelected(
+                    root,
+                    hostOwnerRefinementPlan
+                      .candidate_files,
+                    state,
+                  )
+                : {
+                    protocol:
+                      FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+                    authority:
+                      "routing_only",
+                    mutationAuthority:
+                      false,
+                    filesScanned: 0,
+                    skippedFiles: 0,
+                    validatedEdges: 0,
+                    rejectedEdges: 0,
+                    truncated: false,
+                  }
+
           const hostResourceInventory =
             await observedHostResourceInventory(
               root,
@@ -742,6 +800,11 @@
                 ) ||
                 (
                   anchorFrontierFramework
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  hostOwnerRefinement
                     ?.truncated ===
                     true
                 ),
@@ -1095,6 +1158,11 @@
                     true
                 ) ||
                 (
+                  hostOwnerRefinement
+                    ?.truncated ===
+                    true
+                ) ||
+                (
                   uiFollowupFramework
                     ?.truncated ===
                     true
@@ -1226,10 +1294,90 @@
                   ?.task_sha256,
             })
 
+          const dataCapabilityObservation =
+            await resolveTaskBoundDataCapability({
+              root,
+              state,
+              anchorFrontier,
+              coverageRequirements:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_coverage_requirements,
+            })
+
+          const dataObligationProjection =
+            dataCapabilityObservation
+              ?.projection
+
+          const taskBoundDataEvidence =
+            projectTaskBoundObligationProofs({
+              coverageRequirements:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_coverage_requirements,
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+              proofs:
+                dataObligationProjection
+                  ?.proofs ??
+                [],
+            })
+
+          const mergedDataRoleEvidence =
+            mergeTaskRoleEvidence({
+              existing:
+                mergedRoleEvidence
+                  .evidence,
+              incoming:
+                taskBoundDataEvidence
+                  .evidence,
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+            })
+
           if (state) {
             state.taskRoleEvidence =
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .evidence
+          }
+
+          const scoutEvidenceClosure =
+            solveScoutEvidenceClosure({
+              taskRequirements:
+                state?.taskRequirements,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              taskRoleEvidence:
+                state?.taskRoleEvidence ??
+                [],
+
+              anchorFrontier,
+
+              hostResourceClosure,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+            })
+
+          let scoutEvidenceProjection = {
+            content: "",
+            bytes: 0,
+            filesShown: 0,
+            truncated: false,
+            abstainedFiles: 0,
           }
 
           const routeFacts = routeFactsForRanking(
@@ -1244,13 +1392,18 @@
             routeFacts.add(fact)
           }
 
+          for (const fact of hostOwnerRefinement.routeFacts ?? []) {
+            routeFacts.add(fact)
+          }
+
           const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
           const novelty = novelEvidenceFacts(state, finalFacts)
           const routeNovelty = novelRouteFacts(state, routeFacts)
           const meaningfulRouteProgress =
             (
               routingActive ||
-              frameworkRouting.validatedEdges > 0
+              frameworkRouting.validatedEdges > 0 ||
+              (hostOwnerRefinement.validatedEdges ?? 0) > 0
             ) &&
             routeNovelty.novel.size > 0
           const novelFactStats = summarizeEvidenceFacts(novelty.novel)
@@ -1306,6 +1459,28 @@
             }
           }
 
+          if (!noProgress && scoutEvidenceClosure.status !== "not_applicable") {
+            const separatorBytes = content.length > 0 ? bytes("\n\n") : 0
+            const remainingProjectionBytes = Math.max(
+              0,
+              callBudgetBytes - resultBytes - separatorBytes,
+            )
+
+            scoutEvidenceProjection =
+              await renderScoutEvidenceClosureContext(
+                root,
+                scoutEvidenceClosure,
+                remainingProjectionBytes,
+              )
+
+            if (scoutEvidenceProjection.content) {
+              content = content.length > 0
+                ? `${content}\n\n${scoutEvidenceProjection.content}`
+                : scoutEvidenceProjection.content
+              resultBytes = bytes(content)
+            }
+          }
+
           if (
             !noProgress &&
             routingActive &&
@@ -1340,6 +1515,7 @@
             retainedUnreadFiles: Math.max(0, rankedFiles.length - probeFileSet.size),
             retainedUnemittedFiles: routeRendered.retained,
             impactIndexCoverageComplete: impactIndexShadow.refreshComplete,
+            evidenceClosure: scoutEvidenceClosure,
             noProgress,
             noProgressBlocked,
           })
@@ -1734,64 +1910,214 @@
                   localMutationCandidateSet.primary
               }
 
-              if (localMutationCapability?.ok === true) {
-                state.localMutationHandoffPath =
-                  localMutationCapability.localHandoffPath
-                state.localMutationCapability = localMutationCapability
-                state.localMutationCandidates =
-                  localMutationCandidateSet?.candidates ?? []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_ready",
-                  "local_mutation_capability_ready",
-                )
-              } else {
-                state.localMutationHandoffPath = null
-                state.localMutationCapability = null
-                state.localMutationCandidates = []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_needs_evidence",
-                  localMutationCapability?.reason ??
-                    localCompetitorCheck?.reason ??
-                    "local_mutation_capability_unavailable",
-                )
-              }
-            } else {
-              applyExecutionEvent(
-                state,
-                "scout_needs_evidence",
-                "edit_capsule_unavailable",
-              )
             }
-          } else {
-            applyExecutionEvent(
-              state,
-              "scout_needs_evidence",
-              `mutation_localization_${mutationLocalization.reason}`,
-            )
           }
 
-          const elapsedMs = Math.round((performance.now() - started) * 100) / 100
+          if (state) {
+            if (localMutationCapability?.ok === true) {
+              state.localMutationHandoffPath =
+                localMutationCapability.localHandoffPath
+              state.localMutationCapability = localMutationCapability
+              state.localMutationCandidates =
+                localMutationCandidateSet?.candidates ?? []
+            } else {
+              state.localMutationHandoffPath = null
+              state.localMutationCapability = null
+              state.localMutationCandidates = []
+            }
 
-          await writeProjectTrace(root, "search-trace.jsonl", {
-            ts: nowMs(),
-            protocol: SEARCH_PROTOCOL,
-            sessionID,
-            turnID: state?.turnID ?? null,
-            project_root: root,
-            attempt_index: attemptIndex,
-            requested_queries: input?.queries,
-            queries,
-            path: target,
-            glob: glob ?? null,
-            requested_glob: requestedGlob ?? null,
-            effective_glob: glob ?? null,
-            glob_corrected: globResolution.corrected === true,
-            glob_correction_reason: globResolution.reason,
-            glob_inventory_complete: globResolution.inventoryComplete,
-            glob_inventory_files: globResolution.inventoryFiles,
+            state.boundMutationTarget = null
+            state.activeMutationHandoffPath = null
+          }
+
+          let additiveMutationCapability =
+            deriveAdditiveMutationCapability({
+              taskShape: state?.taskShape,
+              evidenceClosure: scoutEvidenceClosure,
+              hostResourceClosure,
+            })
+
+          let additiveMutationContext = null
+          let additiveMutationHandoffPath = null
+          let additiveMutationAuthority = null
+
+          if (additiveMutationCapability?.binding_ready === true) {
+            additiveMutationContext =
+              await materializeAdditiveMutationContext({
+                root,
+                capability: additiveMutationCapability,
+                maxBytes: ADDITIVE_MODEL_CONTEXT_MAX_BYTES,
+              })
+
+            if (additiveMutationContext?.ok === true) {
+              const discriminator =
+                `additive-${additiveMutationCapability.capability_sha256.slice(0, 16)}`
+              const provisionalHandoff =
+                buildAdditiveMutationHandoff({
+                  searchProtocol: SEARCH_PROTOCOL,
+                  sessionKey: scoutOpaqueKey(sessionID),
+                  turnKey: scoutOpaqueKey(state?.turnID ?? ""),
+                  generatedAtMs: nowMs(),
+                  capability: additiveMutationCapability,
+                  context: additiveMutationContext,
+                })
+
+              if (provisionalHandoff?.ok === true) {
+                const provisionalPath =
+                  await writeLocalMutationHandoff(
+                    root,
+                    sessionID,
+                    state?.turnID,
+                    provisionalHandoff.bundle,
+                    discriminator,
+                  )
+
+                if (provisionalPath) {
+                  const authorizedCapability =
+                    await authorizeAdditiveMutationCapability({
+                      root,
+                      capability: additiveMutationCapability,
+                      context: additiveMutationContext,
+                      handoffPath: provisionalPath,
+                    })
+
+                  if (
+                    authorizedCapability?.ready === true &&
+                    authorizedCapability?.mutation_authority === true
+                  ) {
+                    const finalHandoff =
+                      buildAdditiveMutationHandoff({
+                        searchProtocol: SEARCH_PROTOCOL,
+                        sessionKey: scoutOpaqueKey(sessionID),
+                        turnKey: scoutOpaqueKey(state?.turnID ?? ""),
+                        generatedAtMs: nowMs(),
+                        capability: authorizedCapability,
+                        context: additiveMutationContext,
+                      })
+
+                    if (finalHandoff?.ok === true) {
+                      const finalPath =
+                        await writeLocalMutationHandoff(
+                          root,
+                          sessionID,
+                          state?.turnID,
+                          finalHandoff.bundle,
+                          discriminator,
+                        )
+
+                      if (finalPath === provisionalPath) {
+                        const verifiedAuthority =
+                          await verifyAdditiveMutationAuthority({
+                            root,
+                            capability: authorizedCapability,
+                            context: additiveMutationContext,
+                            handoffPath: finalPath,
+                          })
+
+                        additiveMutationAuthority =
+                          verifiedAuthority
+
+                        if (verifiedAuthority?.ok === true) {
+                          additiveMutationCapability =
+                            authorizedCapability
+                          additiveMutationHandoffPath =
+                            finalPath
+                        }
+                      } else {
+                        additiveMutationAuthority = {
+                          ok: false,
+                          reason:
+                            "additive_final_handoff_path_mismatch",
+                        }
+                      }
+                    } else {
+                      additiveMutationAuthority = {
+                        ok: false,
+                        reason:
+                          finalHandoff?.reason ??
+                          "additive_final_handoff_invalid",
+                      }
+                    }
+                  } else {
+                    additiveMutationAuthority = {
+                      ok: false,
+                      reason:
+                        authorizedCapability?.reason ??
+                        "additive_authority_authorization_failed",
+                    }
+                  }
+                } else {
+                  additiveMutationAuthority = {
+                    ok: false,
+                    reason:
+                      "additive_provisional_handoff_write_failed",
+                  }
+                }
+              } else {
+                additiveMutationAuthority = {
+                  ok: false,
+                  reason:
+                    provisionalHandoff?.reason ??
+                    "additive_provisional_handoff_invalid",
+                }
+              }
+            } else {
+              additiveMutationAuthority = {
+                ok: false,
+                reason:
+                  additiveMutationContext?.reason ??
+                  "additive_context_materialization_failed",
+              }
+            }
+
+            if (
+              additiveMutationCapability?.mutation_authority !== true ||
+              !additiveMutationHandoffPath ||
+              additiveMutationAuthority?.ok !== true
+            ) {
+              additiveMutationCapability = Object.freeze({
+                ...additiveMutationCapability,
+                status: "abstained",
+                reason:
+                  additiveMutationAuthority?.reason ??
+                  "additive_handoff_authority_unavailable",
+                binding_ready: false,
+                ready: false,
+                mutation_authority: false,
+                authority_protocol: null,
+                authority_receipt: null,
+                authority_sha256: null,
+              })
+              additiveMutationHandoffPath = null
+            }
+          }
+
+          if (state) {
+            state.additiveMutationCapability =
+              additiveMutationCapability
+            state.additiveMutationHandoffPath =
+              additiveMutationHandoffPath
+            state.additiveMutationContext =
+              additiveMutationContext
+          }
+
+          const executionReadiness =
+            resolveExecutionReadiness({
+              taskShape: state?.taskShape,
+              taskAction: state?.taskAction,
+              mutationIntent: state?.mutationIntent,
+              scoutHandoff,
+              evidenceClosure: scoutEvidenceClosure,
+              editCapsule,
+              localCompetitorCheck,
+              localMutationCapability,
+              localMutationCandidates:
+                localMutationCandidateSet?.candidates ?? [],
+              renameMutationCapability,
+              additiveMutationCapability,
+              noProgressBlocked,
+            })
+
+          if (state) {
+            applyExecutionReadiness(state, executionReadiness)
+          }

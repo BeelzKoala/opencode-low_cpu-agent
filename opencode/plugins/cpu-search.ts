@@ -2,6 +2,23 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+
+import {
+  DETERMINISTIC_SCOUT_ENTRY_PROTOCOL,
+  mergeDeterministicScoutContext,
+  canMergeDeterministicScoutContext,
+  compileDeterministicScoutRequest,
+} from "./cpu-search-core/deterministic-scout-entry-v1.mjs"
+import {
+  MODEL_CONTEXT_COMPILER_PROTOCOL,
+  buildRepairExecutionProjection,
+  compileAdditiveExecutionCapsule,
+  resolveModelContextBudgetBytes,
+  resolveModelContextCompilerMode,
+  resolveRepairContextBudgetBytes,
+  snapshotCompiledExecutionCapsule,
+} from "./cpu-search-core/model-context-compiler-v1.mjs"
+
 import {
   TASK_ACTION_PROTOCOL,
   compileTaskAction,
@@ -29,54 +46,109 @@ import {
   FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
   inspectFrameworkResourceFile,
 } from "./cpu-search-core/framework-resource-bridge-v1.mjs"
-
 import {
   RESOURCE_ADAPTER_BRIDGE_PROTOCOL,
   inspectResourceAdapterFile,
 } from "./cpu-search-core/resource-adapter-bridge-v1.mjs"
-
 import {
   TASK_ANCHOR_PROTOCOL,
   compileTaskAnchors,
 } from "./cpu-search-core/task-anchor-v1.mjs"
-
 import {
   TASK_CAUSAL_SHADOW_PROTOCOL,
   runTaskCausalShadow,
 } from "./cpu-search-core/task-causal-shadow-v1.mjs"
-
 import {
   TASK_SHAPE_PROTOCOL,
   compileTaskShape,
 } from "./cpu-search-core/task-shape-v1.mjs"
-
 import {
   ADDITIVE_LOCALIZATION_PLAN_PROTOCOL,
   planAdditiveLocalization,
 } from "./cpu-search-core/additive-localization-plan-v1.mjs"
-
-
 import {
   HOST_INTEGRATION_SHADOW_PROTOCOL,
   runHostIntegrationShadow,
 } from "./cpu-search-core/host-integration-shadow-v1.mjs"
-
-
 import {
   resolveAnchorFrontier,
   routeAnchorValues,
 } from "./cpu-search-core/anchor-resolution-frontier-v1.mjs"
-
 import {
   hostResourceClosureSummary,
   mergeHostAliases,
   resolveHostAliasesForNodes,
   resolveHostClosureContext,
 } from "./cpu-search-core/host-resource-closure-v2.mjs"
-
 import {
   projectAnchoredHostObligationProofs,
 } from "./cpu-search-core/host-obligation-projector-v1.mjs"
+import {
+  DATA_OBLIGATION_PROJECTOR_PROTOCOL,
+  projectDataAccessObligation,
+} from "./cpu-search-core/data-obligation-projector-v1.mjs"
+import {
+  SCOUT_EVIDENCE_CLOSURE_PROTOCOL,
+  planTaskBoundHostRefinement,
+  solveScoutEvidenceClosure,
+} from "./cpu-search-core/scout-evidence-closure-v1.mjs"
+import {
+  inspectEvidence,
+} from "./cpu-search-core/evidence-inspect-v1.mjs"
+import {
+  EXECUTION_MUTATION_SHAPE,
+  EXECUTION_READINESS_PROTOCOL,
+  EXECUTION_READINESS_STATUS,
+  initialExecutionReadiness,
+  resolveExecutionReadiness,
+} from "./cpu-search-core/execution-readiness-v1.mjs"
+import {
+  ADDITIVE_HOST_BINDING_PROTOCOL,
+  ADDITIVE_MODEL_CONTEXT_MAX_BYTES,
+  ADDITIVE_MAX_OPERATIONS,
+  ADDITIVE_MAX_CREATE_FILES,
+  ADDITIVE_MAX_REPLACE_BYTES,
+  ADDITIVE_MAX_CREATE_BYTES,
+  ADDITIVE_MAX_REL_PATH_BYTES,
+  ADDITIVE_MUTATION_ABI_PROTOCOL,
+  ADDITIVE_MUTATION_AUTHORITY_PROTOCOL,
+  ADDITIVE_MUTATION_CAPABILITY_PROTOCOL,
+  ADDITIVE_MUTATION_PLAN_PROTOCOL,
+  ADDITIVE_REPAIR_HINT_PROTOCOL,
+  EXECUTE_ADDITIVE_PLAN_TOOL,
+  additiveRepairAuthorityMatches,
+  bindAdditiveToolSchemaToCapability,
+  authorizeAdditiveMutationCapability,
+  buildAdditiveMutationHandoff,
+  buildAdditiveRepairHint,
+  deriveAdditiveMutationCapability,
+  materializeAdditiveMutationContext,
+  materializeAdditiveMutationPlan,
+  renderAdditiveMutationCapability,
+  validateAdditiveMutationRequest,
+  verifyAdditiveMutationAuthority,
+} from "./cpu-search-core/additive-mutation-v3.mjs"
+import {
+  OBLIGATION_BOUND_SYNTHESIS_PROTOCOL,
+  bindObligationBoundToolSchema,
+  materializeObligationBoundAdditiveRequest,
+  renderObligationBoundSynthesisContract,
+} from "./cpu-search-core/obligation-bound-synthesis-v1.mjs"
+import {
+  GOVERNOR_LATENCY_PROTOCOL,
+  TIME_SEMANTICS_PROTOCOL,
+  GOVERNOR_TASK_WINDOW_SEMANTICS,
+  GOVERNOR_TASK_SLA_ENFORCED,
+  GOVERNOR_PRODUCT_WATCHDOG_MODE,
+  GOVERNOR_PRODUCTION_HARD_LEASE_PROMOTED,
+  GOVERNOR_MAX_ACTIVE_PHASES,
+  effectivePhaseBudgetMs,
+  initialLatencyProfile,
+  latencyReserveMs,
+  observeLatency,
+  phaseForExecutionState,
+  resolveGovernorAdmission,
+} from "./cpu-search-core/governor-latency-v1.mjs"
 
 import {
   mergeTaskRoleEvidence,
@@ -199,6 +271,10 @@ const IMPACT_GRAPH_EMIT_MAX_FILES = 1
 const IMPACT_BINDINGS_PER_CANDIDATE = 4
 const IMPACT_EDGE_SYMBOL_CAP = 16
 const IMPACT_VALIDATION_SYMBOL_CAP = IMPACT_EDGE_SYMBOL_CAP
+const DATA_PROVIDER_IDENTITY_MAX_TASK_IDENTITIES = 8
+const DATA_PROVIDER_IDENTITY_MAX_FILES_PER_IDENTITY = 8
+const DATA_PROVIDER_IDENTITY_REQUEST_TIMEOUT_MS = 1800
+const DATA_PROVIDER_SYMBOL_BINDING_TIMEOUT_MS = 800
 const IMPACT_SCOPE_IDENTIFIER_CAP = 160
 const IMPACT_FILTER_SYMBOL_CAP = IMPACT_SCOPE_IDENTIFIER_CAP
 const IMPACT_VALIDATION_TIMEOUT_MS = 350
@@ -260,6 +336,7 @@ const EXECUTE_RENAME_SYMBOL_TOOL = "execute_rename_symbol"
 const MUTATION_TOOL_NAMES = Object.freeze([
   EXECUTE_REPLACE_NODE_TOOL,
   EXECUTE_RENAME_SYMBOL_TOOL,
+  EXECUTE_ADDITIVE_PLAN_TOOL,
 ])
 const PATCH_PERMISSION_ACTION = "execute_patch"
 const PATCH_EXECUTOR_PROTOCOL = "patch-executor-v3"
@@ -307,6 +384,7 @@ const RUNTIME_STACK_COMPONENTS = {
   executor: "opencode-patch-executor",
   verifier: "opencode-invariant-verifier",
   impact_index: "opencode-impact-index",
+  context_planner: "opencode-context-planner",
 }
 
 let runtimeStackManifestCache = null
@@ -339,6 +417,7 @@ const MUTATION_CANDIDATE_MAX = EDIT_CAPSULE_MAX_SCOPES
 
 const SEARCH_PROTOCOL = "search-v2.24.0-semantic-impact-shadow"
 const AGENT_PROTOCOL = "cpu-agent-v2.8.0-mutation-confinement-2"
+const RUNTIME_COST_OBSERVATION_PROTOCOL = "runtime-cost-observation-v1"
 
 const MAX_SEARCH_ATTEMPTS_PER_TURN = 6
 const MAX_EXECUTED_SEARCHES_PER_TURN = 4
@@ -1052,12 +1131,42 @@ async function scoutFileFingerprint(root, rawFile, witnesses = []) {
     }
     const body = await readFile(resolved)
     const lines = body.toString("utf8").split(/\r?\n/)
+    const bodySha256 = createHash("sha256").update(body).digest("hex")
     let evidenceFresh = true
     let witnessesChecked = 0
     for (const witness of witnesses) {
-      if (!Number.isInteger(witness?.line) || typeof witness?.text !== "string") continue
+      if (!Number.isInteger(witness?.line) || witness.line < 1) continue
+
+      const expectedSha =
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256)
+          ? witness.sha256.toLowerCase()
+          : null
+
+      const expectedText =
+        typeof witness?.text === "string"
+          ? witness.text
+          : null
+
+      if (!expectedSha && expectedText === null) continue
+
       witnessesChecked += 1
-      if (scoutNormalizeWitnessText(lines[witness.line - 1] ?? "") !== scoutNormalizeWitnessText(witness.text)) {
+
+      if (witness.line > lines.length) {
+        evidenceFresh = false
+        break
+      }
+
+      if (expectedSha && expectedSha !== bodySha256) {
+        evidenceFresh = false
+        break
+      }
+
+      if (
+        expectedText !== null &&
+        scoutNormalizeWitnessText(lines[witness.line - 1] ?? "") !==
+          scoutNormalizeWitnessText(expectedText)
+      ) {
         evidenceFresh = false
         break
       }
@@ -1065,7 +1174,7 @@ async function scoutFileFingerprint(root, rawFile, witnesses = []) {
     return {
       kind: "sha256",
       strong: true,
-      sha256: createHash("sha256").update(body).digest("hex"),
+      sha256: bodySha256,
       evidence_fresh: evidenceFresh,
       witnesses_checked: witnessesChecked,
       ...base,
@@ -2339,11 +2448,223 @@ function serializeScoutFile(entry) {
   }
 }
 
+async function buildScoutEvidenceContext(root, evidenceClosure) {
+  const rows = []
+
+  for (const item of evidenceClosure?.files ?? []) {
+    const file = evidenceFileKey(item?.file)
+    if (!file) continue
+
+    const witnesses = (item?.witnesses ?? [])
+      .filter((witness) =>
+        Number.isInteger(witness?.line) &&
+        witness.line >= 1 &&
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256),
+      )
+      .map((witness) => ({
+        line: witness.line,
+        sha256: witness.sha256.toLowerCase(),
+        extractor: witness?.extractor ?? null,
+      }))
+
+    const fingerprint = await scoutFileFingerprint(
+      root,
+      file,
+      witnesses,
+    )
+
+    rows.push({
+      file,
+      roles: [...new Set(item?.roles ?? [])]
+        .filter((role) => typeof role === "string" && role.length > 0)
+        .sort(),
+      evidence_lines: [...new Set(witnesses.map((witness) => witness.line))]
+        .sort((a, b) => a - b),
+      fingerprint,
+      authority: "localization_context_only",
+      mutation_authority: false,
+    })
+  }
+
+  return rows.sort((a, b) => a.file.localeCompare(b.file))
+}
+
+function scoutEvidenceContextPriority(row) {
+  const roles = new Set(row?.roles ?? [])
+  if (roles.has("task_anchor_owner")) return 0
+  if (roles.has("ui_host")) return 1
+  if (roles.has("navigation_host")) return 2
+  if (roles.has("data_access_capability")) return 3
+  return 9
+}
+
+async function renderScoutEvidenceClosureContext(
+  root,
+  evidenceClosure,
+  maxBytes,
+) {
+  const limit = Number.isSafeInteger(maxBytes) && maxBytes > 0
+    ? maxBytes
+    : 0
+
+  if (
+    !evidenceClosure ||
+    evidenceClosure.status === "not_applicable" ||
+    limit < 1
+  ) {
+    return {
+      content: "",
+      bytes: 0,
+      filesShown: 0,
+      truncated: false,
+      abstainedFiles: 0,
+    }
+  }
+
+  const required = (evidenceClosure.required_roles ?? []).join(",") || "none"
+  const covered = (evidenceClosure.covered_roles ?? []).join(",") || "none"
+  const missing = (evidenceClosure.missing_roles ?? []).join(",") || "none"
+  const ambiguous = (evidenceClosure.ambiguous_roles ?? []).join(",") || "none"
+  const header =
+    `SCOUT_EVIDENCE_CLOSURE status=${evidenceClosure.status} ` +
+    `required=${required} covered=${covered} missing=${missing} ambiguous=${ambiguous} ` +
+    `authority=localization_context_only mutation_authority=false`
+
+  if (bytes(header) > limit) {
+    return {
+      content: "",
+      bytes: 0,
+      filesShown: 0,
+      truncated: true,
+      abstainedFiles: 0,
+    }
+  }
+
+  const lines = [header]
+  let used = bytes(header)
+  let filesShown = 0
+  let truncated = evidenceClosure.truncated === true
+  let abstainedFiles = 0
+
+  const rows = [...(evidenceClosure.files ?? [])].sort((a, b) =>
+    scoutEvidenceContextPriority(a) - scoutEvidenceContextPriority(b) ||
+    String(evidenceFileKey(a?.file) ?? "").localeCompare(
+      String(evidenceFileKey(b?.file) ?? ""),
+    ),
+  )
+
+  for (const row of rows) {
+    const file = evidenceFileKey(row?.file)
+    const witnesses = (row?.witnesses ?? [])
+      .filter((witness) =>
+        Number.isInteger(witness?.line) &&
+        witness.line >= 1 &&
+        typeof witness?.sha256 === "string" &&
+        /^[0-9a-f]{64}$/iu.test(witness.sha256),
+      )
+      .sort((a, b) => a.line - b.line)
+
+    if (!file || witnesses.length < 1) {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const digests = [...new Set(witnesses.map((witness) => witness.sha256.toLowerCase()))]
+    if (digests.length !== 1) {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    let safeFile
+    try {
+      safeFile = await safeTarget(root, file)
+    } catch {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    let source
+    try {
+      const info = await stat(path.join(root, safeFile))
+      if (!info.isFile() || info.size > SCOUT_HANDOFF_HASH_MAX_BYTES) {
+        abstainedFiles += 1
+        truncated = true
+        continue
+      }
+      source = await readFile(path.join(root, safeFile))
+    } catch {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const inspection = inspectEvidence({
+      request: {
+        file,
+        line: witnesses[0].line,
+        radius: 3,
+      },
+      allowed_files: [{
+        file,
+        sha256: digests[0],
+        evidence_lines: witnesses.map((witness) => witness.line),
+      }],
+      source,
+    })
+
+    if (inspection?.status !== "OK") {
+      abstainedFiles += 1
+      truncated = true
+      continue
+    }
+
+    const roles = [...new Set(row?.roles ?? [])]
+      .filter((role) => typeof role === "string" && role.length > 0)
+      .sort()
+      .join(",") || "context"
+
+    const block = [
+      `EVIDENCE_CONTEXT file=${file} roles=${roles} anchor=${inspection.binding.line} ` +
+        `sha256=${inspection.binding.sha256} mutation_authority=false`,
+      ...inspection.excerpt.map((item) =>
+        `  ${String(item.line).padStart(5)} | ${clipLine(item.text)}`,
+      ),
+    ]
+
+    const blockCost = bytes("\n" + block.join("\n"))
+    if (used + blockCost > limit) {
+      truncated = true
+      continue
+    }
+
+    lines.push(...block)
+    used += blockCost
+    filesShown += 1
+  }
+
+  const content = lines.join("\n")
+  return {
+    content,
+    bytes: bytes(content),
+    filesShown,
+    truncated,
+    abstainedFiles,
+  }
+}
+
 async function updateScoutHandoff(root, sessionID, state, snapshot) {
   if (!state || !sessionID) return null
   const started = performance.now()
   const lineMap = scoutEvidenceLines(snapshot.hits, snapshot.selectedFiles)
   const witnessMap = scoutEvidenceWitnesses(snapshot.hits, snapshot.selectedFiles)
+  const contextFiles = await buildScoutEvidenceContext(
+    root,
+    snapshot.evidenceClosure,
+  )
   const fingerprints = await Promise.all((snapshot.selectedFiles ?? []).map(async (selected) => {
     const file = evidenceFileKey(selected?.file)
     return {
@@ -2404,6 +2725,13 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
     retained_unread_files: snapshot.retainedUnreadFiles,
     retained_unemitted_files: snapshot.retainedUnemittedFiles,
     selected_files: (snapshot.selectedFiles ?? []).map((entry) => evidenceFileKey(entry?.file)).filter(Boolean),
+    evidence_closure_protocol: snapshot.evidenceClosure?.protocol ?? null,
+    evidence_closure_status: snapshot.evidenceClosure?.status ?? "not_applicable",
+    evidence_closure_covered_roles: snapshot.evidenceClosure?.covered_roles ?? [],
+    evidence_closure_missing_roles: snapshot.evidenceClosure?.missing_roles ?? [],
+    evidence_closure_ambiguous_roles: snapshot.evidenceClosure?.ambiguous_roles ?? [],
+    evidence_closure_files: (snapshot.evidenceClosure?.files ?? []).map((entry) => evidenceFileKey(entry?.file)).filter(Boolean),
+    evidence_closure_truncated: snapshot.evidenceClosure?.truncated === true,
     impact_index_coverage_complete: snapshot.impactIndexCoverageComplete,
     no_progress: snapshot.noProgress === true,
     no_progress_blocked: snapshot.noProgressBlocked === true,
@@ -2422,6 +2750,16 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
   if (files.some((entry) => entry.fingerprint?.strong !== true)) blockingReasons.push("weak_fingerprint")
   if (files.some((entry) => entry.fingerprint?.evidence_fresh === false)) blockingReasons.push("evidence_changed_before_handoff")
   if (files.some((entry) => entry.changed_during_scout === true)) blockingReasons.push("file_changed_during_scout")
+  if (contextFiles.some((entry) => !entry.fingerprint)) blockingReasons.push("context_fingerprint_unavailable")
+  if (contextFiles.some((entry) => entry.fingerprint?.strong !== true)) blockingReasons.push("weak_context_fingerprint")
+  if (contextFiles.some((entry) => entry.fingerprint?.evidence_fresh === false)) {
+    blockingReasons.push("context_evidence_changed_before_handoff")
+  }
+  if (latest?.evidence_closure_status === "insufficient") blockingReasons.push("evidence_sufficiency_missing")
+  if (latest?.evidence_closure_status === "ambiguous") blockingReasons.push("evidence_sufficiency_ambiguous")
+  if (latest?.evidence_closure_status === "truncated" || latest?.evidence_closure_truncated === true) {
+    blockingReasons.push("evidence_closure_truncated")
+  }
 
   if (latest?.lexical_discovery_complete === false) partialReasons.push("lexical_discovery_incomplete")
   if ((latest?.retained_unread_files ?? 0) > 0) partialReasons.push("retained_unread_files")
@@ -2445,6 +2783,21 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
       executed_searches: state.executedSearches,
       evidence_bytes: state.evidenceBytes,
     },
+    evidence_sufficiency: snapshot.evidenceClosure
+      ? {
+          protocol: snapshot.evidenceClosure.protocol,
+          status: snapshot.evidenceClosure.status,
+          reason: snapshot.evidenceClosure.reason,
+          coverage_status: snapshot.evidenceClosure.coverage_status,
+          required_roles: snapshot.evidenceClosure.required_roles,
+          covered_roles: snapshot.evidenceClosure.covered_roles,
+          missing_roles: snapshot.evidenceClosure.missing_roles,
+          ambiguous_roles: snapshot.evidenceClosure.ambiguous_roles,
+          files: (snapshot.evidenceClosure.files ?? []).map((entry) => entry.file),
+          mutation_authority: false,
+        }
+      : null,
+    context_files: contextFiles,
     searches: state.scoutSearches,
     files,
   }
@@ -2461,6 +2814,7 @@ async function updateScoutHandoff(root, sessionID, state, snapshot) {
     path: handoffPath,
     status,
     files: files.length,
+    contextFiles,
     blockingReasons: bundle.blocking_reasons,
     partialReasons: bundle.partial_reasons,
     elapsedMs: Math.round((performance.now() - started) * 100) / 100,
@@ -4087,6 +4441,7 @@ function getSessionState(sessionID) {
       contractFailureSignatures: new Set(),
       contractFailures: 0,
       activeMutationTool: null,
+      additiveRepairLock: null,
       taskContextProtocol: TASK_CONTEXT_PROTOCOL,
       taskContextAdapterProtocol: TASK_CONTEXT_ADAPTER_PROTOCOL,
       taskContextLatched: false,
@@ -4100,6 +4455,7 @@ function getSessionState(sessionID) {
       taskAction: null,
       taskRequirements: null,
       taskRoleEvidence: [],
+      dataCapabilityObservation: null,
       actionCommitSha256: null,
       actionCommitDispatches: 0,
       terminalCommit: null,
@@ -4124,6 +4480,27 @@ function getSessionState(sessionID) {
       executionState: EXEC_STATE_LOCATE,
       executionReason: "session_start",
       executionEvent: "session_start",
+      executionReadiness: initialExecutionReadiness("session_start"),
+      additiveMutationCapability: null,
+      additiveMutationHandoffPath: null,
+      additiveMutationContext: null,
+      executionContextCapsule: null,
+      executionContextCapsuleSha256: null,
+      executionContextContractSha256: null,
+      executionContextBlockReason: null,
+      executionContextSelectedSource: null,
+      repairContextProjectionStatus: null,
+      repairContextProjectionReason: null,
+      repairContextProjectionBytes: 0,
+      repairContextProjectionSha256: null,
+      repairContextSourceCapsuleSha256: null,
+      lastModelDispatchStartedAt: null,
+      modelLatencySamples: 0,
+      modelLatencyMaxMs: 0,
+      modelLatencyProfile: initialLatencyProfile(),
+      governorTaskStartedAt: now,
+      governorPhaseStartedAt: now,
+      governorPhase: phaseForExecutionState(EXEC_STATE_LOCATE),
       editCapsulePath: null,
       editCapsuleHash: null,
       proofObligations: [],
@@ -4176,6 +4553,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.contractFailureSignatures.clear()
   state.contractFailures = 0
   state.activeMutationTool = null
+  state.additiveRepairLock = null
   state.taskContextProtocol = TASK_CONTEXT_PROTOCOL
   state.taskContextAdapterProtocol = TASK_CONTEXT_ADAPTER_PROTOCOL
   state.taskContextLatched = false
@@ -4192,6 +4570,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskShape = null
   state.additiveLocalizationPlan = null
   state.taskRoleEvidence = []
+  state.dataCapabilityObservation = null
   state.actionCommitSha256 = null
   state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
@@ -4202,6 +4581,27 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.executionState = EXEC_STATE_LOCATE
   state.executionReason = "turn_start"
   state.executionEvent = "turn_start"
+  state.executionReadiness = initialExecutionReadiness("turn_start")
+  state.additiveMutationCapability = null
+  state.additiveMutationHandoffPath = null
+  state.additiveMutationContext = null
+  state.executionContextCapsule = null
+  state.executionContextCapsuleSha256 = null
+  state.executionContextContractSha256 = null
+  state.executionContextBlockReason = null
+  state.executionContextSelectedSource = null
+  state.repairContextProjectionStatus = null
+  state.repairContextProjectionReason = null
+  state.repairContextProjectionBytes = 0
+  state.repairContextProjectionSha256 = null
+  state.repairContextSourceCapsuleSha256 = null
+  state.lastModelDispatchStartedAt = null
+  state.modelLatencySamples = 0
+  state.modelLatencyMaxMs = 0
+  state.modelLatencyProfile = initialLatencyProfile()
+  state.governorTaskStartedAt = startedAt
+  state.governorPhaseStartedAt = startedAt
+  state.governorPhase = phaseForExecutionState(EXEC_STATE_LOCATE)
   state.editCapsulePath = null
   state.editCapsuleHash = null
   state.proofObligations = []
@@ -4213,6 +4613,7 @@ function transitionExecutionState(current, event) {
   if (event === "turn_start") return EXEC_STATE_LOCATE
   if (event === "scout_ready") return EXEC_STATE_MUTATE
   if (event === "scout_needs_evidence") return EXEC_STATE_LOCATE
+  if (event === "readiness_safe_fail") return EXEC_STATE_SAFE_FAIL
   if (event === "patch_retry") return EXEC_STATE_REPAIR
   if (event === "patch_rescout") return EXEC_STATE_LOCATE
   if (event === "patch_ready") return EXEC_STATE_DONE
@@ -4220,6 +4621,39 @@ function transitionExecutionState(current, event) {
   if (event === "verification_rescout") return EXEC_STATE_LOCATE
   if (event === "fatal") return EXEC_STATE_SAFE_FAIL
   return current
+}
+
+function applyExecutionReadiness(state, readiness) {
+  if (!state || !readiness || readiness.protocol !== EXECUTION_READINESS_PROTOCOL) {
+    return applyExecutionEvent(
+      state,
+      "fatal",
+      "execution_readiness_invalid",
+    )
+  }
+
+  state.executionReadiness = readiness
+  return applyExecutionEvent(
+    state,
+    readiness.execution_event,
+    readiness.reason,
+  )
+}
+
+function observeModelLatencyAtToolBoundary(state, observedAt = nowMs()) {
+  if (!state || !Number.isFinite(state.lastModelDispatchStartedAt)) return null
+
+  const elapsed = Math.max(0, observedAt - state.lastModelDispatchStartedAt)
+  state.lastModelDispatchStartedAt = null
+  state.modelLatencySamples = (state.modelLatencySamples ?? 0) + 1
+  state.modelLatencyMaxMs = Math.max(state.modelLatencyMaxMs ?? 0, elapsed)
+  state.modelLatencyProfile = observeLatency(state.modelLatencyProfile, elapsed)
+  return elapsed
+}
+
+function modelDispatchReserveMs(state) {
+  if (!state) return 0
+  return latencyReserveMs(state.modelLatencyProfile)
 }
 
 function allowedToolsForExecutionState(executionState) {
@@ -4254,6 +4688,15 @@ function resolveMutationActionForState(state) {
     typeof state?.scoutHandoffPath === "string" &&
     state.scoutHandoffPath.length > 0
 
+  const additiveCapability = state?.additiveMutationCapability ?? null
+  const additiveReady =
+    additiveCapability?.protocol === ADDITIVE_MUTATION_CAPABILITY_PROTOCOL &&
+    additiveCapability?.ready === true &&
+    additiveCapability?.mutation_authority === true &&
+    additiveCapability?.operation === "additive_surface" &&
+    typeof state?.additiveMutationHandoffPath === "string" &&
+    state.additiveMutationHandoffPath.length > 0
+
   if (
     state.executionState === EXEC_STATE_REPAIR &&
     typeof state.activeMutationTool === "string"
@@ -4264,23 +4707,36 @@ function resolveMutationActionForState(state) {
     if (state.activeMutationTool === EXECUTE_REPLACE_NODE_TOOL && replaceReady) {
       return { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "repair_sticky_replace" }
     }
+    if (state.activeMutationTool === EXECUTE_ADDITIVE_PLAN_TOOL && additiveReady) {
+      return { tool: EXECUTE_ADDITIVE_PLAN_TOOL, reason: "repair_sticky_additive" }
+    }
     return { tool: null, reason: "repair_capability_unavailable" }
   }
 
-  if (state?.mutationIntent === "rename_symbol") {
+  const selected =
+    state?.executionReadiness?.selected_mutation_operation ?? null
+
+  if (selected === "additive_surface") {
+    return additiveReady
+      ? { tool: EXECUTE_ADDITIVE_PLAN_TOOL, reason: "readiness_additive_authorized" }
+      : { tool: null, reason: "additive_capability_unavailable" }
+  }
+
+  if (selected === "rename_symbol") {
     return renameReady
-      ? { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "rename_intent_authorized" }
+      ? { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "readiness_rename_authorized" }
       : { tool: null, reason: "rename_capability_unavailable" }
   }
 
-  if (state?.mutationIntent === "generic_edit") {
+  if (selected === "replace_node") {
     return replaceReady
-      ? { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "generic_edit_authorized" }
+      ? { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "readiness_replace_authorized" }
       : { tool: null, reason: "replace_capability_unavailable" }
   }
 
-  return { tool: null, reason: "mutation_intent_unknown" }
+  return { tool: null, reason: "readiness_operation_unresolved" }
 }
+
 
 function mutationToolsForState(state) {
   const resolution = resolveMutationActionForState(state)
@@ -4290,31 +4746,61 @@ function mutationToolsForState(state) {
 
 function allowedToolsForState(state) {
   if (!state) return []
-  if (state.executionState === EXEC_STATE_LOCATE) return ["search"]
-  if (
-    state.executionState === EXEC_STATE_MUTATE ||
-    state.executionState === EXEC_STATE_REPAIR
-  ) {
+
+  const readinessStatus = state.executionReadiness?.status ?? null
+
+  if (state.executionState === EXEC_STATE_LOCATE) {
+    return readinessStatus === EXECUTION_READINESS_STATUS.SAFE_FAIL ||
+      readinessStatus === EXECUTION_READINESS_STATUS.READY_TO_MUTATE
+      ? []
+      : ["search"]
+  }
+
+  if (state.executionState === EXEC_STATE_MUTATE) {
+    if (readinessStatus !== EXECUTION_READINESS_STATUS.READY_TO_MUTATE) {
+      return []
+    }
     return mutationToolsForState(state)
   }
+
+  if (state.executionState === EXEC_STATE_REPAIR) {
+    return mutationToolsForState(state)
+  }
+
   return []
 }
 
 function applyExecutionEvent(state, event, reason, details = null) {
   if (!state) return null
-  const next = transitionExecutionState(state.executionState, event)
+  const previous = state.executionState
+  const previousPhase = phaseForExecutionState(previous)
+  const next = transitionExecutionState(previous, event)
+  const nextPhase = phaseForExecutionState(next)
+  const observedAt = nowMs()
+
   state.executionState = next
   state.executionReason = reason ?? event
   state.executionEvent = event
+
+  if (previousPhase !== nextPhase) {
+    state.governorPhase = nextPhase
+    state.governorPhaseStartedAt = observedAt
+  }
+
   if (event !== "patch_rescout" && event !== "verification_rescout") {
     state.pendingRescout = null
   } else {
     state.pendingRescout = details ?? { reason: reason ?? event }
     state.activeMutationTool = null
+    state.additiveRepairLock = null
+    state.executionReadiness =
+      initialExecutionReadiness(reason ?? event)
   }
-  state.lastSeen = nowMs()
+
+  state.lastSeen = observedAt
   return next
 }
+
 
 function toolAllowedForExecutionState(state, toolName) {
   if (!state) return false
@@ -8899,6 +9385,208 @@ function runImpactIndexRequest(root, request, timeoutMs) {
   })
 }
 
+
+function taskConstantIdentifiers(taskAnchors) {
+  if (taskAnchors?.status !== "compiled" || taskAnchors?.truncated === true) return []
+  return [...new Set((taskAnchors?.anchors ?? [])
+    .filter((anchor) =>
+      anchor?.kind === "constant_identifier" &&
+      typeof anchor?.value === "string" &&
+      /^[A-Z][A-Z0-9_]{2,79}$/u.test(anchor.value),
+    )
+    .map((anchor) => anchor.value))].sort()
+}
+
+function additiveNeedsDataAccess(requirements) {
+  return requirements?.status === "compiled" &&
+    (requirements?.required_roles ?? []).includes("data_access_capability")
+}
+
+async function dataCapabilitySourceProof(root, file, line, extractor) {
+  if (typeof file !== "string" || !Number.isSafeInteger(line) || line < 1) return null
+  const rel = evidenceFileKey(file)
+  const rootPath = path.resolve(root)
+  const candidate = path.resolve(rootPath, rel)
+  if (candidate !== rootPath && !candidate.startsWith(rootPath + path.sep)) return null
+  try {
+    const body = await readFile(candidate)
+    return Object.freeze({
+      file: rel,
+      line,
+      sha256: createHash("sha256").update(body).digest("hex"),
+      extractor,
+    })
+  } catch {
+    return null
+  }
+}
+
+async function resolveTaskBoundDataCapability({root, state, anchorFrontier, coverageRequirements}) {
+  const empty = {
+    providerResolution: null,
+    projection: Object.freeze({
+      protocol: DATA_OBLIGATION_PROJECTOR_PROTOCOL,
+      authority: "proof_projection_only",
+      status: "abstained",
+      reason: "not_required",
+      proofs: Object.freeze([]),
+      localization_authority: false,
+      mutation_authority: false,
+    }),
+  }
+  if (
+    !state ||
+    !additiveNeedsDataAccess(coverageRequirements) ||
+    anchorFrontier?.status !== "bound" ||
+    typeof anchorFrontier?.owner_file !== "string"
+  ) return empty
+
+  const identities = taskConstantIdentifiers(state?.taskAnchors)
+  if (identities.length > DATA_PROVIDER_IDENTITY_MAX_TASK_IDENTITIES) {
+    const providerResolution = {
+      protocol: "impact-index-v1",
+      mode: "data_provider_identity",
+      ready: false,
+      complete: false,
+      reason: "task_constant_identity_budget_exceeded",
+      observations: [],
+    }
+    return {
+      ...empty,
+      providerResolution,
+      projection: projectDataAccessObligation({
+        taskSha256: state?.taskRequirements?.task_sha256,
+        taskAnchors: state?.taskAnchors,
+        coverageRequirements,
+        anchorFrontier,
+        providerResolution,
+      }),
+    }
+  }
+
+  const cacheKey = JSON.stringify([
+    state?.taskRequirements?.task_sha256 ?? null,
+    anchorFrontier.owner_file,
+    identities,
+  ])
+  if (state?.dataCapabilityObservation?.cacheKey === cacheKey) {
+    return state.dataCapabilityObservation.value
+  }
+
+  const request = await runImpactIndexRequest(
+    root,
+    {
+      mode: "data_provider_identity",
+      identities,
+      max_files_per_identity: DATA_PROVIDER_IDENTITY_MAX_FILES_PER_IDENTITY,
+    },
+    DATA_PROVIDER_IDENTITY_REQUEST_TIMEOUT_MS,
+  )
+  const providerResolution = request?.ok === true
+    ? request.response
+    : {
+        protocol: "impact-index-v1",
+        mode: "data_provider_identity",
+        ready: false,
+        complete: false,
+        reason: request?.reason ?? "provider_request_failed",
+        observations: [],
+      }
+
+  const providerProofs = {}
+  const bindingByProvider = {}
+  const bindingProofs = {}
+
+  if (providerResolution?.ready === true && providerResolution?.complete === true) {
+    for (const observation of providerResolution?.observations ?? []) {
+      if (
+        observation?.search_complete !== true ||
+        observation?.truncated === true ||
+        !identities.includes(observation?.identity)
+      ) continue
+
+      for (const candidate of observation?.candidates ?? []) {
+        if (
+          candidate?.configuration_identity !== observation.identity ||
+          candidate?.constructor_family !== "python-psycopg2" ||
+          typeof candidate?.file !== "string" ||
+          typeof candidate?.symbol !== "string"
+        ) continue
+
+        const providerFile = evidenceFileKey(candidate.file)
+        const key = [observation.identity, providerFile, candidate.symbol].join("\0")
+        const providerProof = await dataCapabilitySourceProof(
+          root,
+          providerFile,
+          candidate.witness_line,
+          "impact-index-data-provider-identity-v1",
+        )
+        if (!providerProof) continue
+        providerProofs[key] = providerProof
+
+        const bindingResult = await runImpactIndexRequest(
+          root,
+          {
+            mode: "symbol_binding_into_file",
+            source_file: providerFile,
+            source_symbol: candidate.symbol,
+            importer_file: evidenceFileKey(anchorFrontier.owner_file),
+          },
+          DATA_PROVIDER_SYMBOL_BINDING_TIMEOUT_MS,
+        )
+        if (bindingResult?.ok !== true) {
+          bindingByProvider[key] = {
+            protocol: "impact-index-v1",
+            mode: "symbol_binding_into_file",
+            ready: false,
+            complete: false,
+            reason: bindingResult?.reason ?? "binding_request_failed",
+            source_file: providerFile,
+            source_symbol: candidate.symbol,
+            importer_file: evidenceFileKey(anchorFrontier.owner_file),
+            bindings: [],
+          }
+          continue
+        }
+        bindingByProvider[key] = bindingResult.response
+
+        const binding = (bindingResult.response?.bindings ?? [])
+          .filter((row) =>
+            evidenceFileKey(row?.importer) === evidenceFileKey(anchorFrontier.owner_file) &&
+            evidenceFileKey(row?.target) === providerFile &&
+            row?.source_symbol === candidate.symbol &&
+            row?.confidence === "exact_local" &&
+            Number.isSafeInteger(row?.witness_line),
+          )
+          .sort((a, b) => a.witness_line - b.witness_line)[0]
+        if (!binding) continue
+
+        const bindingProof = await dataCapabilitySourceProof(
+          root,
+          binding.importer,
+          binding.witness_line,
+          "impact-index-symbol-binding-into-file-v1",
+        )
+        if (bindingProof) bindingProofs[key] = bindingProof
+      }
+    }
+  }
+
+  const projection = projectDataAccessObligation({
+    taskSha256: state?.taskRequirements?.task_sha256,
+    taskAnchors: state?.taskAnchors,
+    coverageRequirements,
+    anchorFrontier,
+    providerResolution,
+    providerProofs,
+    bindingByProvider,
+    bindingProofs,
+  })
+  const value = {providerResolution, bindingByProvider, projection}
+  state.dataCapabilityObservation = {cacheKey, value}
+  return value
+}
+
 function impactIndexShadowStats(result, lexicalFiles) {
   const lexical = new Set((lexicalFiles ?? []).map((entry) =>
     evidenceFileKey(typeof entry === "string" ? entry : entry?.file),
@@ -12697,6 +13385,31 @@ async function subscribeEvents(ctx) {
         )
 
       if (assistantDone) {
+        const completionObservedAtMs = nowMs()
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: completionObservedAtMs,
+          protocol: AGENT_PROTOCOL,
+          cost_observation_protocol: RUNTIME_COST_OBSERVATION_PROTOCOL,
+          kind: "model_completion",
+          sessionID,
+          turnID: state.turnID,
+          model_call: state.modelCalls,
+          project_root: root,
+          observed_at_ms: completionObservedAtMs,
+          message_created_at_ms:
+            Number.isFinite(info.time?.created) ? info.time.created : null,
+          message_completed_at_ms:
+            Number.isFinite(info.time?.completed) ? info.time.completed : null,
+          messageID: info.id,
+          parentID: info.parentID ?? null,
+          providerID: info.providerID ?? null,
+          modelID: info.modelID ?? null,
+          finish: info.finish ?? null,
+          error: info.error?.name ?? null,
+          mutation_authority: false,
+          scheduling_authority: false,
+        })
+
         await recordModelUsage(ctx, state, sessionID, root, {
           source: "message_updated",
           messageID: info.id,
@@ -12761,6 +13474,8 @@ export default {
             : null
         const state = getSessionState(sessionID)
         const root = await rootForTool(ctx, toolContext, sessionID, state)
+        const observedModelLatencyMs =
+          observeModelLatencyAtToolBoundary(state)
         const runtimeIdentity = await runtimeStackIdentity()
 
         const trace = async (record) => {
@@ -12777,6 +13492,9 @@ export default {
             executor_runs: state?.executorRuns ?? null,
             executed_patches: state?.executedPatches ?? null,
             turn_model_calls: state?.modelCalls ?? null,
+            observed_model_latency_ms: observedModelLatencyMs,
+            model_latency_samples: state?.modelLatencySamples ?? 0,
+            model_latency_max_ms: state?.modelLatencyMaxMs ?? 0,
             scout_handoff_path: state?.scoutHandoffPath ?? null,
             edit_capsule_path: state?.editCapsulePath ?? null,
             bound_mutation_target: state?.boundMutationTarget ?? null,
@@ -12788,6 +13506,10 @@ export default {
             mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
             mutation_tool: toolName,
             semantic_kind: forcedKind,
+            obligation_bound_synthesis_protocol:
+              forcedKind === "additive_surface"
+                ? OBLIGATION_BOUND_SYNTHESIS_PROTOCOL
+                : null,
             mutation_dispatch_origin: dispatchOrigin,
             action_commit_protocol: actionCommit?.protocol ?? null,
             action_commit_sha256: actionCommit?.commit_sha256 ?? null,
@@ -12919,12 +13641,30 @@ export default {
           "scope",
         ].find((field) => mutationFieldPresent(rawInput, field))
 
+        const obligationBoundRequest =
+          forcedKind === "additive_surface" && !forbiddenRawAuthorityField
+            ? materializeObligationBoundAdditiveRequest({
+                capability: state.additiveMutationCapability,
+                taskRequirements: state.taskRequirements,
+                request: rawInput,
+              })
+            : null
+
         const shape = forbiddenRawAuthorityField
           ? mutationShapeFailure(
               forcedKind,
               `action_tool_forbids_${forbiddenRawAuthorityField}`,
             )
-          : validateMutationShape(input)
+          : forcedKind === "additive_surface"
+            ? obligationBoundRequest?.ok === true
+              ? validateAdditiveMutationRequest(obligationBoundRequest.request)
+              : mutationShapeFailure(
+                  forcedKind,
+                  obligationBoundRequest?.detail ??
+                    obligationBoundRequest?.reason ??
+                    "obligation_bound_request_invalid",
+                )
+            : validateMutationShape(input)
 
         // Tool-schema/transport violations are not semantic patch attempts.
         // With action-specific top-level required fields these should be
@@ -12996,6 +13736,84 @@ export default {
           }
         }
 
+        if (
+          forcedKind === "additive_surface" &&
+          state.executionState === EXEC_STATE_REPAIR &&
+          state.additiveRepairLock
+        ) {
+          const repairAuthorityOk =
+            state.additiveRepairLock?.tool === toolName &&
+            additiveRepairAuthorityMatches({
+              hint: state.additiveRepairLock,
+              capability: state.additiveMutationCapability,
+              executionContextSha256:
+                state.executionContextCapsuleSha256,
+            })
+
+          if (!repairAuthorityOk) {
+            state.additiveRepairLock = null
+            applyExecutionEvent(
+              state,
+              "fatal",
+              "additive_repair_authority_drift",
+            )
+            await trace({
+              admitted: false,
+              failure_layer: "orchestrator_contract",
+              reason: "additive_repair_authority_drift",
+              action: "stop",
+              compiler_run: false,
+              executor_run: false,
+            })
+            return {
+              content:
+                "PATCH_STOP reason=additive_repair_authority_drift " +
+                "action=report_blocked",
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason: "additive_repair_authority_drift",
+                failure_layer: "orchestrator_contract",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+        }
+
+        if (
+          forcedKind === "additive_surface" &&
+          state.executionContextBlockReason
+        ) {
+          const contextBlockReason =
+            state.executionContextBlockReason
+          applyExecutionEvent(
+            state,
+            "fatal",
+            contextBlockReason,
+          )
+          await trace({
+            admitted: false,
+            failure_layer: "orchestrator_contract",
+            reason: contextBlockReason,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              `PATCH_STOP reason=${contextBlockReason} ` +
+              "action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: contextBlockReason,
+              failure_layer: "orchestrator_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
         state.activeMutationTool = toolName
 
         if (state.executionState === EXEC_STATE_REPAIR) {
@@ -13006,11 +13824,41 @@ export default {
         state.lastSeen = nowMs()
 
         const authorization =
-          await materializeCapabilityBoundMutation(
-            root,
-            state,
-            input,
-          )
+          forcedKind === "additive_surface"
+            ? await (async () => {
+                const plan = await materializeAdditiveMutationPlan({
+                  root,
+                  capability: state.additiveMutationCapability,
+                  request: obligationBoundRequest.request,
+                })
+                if (plan.ok === true) {
+                  return {
+                    ...plan,
+                    handoff_path: state.additiveMutationHandoffPath,
+                  }
+                }
+
+                const repairHint = buildAdditiveRepairHint({
+                  failure: plan,
+                  capability: state.additiveMutationCapability,
+                  request: obligationBoundRequest.request,
+                  executionContextSha256:
+                    state.executionContextCapsuleSha256,
+                  previousRepairHint:
+                    state.additiveRepairLock,
+                })
+                return {
+                  ...plan,
+                  repairable: repairHint.repairable === true,
+                  rescout: false,
+                  repair_hint: repairHint,
+                }
+              })()
+            : await materializeCapabilityBoundMutation(
+                root,
+                state,
+                input,
+              )
 
         if (authorization.ok !== true) {
           const reason =
@@ -13023,11 +13871,59 @@ export default {
               ? authorization.detail
               : reason
 
+          const authorizationFailureLayer =
+            forcedKind === "additive_surface" &&
+            reason === "additive_plan_coverage_incomplete"
+              ? "synthesis_validation"
+              : "scope_authorization"
+
           const canRetryAuthorization =
             authorization.repairable === true &&
             state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
 
           if (canRetryAuthorization) {
+            const additiveRepairHint =
+              forcedKind === "additive_surface"
+                ? authorization.repair_hint ?? null
+                : null
+
+            if (forcedKind === "additive_surface") {
+              if (
+                additiveRepairHint?.repairable !== true ||
+                !additiveRepairAuthorityMatches({
+                  hint: additiveRepairHint,
+                  capability: state.additiveMutationCapability,
+                  executionContextSha256:
+                    state.executionContextCapsuleSha256,
+                })
+              ) {
+                state.additiveRepairLock = null
+                applyExecutionEvent(
+                  state,
+                  "fatal",
+                  "additive_repair_authority_unavailable",
+                )
+                return {
+                  content:
+                    "PATCH_STOP reason=additive_repair_authority_unavailable " +
+                    "action=report_blocked",
+                  metadata: {
+                    protocol: EXECUTION_LOOP_PROTOCOL,
+                    action: "stop",
+                    reason: "additive_repair_authority_unavailable",
+                    failure_layer: "orchestrator_contract",
+                    compiler_run: false,
+                    executor_run: false,
+                  },
+                }
+              }
+
+              state.additiveRepairLock = Object.freeze({
+                ...additiveRepairHint,
+                tool: toolName,
+              })
+            }
+
             applyExecutionEvent(
               state,
               "patch_retry",
@@ -13036,26 +13932,78 @@ export default {
 
             await trace({
               admitted: false,
-              failure_layer: "scope_authorization",
+              failure_layer: authorizationFailureLayer,
               reason,
               scope_detail: detail,
+              repair_hint: additiveRepairHint,
               action: "retry",
               compiler_run: false,
               executor_run: false,
             })
 
+            const repairAction =
+              forcedKind === "additive_surface"
+                ? "revise_additive_transaction"
+                : "revise_semantic_owner_binding"
+            const repairDetail =
+              additiveRepairHint
+                ? ` repair_protocol=${ADDITIVE_REPAIR_HINT_PROTOCOL}` +
+                  ` operation_index=${additiveRepairHint.operation_index ?? "none"}` +
+                  ` field=${additiveRepairHint.field ?? "none"}`
+                : ""
+            const repairCoverageDetail =
+              additiveRepairHint
+                ? [
+                    [
+                      "missing_slots",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_slots,
+                    ],
+                    [
+                      "missing_roles",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_roles,
+                    ],
+                    [
+                      "missing_obligations",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_obligations,
+                    ],
+                    [
+                      "observed_unused_existing_slots",
+                      additiveRepairHint.slot_usage
+                        ?.unused_existing_slots,
+                    ],
+                    [
+                      "observed_unused_create_slots",
+                      additiveRepairHint.slot_usage
+                        ?.unused_create_slots,
+                    ],
+                  ]
+                    .filter(([, values]) =>
+                      Array.isArray(values) && values.length > 0,
+                    )
+                    .map(([key, values]) =>
+                      ` ${key}=${values.join(",")}`,
+                    )
+                    .join("")
+                : ""
+
             return {
               content:
                 `PATCH_RETRY reason=${reason} ` +
                 `detail=${detail} ` +
-                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                `action=revise_semantic_owner_binding`,
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN}` +
+                repairDetail +
+                repairCoverageDetail +
+                ` action=${repairAction}`,
               metadata: {
                 protocol: EXECUTION_LOOP_PROTOCOL,
                 action: "retry",
                 reason,
                 detail,
-                failure_layer: "scope_authorization",
+                repair_hint: additiveRepairHint,
+                failure_layer: authorizationFailureLayer,
                 compiler_run: false,
                 executor_run: false,
               },
@@ -13075,7 +14023,7 @@ export default {
 
             await trace({
               admitted: false,
-              failure_layer: "scope_authorization",
+              failure_layer: authorizationFailureLayer,
               reason,
               scope_detail: detail,
               action: "rescout",
@@ -13094,7 +14042,7 @@ export default {
                 action: "rescout",
                 reason,
                 detail,
-                failure_layer: "scope_authorization",
+                failure_layer: authorizationFailureLayer,
                 compiler_run: false,
                 executor_run: false,
               },
@@ -13133,10 +14081,14 @@ export default {
           }
         }
 
-        const mutation =
-          authorization.mutation
+        if (forcedKind === "additive_surface") {
+          state.additiveRepairLock = null
+        }
 
-        const mutations = [mutation]
+        const mutations =
+          Array.isArray(authorization.mutations)
+            ? authorization.mutations
+            : [authorization.mutation]
 
         const activeMutationHandoffPath =
           authorization.handoff_path
@@ -13606,60 +14558,8 @@ export default {
         }
     }
 
-    await track(ctx.tool.transform((tools) => {
-      tools.add({
-        name: "search",
-        description:
-          "Search the active project with 1 to 4 regular expressions in one call. " +
-          "Search first performs repository-wide lexical discovery, applies bounded deterministic structural BM25F/RRF reranking when available, and keeps query fairness separate from relevance, " +
-          "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
-          "Returns bounded line-numbered evidence and explicit completeness metadata. " +
-          "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
-          "for the requested regex/path/glob. scan_complete=true is stronger: every discovered file " +
-          "was probed and every matching line was scanned. " +
-          "A ROUTE block is heuristic routing only; retained_unemitted files remain lexical candidates " +
-          "and must not be treated as irrelevant or absent. " +
-          "Completeness is lexical: scan_complete=true means all matches for the requested " +
-          "regex/path/glob were scanned across the probed universe, not that a semantic category is exhaustively absent. " +
-          "evidence_complete=true means every discovered hit line is represented, not that " +
-          "the surrounding function or file is fully shown. representation=focused adds bounded " +
-          "containing-scope context chosen from structurally relevant non-module matches but still " +
-          "does not imply whole-file context. Turn evidence is deduplicated: prior_evidence_reused=true " +
-          "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
-          "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
-          "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
-          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
-          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only capability-derived action-specific mutation tools.",
-        input: {
-          type: "object",
-          properties: {
-            queries: {
-              type: "array",
-              minItems: 1,
-              maxItems: MAX_QUERIES,
-              items: { type: "string", minLength: 1, maxLength: 200 },
-              description: "One to four regular expressions.",
-            },
-            path: {
-              type: "string",
-              minLength: 1,
-              description: "Optional project-relative file or directory. Default: project root.",
-            },
-            glob: {
-              type: "string",
-              minLength: 1,
-              description: "Optional file glob such as **/*.py.",
-            },
-          },
-          required: ["queries"],
-          additionalProperties: false,
-        },
-        options: {
-          codemode: false,
-          permission: "search",
-        },
-
-        execute: async (input, toolContext) => {
+    // E2.3-A: one Scout implementation, two entry paths.
+    const deterministicSearchExecutor = async (input, toolContext) => {
           const started = performance.now()
           const sessionID =
             typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
@@ -13668,6 +14568,8 @@ export default {
 
           const state = getSessionState(sessionID)
           const root = await rootForTool(ctx, toolContext, sessionID, state)
+          const observedModelLatencyMs =
+            observeModelLatencyAtToolBoundary(state)
 
           if (!root) {
             return {
@@ -14983,6 +15885,64 @@ export default {
                     : [],
             })
 
+          const hostOwnerRefinementPlan =
+            planTaskBoundHostRefinement({
+              taskRequirements:
+                state?.taskRequirements,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              anchorFrontier,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+
+              selectedFiles,
+            })
+
+          /*
+           * E1.7 — deterministic evidence closure.
+           *
+           * Exact task-anchor ownership is already source validated above.
+           * If an additive UI/navigation obligation still needs host
+           * relations and the exact owner was dropped by lexical emission,
+           * inspect that ONE proven owner without a model round-trip.
+           *
+           * This is evidence refinement only. It cannot grant mutation
+           * authority and cannot expand beyond the exact task-bound owner.
+           */
+          const hostOwnerRefinement =
+            hostOwnerRefinementPlan
+              .candidate_files
+              .length > 0
+                ? await inspectFrameworkRoutingForSelected(
+                    root,
+                    hostOwnerRefinementPlan
+                      .candidate_files,
+                    state,
+                  )
+                : {
+                    protocol:
+                      FRAMEWORK_RESOURCE_BRIDGE_PROTOCOL,
+                    authority:
+                      "routing_only",
+                    mutationAuthority:
+                      false,
+                    filesScanned: 0,
+                    skippedFiles: 0,
+                    validatedEdges: 0,
+                    rejectedEdges: 0,
+                    truncated: false,
+                  }
+
           const hostResourceInventory =
             await observedHostResourceInventory(
               root,
@@ -15040,6 +16000,11 @@ export default {
                 ) ||
                 (
                   anchorFrontierFramework
+                    ?.truncated ===
+                    true
+                ) ||
+                (
+                  hostOwnerRefinement
                     ?.truncated ===
                     true
                 ),
@@ -15393,6 +16358,11 @@ export default {
                     true
                 ) ||
                 (
+                  hostOwnerRefinement
+                    ?.truncated ===
+                    true
+                ) ||
+                (
                   uiFollowupFramework
                     ?.truncated ===
                     true
@@ -15524,10 +16494,90 @@ export default {
                   ?.task_sha256,
             })
 
+          const dataCapabilityObservation =
+            await resolveTaskBoundDataCapability({
+              root,
+              state,
+              anchorFrontier,
+              coverageRequirements:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_coverage_requirements,
+            })
+
+          const dataObligationProjection =
+            dataCapabilityObservation
+              ?.projection
+
+          const taskBoundDataEvidence =
+            projectTaskBoundObligationProofs({
+              coverageRequirements:
+                state
+                  ?.additiveLocalizationPlan
+                  ?.positive_coverage_requirements,
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+              proofs:
+                dataObligationProjection
+                  ?.proofs ??
+                [],
+            })
+
+          const mergedDataRoleEvidence =
+            mergeTaskRoleEvidence({
+              existing:
+                mergedRoleEvidence
+                  .evidence,
+              incoming:
+                taskBoundDataEvidence
+                  .evidence,
+              taskSha256:
+                state
+                  ?.taskRequirements
+                  ?.task_sha256,
+            })
+
           if (state) {
             state.taskRoleEvidence =
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .evidence
+          }
+
+          const scoutEvidenceClosure =
+            solveScoutEvidenceClosure({
+              taskRequirements:
+                state?.taskRequirements,
+
+              additiveLocalizationPlan:
+                state?.additiveLocalizationPlan,
+
+              taskRoleEvidence:
+                state?.taskRoleEvidence ??
+                [],
+
+              anchorFrontier,
+
+              hostResourceClosure,
+
+              frameworkEdges:
+                state?.frameworkResourceEdges
+                  instanceof Map
+                    ? [
+                        ...state
+                          .frameworkResourceEdges
+                          .values(),
+                      ]
+                    : [],
+            })
+
+          let scoutEvidenceProjection = {
+            content: "",
+            bytes: 0,
+            filesShown: 0,
+            truncated: false,
+            abstainedFiles: 0,
           }
 
           const routeFacts = routeFactsForRanking(
@@ -15542,13 +16592,18 @@ export default {
             routeFacts.add(fact)
           }
 
+          for (const fact of hostOwnerRefinement.routeFacts ?? []) {
+            routeFacts.add(fact)
+          }
+
           const ledgerFactsBefore = state?.evidenceLedger?.size ?? 0
           const novelty = novelEvidenceFacts(state, finalFacts)
           const routeNovelty = novelRouteFacts(state, routeFacts)
           const meaningfulRouteProgress =
             (
               routingActive ||
-              frameworkRouting.validatedEdges > 0
+              frameworkRouting.validatedEdges > 0 ||
+              (hostOwnerRefinement.validatedEdges ?? 0) > 0
             ) &&
             routeNovelty.novel.size > 0
           const novelFactStats = summarizeEvidenceFacts(novelty.novel)
@@ -15604,6 +16659,28 @@ export default {
             }
           }
 
+          if (!noProgress && scoutEvidenceClosure.status !== "not_applicable") {
+            const separatorBytes = content.length > 0 ? bytes("\n\n") : 0
+            const remainingProjectionBytes = Math.max(
+              0,
+              callBudgetBytes - resultBytes - separatorBytes,
+            )
+
+            scoutEvidenceProjection =
+              await renderScoutEvidenceClosureContext(
+                root,
+                scoutEvidenceClosure,
+                remainingProjectionBytes,
+              )
+
+            if (scoutEvidenceProjection.content) {
+              content = content.length > 0
+                ? `${content}\n\n${scoutEvidenceProjection.content}`
+                : scoutEvidenceProjection.content
+              resultBytes = bytes(content)
+            }
+          }
+
           if (
             !noProgress &&
             routingActive &&
@@ -15638,6 +16715,7 @@ export default {
             retainedUnreadFiles: Math.max(0, rankedFiles.length - probeFileSet.size),
             retainedUnemittedFiles: routeRendered.retained,
             impactIndexCoverageComplete: impactIndexShadow.refreshComplete,
+            evidenceClosure: scoutEvidenceClosure,
             noProgress,
             noProgressBlocked,
           })
@@ -16032,48 +17110,217 @@ export default {
                   localMutationCandidateSet.primary
               }
 
-              if (localMutationCapability?.ok === true) {
-                state.localMutationHandoffPath =
-                  localMutationCapability.localHandoffPath
-                state.localMutationCapability = localMutationCapability
-                state.localMutationCandidates =
-                  localMutationCandidateSet?.candidates ?? []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_ready",
-                  "local_mutation_capability_ready",
-                )
-              } else {
-                state.localMutationHandoffPath = null
-                state.localMutationCapability = null
-                state.localMutationCandidates = []
-                state.boundMutationTarget = null
-                state.activeMutationHandoffPath = null
-                applyExecutionEvent(
-                  state,
-                  "scout_needs_evidence",
-                  localMutationCapability?.reason ??
-                    localCompetitorCheck?.reason ??
-                    "local_mutation_capability_unavailable",
-                )
-              }
-            } else {
-              applyExecutionEvent(
-                state,
-                "scout_needs_evidence",
-                "edit_capsule_unavailable",
-              )
             }
-          } else {
-            applyExecutionEvent(
-              state,
-              "scout_needs_evidence",
-              `mutation_localization_${mutationLocalization.reason}`,
-            )
           }
 
+          if (state) {
+            if (localMutationCapability?.ok === true) {
+              state.localMutationHandoffPath =
+                localMutationCapability.localHandoffPath
+              state.localMutationCapability = localMutationCapability
+              state.localMutationCandidates =
+                localMutationCandidateSet?.candidates ?? []
+            } else {
+              state.localMutationHandoffPath = null
+              state.localMutationCapability = null
+              state.localMutationCandidates = []
+            }
+
+            state.boundMutationTarget = null
+            state.activeMutationHandoffPath = null
+          }
+
+          let additiveMutationCapability =
+            deriveAdditiveMutationCapability({
+              taskShape: state?.taskShape,
+              evidenceClosure: scoutEvidenceClosure,
+              hostResourceClosure,
+            })
+
+          let additiveMutationContext = null
+          let additiveMutationHandoffPath = null
+          let additiveMutationAuthority = null
+
+          if (additiveMutationCapability?.binding_ready === true) {
+            additiveMutationContext =
+              await materializeAdditiveMutationContext({
+                root,
+                capability: additiveMutationCapability,
+                maxBytes: ADDITIVE_MODEL_CONTEXT_MAX_BYTES,
+              })
+
+            if (additiveMutationContext?.ok === true) {
+              const discriminator =
+                `additive-${additiveMutationCapability.capability_sha256.slice(0, 16)}`
+              const provisionalHandoff =
+                buildAdditiveMutationHandoff({
+                  searchProtocol: SEARCH_PROTOCOL,
+                  sessionKey: scoutOpaqueKey(sessionID),
+                  turnKey: scoutOpaqueKey(state?.turnID ?? ""),
+                  generatedAtMs: nowMs(),
+                  capability: additiveMutationCapability,
+                  context: additiveMutationContext,
+                })
+
+              if (provisionalHandoff?.ok === true) {
+                const provisionalPath =
+                  await writeLocalMutationHandoff(
+                    root,
+                    sessionID,
+                    state?.turnID,
+                    provisionalHandoff.bundle,
+                    discriminator,
+                  )
+
+                if (provisionalPath) {
+                  const authorizedCapability =
+                    await authorizeAdditiveMutationCapability({
+                      root,
+                      capability: additiveMutationCapability,
+                      context: additiveMutationContext,
+                      handoffPath: provisionalPath,
+                    })
+
+                  if (
+                    authorizedCapability?.ready === true &&
+                    authorizedCapability?.mutation_authority === true
+                  ) {
+                    const finalHandoff =
+                      buildAdditiveMutationHandoff({
+                        searchProtocol: SEARCH_PROTOCOL,
+                        sessionKey: scoutOpaqueKey(sessionID),
+                        turnKey: scoutOpaqueKey(state?.turnID ?? ""),
+                        generatedAtMs: nowMs(),
+                        capability: authorizedCapability,
+                        context: additiveMutationContext,
+                      })
+
+                    if (finalHandoff?.ok === true) {
+                      const finalPath =
+                        await writeLocalMutationHandoff(
+                          root,
+                          sessionID,
+                          state?.turnID,
+                          finalHandoff.bundle,
+                          discriminator,
+                        )
+
+                      if (finalPath === provisionalPath) {
+                        const verifiedAuthority =
+                          await verifyAdditiveMutationAuthority({
+                            root,
+                            capability: authorizedCapability,
+                            context: additiveMutationContext,
+                            handoffPath: finalPath,
+                          })
+
+                        additiveMutationAuthority =
+                          verifiedAuthority
+
+                        if (verifiedAuthority?.ok === true) {
+                          additiveMutationCapability =
+                            authorizedCapability
+                          additiveMutationHandoffPath =
+                            finalPath
+                        }
+                      } else {
+                        additiveMutationAuthority = {
+                          ok: false,
+                          reason:
+                            "additive_final_handoff_path_mismatch",
+                        }
+                      }
+                    } else {
+                      additiveMutationAuthority = {
+                        ok: false,
+                        reason:
+                          finalHandoff?.reason ??
+                          "additive_final_handoff_invalid",
+                      }
+                    }
+                  } else {
+                    additiveMutationAuthority = {
+                      ok: false,
+                      reason:
+                        authorizedCapability?.reason ??
+                        "additive_authority_authorization_failed",
+                    }
+                  }
+                } else {
+                  additiveMutationAuthority = {
+                    ok: false,
+                    reason:
+                      "additive_provisional_handoff_write_failed",
+                  }
+                }
+              } else {
+                additiveMutationAuthority = {
+                  ok: false,
+                  reason:
+                    provisionalHandoff?.reason ??
+                    "additive_provisional_handoff_invalid",
+                }
+              }
+            } else {
+              additiveMutationAuthority = {
+                ok: false,
+                reason:
+                  additiveMutationContext?.reason ??
+                  "additive_context_materialization_failed",
+              }
+            }
+
+            if (
+              additiveMutationCapability?.mutation_authority !== true ||
+              !additiveMutationHandoffPath ||
+              additiveMutationAuthority?.ok !== true
+            ) {
+              additiveMutationCapability = Object.freeze({
+                ...additiveMutationCapability,
+                status: "abstained",
+                reason:
+                  additiveMutationAuthority?.reason ??
+                  "additive_handoff_authority_unavailable",
+                binding_ready: false,
+                ready: false,
+                mutation_authority: false,
+                authority_protocol: null,
+                authority_receipt: null,
+                authority_sha256: null,
+              })
+              additiveMutationHandoffPath = null
+            }
+          }
+
+          if (state) {
+            state.additiveMutationCapability =
+              additiveMutationCapability
+            state.additiveMutationHandoffPath =
+              additiveMutationHandoffPath
+            state.additiveMutationContext =
+              additiveMutationContext
+          }
+
+          const executionReadiness =
+            resolveExecutionReadiness({
+              taskShape: state?.taskShape,
+              taskAction: state?.taskAction,
+              mutationIntent: state?.mutationIntent,
+              scoutHandoff,
+              evidenceClosure: scoutEvidenceClosure,
+              editCapsule,
+              localCompetitorCheck,
+              localMutationCapability,
+              localMutationCandidates:
+                localMutationCandidateSet?.candidates ?? [],
+              renameMutationCapability,
+              additiveMutationCapability,
+              noProgressBlocked,
+            })
+
+          if (state) {
+            applyExecutionReadiness(state, executionReadiness)
+          }
           const elapsedMs = Math.round((performance.now() - started) * 100) / 100
 
           await writeProjectTrace(root, "search-trace.jsonl", {
@@ -16374,6 +17621,23 @@ export default {
             anchor_frontier_mutation_authority:
               anchorFrontier.mutation_authority,
 
+            host_owner_refinement_protocol:
+              hostOwnerRefinementPlan.protocol,
+            host_owner_refinement_status:
+              hostOwnerRefinementPlan.status,
+            host_owner_refinement_reason:
+              hostOwnerRefinementPlan.reason,
+            host_owner_refinement_candidate_files:
+              hostOwnerRefinementPlan.candidate_files,
+            host_owner_refinement_files_scanned:
+              hostOwnerRefinement.filesScanned,
+            host_owner_refinement_edges_validated:
+              hostOwnerRefinement.validatedEdges,
+            host_owner_refinement_truncated:
+              hostOwnerRefinement.truncated === true,
+            host_owner_refinement_mutation_authority:
+              false,
+
             host_resource_inventory_protocol:
               hostResourceInventory.protocol,
             host_resource_inventory_files:
@@ -16451,22 +17715,188 @@ export default {
                   }),
                 ),
 
+            data_obligation_projector_protocol:
+              dataObligationProjection
+                ?.protocol ??
+              DATA_OBLIGATION_PROJECTOR_PROTOCOL,
+            data_obligation_projector_status:
+              dataObligationProjection
+                ?.status ??
+              null,
+            data_obligation_projector_reason:
+              dataObligationProjection
+                ?.reason ??
+              null,
+            data_provider_identity_observations:
+              (
+                dataCapabilityObservation
+                  ?.providerResolution
+                  ?.observations ??
+                []
+              ).map(
+                (row) => ({
+                  identity: row.identity,
+                  search_complete:
+                    row.search_complete === true,
+                  truncated:
+                    row.truncated === true,
+                  reason:
+                    row.reason ?? null,
+                  candidates:
+                    (row.candidates ?? []).map(
+                      (candidate) => ({
+                        file: candidate.file,
+                        symbol: candidate.symbol,
+                        configuration_identity:
+                          candidate.configuration_identity,
+                        constructor_family:
+                          candidate.constructor_family,
+                      }),
+                    ),
+                }),
+              ),
+            data_provider_host_binding_observations:
+              Object.entries(
+                dataCapabilityObservation
+                  ?.bindingByProvider ??
+                {},
+              )
+                .map(
+                  ([key, observation]) => {
+                    const [
+                      identity,
+                      providerFile,
+                      providerSymbol,
+                    ] = key.split("\0")
+
+                    return {
+                    key,
+                    identity:
+                      identity ?? null,
+                    provider_file:
+                      providerFile ?? null,
+                    provider_symbol:
+                      providerSymbol ?? null,
+                    mode:
+                      observation?.mode ??
+                      null,
+                    ready:
+                      observation?.ready ===
+                      true,
+                    complete:
+                      observation?.complete ===
+                      true,
+                    reason:
+                      observation?.reason ??
+                      null,
+                    source_file:
+                      observation?.source_file ??
+                      null,
+                    source_symbol:
+                      observation?.source_symbol ??
+                      null,
+                    importer_file:
+                      observation?.importer_file ??
+                      null,
+                    bindings:
+                      (
+                        observation?.bindings ??
+                        []
+                      ).map(
+                        (binding) => ({
+                          importer:
+                            binding.importer,
+                          target:
+                            binding.target,
+                          source_symbol:
+                            binding.source_symbol,
+                          local_symbol:
+                            binding.local_symbol,
+                          confidence:
+                            binding.confidence,
+                          witness_line:
+                            binding.witness_line,
+                        }),
+                      ),
+                    }
+                  },
+                )
+                .sort(
+                  (a, b) =>
+                    a.key.localeCompare(
+                      b.key,
+                    ),
+                ),
+
+            task_bound_data_evidence_protocol:
+              taskBoundDataEvidence.protocol,
+            task_bound_data_evidence_status:
+              taskBoundDataEvidence.status,
+            task_bound_data_evidence:
+              taskBoundDataEvidence.evidence.map(
+                (item) => ({
+                  role: item.role,
+                  tier: item.tier,
+                  ambiguous: item.ambiguous,
+                  localization_authority:
+                    item.localization_authority,
+                  mutation_authority:
+                    item.mutation_authority,
+                }),
+              ),
+
             task_role_evidence_merge_status:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .status,
 
             task_role_evidence_merge_truncated:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .truncated ===
               true,
 
             task_role_evidence_roles:
-              mergedRoleEvidence
+              mergedDataRoleEvidence
                 .evidence
                 .map(
                   (item) =>
                     item.role,
                 ),
+
+            scout_evidence_closure_protocol:
+              scoutEvidenceClosure.protocol ??
+              SCOUT_EVIDENCE_CLOSURE_PROTOCOL,
+            scout_evidence_closure_status:
+              scoutEvidenceClosure.status,
+            scout_evidence_closure_reason:
+              scoutEvidenceClosure.reason,
+            scout_evidence_closure_coverage_status:
+              scoutEvidenceClosure.coverage_status,
+            scout_evidence_closure_required_roles:
+              scoutEvidenceClosure.required_roles,
+            scout_evidence_closure_covered_roles:
+              scoutEvidenceClosure.covered_roles,
+            scout_evidence_closure_missing_roles:
+              scoutEvidenceClosure.missing_roles,
+            scout_evidence_closure_ambiguous_roles:
+              scoutEvidenceClosure.ambiguous_roles,
+            scout_evidence_closure_files:
+              scoutEvidenceClosure.files.map(
+                (item) => item.file,
+              ),
+            scout_evidence_closure_truncated:
+              scoutEvidenceClosure.truncated === true,
+            scout_evidence_closure_localization_authority:
+              scoutEvidenceClosure.localization_authority,
+            scout_evidence_closure_mutation_authority:
+              false,
+            scout_evidence_projection_files_shown:
+              scoutEvidenceProjection.filesShown,
+            scout_evidence_projection_bytes:
+              scoutEvidenceProjection.bytes,
+            scout_evidence_projection_truncated:
+              scoutEvidenceProjection.truncated === true,
+            scout_evidence_projection_abstained_files:
+              scoutEvidenceProjection.abstainedFiles,
 
 
             host_resource_closure_protocol:
@@ -17085,6 +18515,60 @@ export default {
               editCapsule?.readinessWarnings ?? [],
             edit_capsule_coverage: editCapsule?.coverage ?? null,
             execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+            execution_readiness_protocol: EXECUTION_READINESS_PROTOCOL,
+            execution_readiness_status: executionReadiness.status,
+            execution_readiness_reason: executionReadiness.reason,
+            execution_readiness_failure_kind:
+              executionReadiness.failure_kind,
+            execution_readiness_required_mutation_shape:
+              executionReadiness.required_mutation_shape,
+            execution_readiness_available_mutation_operations:
+              executionReadiness.available_mutation_operations,
+            execution_readiness_evidence:
+              executionReadiness.evidence,
+            execution_readiness_mutation_authority:
+              executionReadiness.mutation_authority,
+            execution_readiness_additive:
+              additiveMutationCapability?.ready === true,
+            additive_capability_protocol:
+              additiveMutationCapability?.protocol ??
+              ADDITIVE_MUTATION_CAPABILITY_PROTOCOL,
+            additive_host_binding_protocol:
+              additiveMutationCapability?.host_binding_protocol ??
+              ADDITIVE_HOST_BINDING_PROTOCOL,
+            additive_binding_ready:
+              additiveMutationCapability?.binding_ready === true,
+            additive_authority_protocol:
+              additiveMutationCapability?.authority_protocol ??
+              ADDITIVE_MUTATION_AUTHORITY_PROTOCOL,
+            additive_authority_sha256:
+              additiveMutationCapability?.authority_sha256 ?? null,
+            additive_authority_verified:
+              additiveMutationAuthority?.ok === true,
+            additive_authority_reason:
+              additiveMutationAuthority?.reason ?? null,
+            additive_host_bindings:
+              additiveMutationCapability?.host_bindings ?? null,
+            additive_capability_status:
+              additiveMutationCapability?.status ?? null,
+            additive_capability_reason:
+              additiveMutationCapability?.reason ?? null,
+            additive_capability_sha256:
+              additiveMutationCapability?.capability_sha256 ?? null,
+            additive_existing_slots:
+              additiveMutationCapability?.existing_slots?.map((slot) => slot.slot) ?? [],
+            additive_create_slots:
+              additiveMutationCapability?.create_slots?.map((slot) => slot.slot) ?? [],
+            additive_handoff_path:
+              additiveMutationHandoffPath,
+            additive_model_context_bytes:
+              additiveMutationContext?.bytes ?? 0,
+            additive_model_context_files:
+              additiveMutationContext?.files_shown ?? 0,
+            additive_model_context_truncated:
+              additiveMutationContext?.truncated === true,
+            additive_mutation_authority:
+              additiveMutationCapability?.mutation_authority === true,
             execution_state: state?.executionState ?? null,
             execution_reason: state?.executionReason ?? null,
             execution_event: state?.executionEvent ?? null,
@@ -17476,6 +18960,9 @@ export default {
             contextualized_hit_lines:
               state?.contextualizedHitLines?.size ?? null,
             turn_model_calls: state?.modelCalls ?? null,
+            observed_model_latency_ms: observedModelLatencyMs,
+            model_latency_samples: state?.modelLatencySamples ?? 0,
+            model_latency_max_ms: state?.modelLatencyMaxMs ?? 0,
             turn_search_attempts: state?.searchAttempts ?? null,
             turn_executed_searches: state?.executedSearches ?? null,
             turn_evidence_bytes: state?.evidenceBytes ?? null,
@@ -17490,15 +18977,33 @@ export default {
           //
           // Full Scout evidence remains persisted in search trace / handoff
           // artifacts; this changes only the next model-facing projection.
-          const mutationFrontier = mutationToolsForState(state)
-          const frontierResolution = resolveMutationActionForState(state)
-          const actionCommitResult = deriveActionCommit({
-            state,
-            editCapsule,
-            frontier: frontierResolution,
-            renameToolName: EXECUTE_RENAME_SYMBOL_TOOL,
-            renameCapabilityProtocol: SCOUT_RENAME_TARGET_PROTOCOL,
-          })
+          const primaryMutationReady =
+            executionReadiness.status ===
+            EXECUTION_READINESS_STATUS.READY_TO_MUTATE
+          const mutationFrontier =
+            primaryMutationReady
+              ? mutationToolsForState(state)
+              : []
+          const frontierResolution =
+            primaryMutationReady
+              ? resolveMutationActionForState(state)
+              : {
+                  tool: null,
+                  reason: `execution_readiness_${executionReadiness.status}`,
+                }
+          const actionCommitResult =
+            primaryMutationReady
+              ? deriveActionCommit({
+                  state,
+                  editCapsule,
+                  frontier: frontierResolution,
+                  renameToolName: EXECUTE_RENAME_SYMBOL_TOOL,
+                  renameCapabilityProtocol: SCOUT_RENAME_TARGET_PROTOCOL,
+                })
+              : {
+                  ok: false,
+                  reason: `execution_readiness_${executionReadiness.status}`,
+                }
 
           let actionCommitClaim = null
           let deterministicMutationResult = null
@@ -17524,15 +19029,41 @@ export default {
             }
           }
 
-          const baseActionContent = editCapsule?.text ?? content
+          const additiveMutationReady =
+            executionReadiness.status ===
+              EXECUTION_READINESS_STATUS.READY_TO_MUTATE &&
+            executionReadiness.required_mutation_shape ===
+              EXECUTION_MUTATION_SHAPE.ADDITIVE_SURFACE &&
+            additiveMutationCapability?.ready === true &&
+            additiveMutationContext?.ok === true
+
+          const additiveCapsuleContent =
+            additiveMutationReady
+              ? [
+                  renderAdditiveMutationCapability(additiveMutationCapability),
+                  renderObligationBoundSynthesisContract(
+                    additiveMutationCapability,
+                    state.taskRequirements,
+                  ),
+                  additiveMutationContext.content,
+                ].filter(Boolean).join("\n\n")
+              : null
+
+          const baseActionContent =
+            additiveCapsuleContent ?? editCapsule?.text ?? content
+          const readinessStopContent =
+            executionReadiness.status === EXECUTION_READINESS_STATUS.SAFE_FAIL
+              ? `SEARCH_STOP reason=${executionReadiness.reason} failure_kind=${executionReadiness.failure_kind ?? "unspecified"} required_mutation_shape=${executionReadiness.required_mutation_shape} action=report_blocked`
+              : null
           const actionableContent =
-            deterministicMutationResult
+            readinessStopContent ??
+            (deterministicMutationResult
               ? `${baseActionContent}\nACTION_COMMIT protocol=${ACTION_COMMIT_PROTOCOL} sha256=${actionCommitResult.commit.commit_sha256} origin=${ACTION_COMMIT_DISPATCH_ORIGIN}\n${deterministicMutationResult.content}`
               : actionCommitResult.ok === true && actionCommitClaim?.ok !== true
                 ? `${baseActionContent}\nACTION_COMMIT_STOP reason=${actionCommitClaim?.reason ?? "action_commit_claim_failed"} action=report_blocked`
                 : mutationFrontier.length > 0
-                  ? `${baseActionContent}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=edit_capsule_ready search_locked=true`
-                  : content
+                  ? `${baseActionContent}\nNEXT_ACTION=${mutationFrontier.join(",")} reason=execution_readiness_ready search_locked=true`
+                  : content)
 
           return {
             content: actionableContent,
@@ -17631,6 +19162,19 @@ export default {
               edit_capsule_mutation_ready: editCapsule?.mutationReady ?? false,
               edit_capsule_coverage: editCapsule?.coverage ?? null,
               execution_fsm_protocol: EXECUTION_FSM_PROTOCOL,
+              execution_readiness_protocol: EXECUTION_READINESS_PROTOCOL,
+              execution_readiness_status: executionReadiness.status,
+              execution_readiness_reason: executionReadiness.reason,
+              execution_readiness_failure_kind:
+                executionReadiness.failure_kind,
+              execution_readiness_required_mutation_shape:
+                executionReadiness.required_mutation_shape,
+              execution_readiness_available_mutation_operations:
+                executionReadiness.available_mutation_operations,
+              execution_readiness_evidence:
+                executionReadiness.evidence,
+              execution_readiness_mutation_authority:
+                executionReadiness.mutation_authority,
               patch_permission_action: PATCH_PERMISSION_ACTION,
               execution_state: state?.executionState ?? null,
               execution_reason: state?.executionReason ?? null,
@@ -17749,7 +19293,222 @@ export default {
               elapsed_ms: elapsedMs,
             },
           }
+        }
+
+    await track(ctx.tool.transform((tools) => {
+      tools.add({
+        name: "search",
+        description:
+          "Search the active project with 1 to 4 regular expressions in one call. " +
+          "Search first performs repository-wide lexical discovery, applies bounded deterministic structural BM25F/RRF reranking when available, and keeps query fairness separate from relevance, " +
+          "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
+          "Returns bounded line-numbered evidence and explicit completeness metadata. " +
+          "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
+          "for the requested regex/path/glob. scan_complete=true is stronger: every discovered file " +
+          "was probed and every matching line was scanned. " +
+          "A ROUTE block is heuristic routing only; retained_unemitted files remain lexical candidates " +
+          "and must not be treated as irrelevant or absent. " +
+          "Completeness is lexical: scan_complete=true means all matches for the requested " +
+          "regex/path/glob were scanned across the probed universe, not that a semantic category is exhaustively absent. " +
+          "evidence_complete=true means every discovered hit line is represented, not that " +
+          "the surrounding function or file is fully shown. representation=focused adds bounded " +
+          "containing-scope context chosen from structurally relevant non-module matches but still " +
+          "does not imply whole-file context. Turn evidence is deduplicated: prior_evidence_reused=true " +
+          "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
+          "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
+          "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
+          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
+          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only capability-derived action-specific mutation tools.",
+        input: {
+          type: "object",
+          properties: {
+            queries: {
+              type: "array",
+              minItems: 1,
+              maxItems: MAX_QUERIES,
+              items: { type: "string", minLength: 1, maxLength: 200 },
+              description: "One to four regular expressions.",
+            },
+            path: {
+              type: "string",
+              minLength: 1,
+              description: "Optional project-relative file or directory. Default: project root.",
+            },
+            glob: {
+              type: "string",
+              minLength: 1,
+              description: "Optional file glob such as **/*.py.",
+            },
+          },
+          required: ["queries"],
+          additionalProperties: false,
         },
+        options: {
+          codemode: false,
+          permission: "search",
+        },
+
+        execute: deterministicSearchExecutor,
+      })
+    }))
+
+    await track(ctx.tool.transform((tools) => {
+      tools.add({
+        name: EXECUTE_ADDITIVE_PLAN_TOOL,
+        description:
+          "Submit one bounded additive plan. Always provide python_imports, python_declarations, replacements, and creations arrays; use [] when unused. " +
+          "Python edits describe WHAT only: imports or new module-level declarations. Never submit Python line numbers, offsets, site ids, paths, or source preimages. " +
+          "Non-Python existing slots use exact replacements. Creations remain relative to sealed create slots.",
+        input: {
+          type: "object",
+          properties: {
+            python_imports: {
+              type: "array",
+              minItems: 0,
+              maxItems: ADDITIVE_MAX_OPERATIONS,
+              items: {
+                type: "object",
+                properties: {
+                  slot: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 64,
+                    description: "Opaque Python existing-slot id.",
+                  },
+                  modules: {
+                    type: "array",
+                    minItems: 0,
+                    maxItems: ADDITIVE_MAX_OPERATIONS,
+                    items: {
+                      type: "string",
+                      minLength: 1,
+                    },
+                    description:
+                      "Plain module imports, e.g. ['io']. No aliases or source coordinates.",
+                  },
+                  from_imports: {
+                    type: "array",
+                    minItems: 0,
+                    maxItems: ADDITIVE_MAX_OPERATIONS,
+                    items: {
+                      type: "object",
+                      properties: {
+                        module: {
+                          type: "string",
+                          minLength: 1,
+                        },
+                        name: {
+                          type: "string",
+                          minLength: 1,
+                        },
+                      },
+                      required: ["module", "name"],
+                      additionalProperties: false,
+                    },
+                    description:
+                      "From-import bindings, e.g. {module:'datetime', name:'datetime'}.",
+                  },
+                },
+                required: ["slot", "modules", "from_imports"],
+                additionalProperties: false,
+              },
+            },
+            python_declarations: {
+              type: "array",
+              minItems: 0,
+              maxItems: ADDITIVE_MAX_OPERATIONS,
+              items: {
+                type: "object",
+                properties: {
+                  slot: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 64,
+                    description: "Opaque Python existing-slot id.",
+                  },
+                  content: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: ADDITIVE_MAX_REPLACE_BYTES,
+                    description:
+                      "New top-level function/class/decorated declaration only. Imports belong in python_imports.",
+                  },
+                },
+                required: ["slot", "content"],
+                additionalProperties: false,
+              },
+            },
+            replacements: {
+              type: "array",
+              minItems: 0,
+              maxItems: ADDITIVE_MAX_OPERATIONS,
+              description:
+                "Exact replacements for non-Python existing slots only.",
+              items: {
+                type: "object",
+                properties: {
+                  slot: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 64,
+                  },
+                  before: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: ADDITIVE_MAX_REPLACE_BYTES,
+                  },
+                  replacement: {
+                    type: "string",
+                    maxLength: ADDITIVE_MAX_REPLACE_BYTES,
+                  },
+                },
+                required: ["slot", "before", "replacement"],
+                additionalProperties: false,
+              },
+            },
+            creations: {
+              type: "array",
+              minItems: 0,
+              maxItems: ADDITIVE_MAX_CREATE_FILES,
+              items: {
+                type: "object",
+                properties: {
+                  slot: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 64,
+                  },
+                  relative_path: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: ADDITIVE_MAX_REL_PATH_BYTES,
+                  },
+                  content: {
+                    type: "string",
+                    maxLength: ADDITIVE_MAX_CREATE_BYTES,
+                    description:
+                      "Complete UTF-8 file content. Deterministic byte budgets are rechecked at runtime.",
+                  },
+                },
+                required: ["slot", "relative_path", "content"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["python_imports", "python_declarations", "replacements", "creations"],
+          additionalProperties: false,
+        },
+        options: {
+          codemode: false,
+          permission: PATCH_PERMISSION_ACTION,
+        },
+        execute: async (input, toolContext) =>
+          executeCapabilityMutationCore(
+            input,
+            toolContext,
+            "additive_surface",
+            EXECUTE_ADDITIVE_PLAN_TOOL,
+          ),
       })
     }))
 
@@ -17834,7 +19593,10 @@ export default {
       // the materialized base surface, so a reused mutable event.tools object
       // cannot lose the next state's schema before the capability frontier is
       // applied below.
-      const stableToolSurface = new Set(["search", ...MUTATION_TOOL_NAMES])
+      const stableToolSurface = new Set([
+        "search",
+        ...MUTATION_TOOL_NAMES,
+      ])
       for (const name of Object.keys(event.tools)) {
         if (!stableToolSurface.has(name)) {
           delete event.tools[name]
@@ -18140,8 +19902,39 @@ export default {
 
       latchTaskContextForTurn(state, taskContextSnapshot)
 
+      if (
+        state.executionReadiness?.protocol === EXECUTION_READINESS_PROTOCOL &&
+        state.executionReadiness?.status === EXECUTION_READINESS_STATUS.SAFE_FAIL
+      ) {
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: nowMs(),
+          protocol: AGENT_PROTOCOL,
+          kind: "model_blocked",
+          reason: "execution_safe_fail",
+          sessionID,
+          turnID: state.turnID,
+          project_root: root,
+          execution_readiness_protocol: EXECUTION_READINESS_PROTOCOL,
+          execution_readiness_status: state.executionReadiness.status,
+          execution_readiness_reason: state.executionReadiness.reason,
+          execution_readiness_failure_kind:
+            state.executionReadiness.failure_kind,
+          execution_readiness_required_mutation_shape:
+            state.executionReadiness.required_mutation_shape,
+          execution_state: state.executionState,
+          model_calls: state.modelCalls,
+        })
+
+        throw new Error(
+          `CPU_AGENT execution_safe_fail reason=${state.executionReadiness.reason}`,
+        )
+      }
+
       const materializedToolNames = Object.keys(event.tools).sort()
-      const requiredSurface = ["search", ...MUTATION_TOOL_NAMES]
+      const requiredSurface = [
+        "search",
+        ...MUTATION_TOOL_NAMES,
+      ]
       const missingSurface = requiredSurface.filter(
         (name) => !Object.prototype.hasOwnProperty.call(event.tools, name),
       )
@@ -18167,11 +19960,658 @@ export default {
         )
       }
 
+      // E2.3-A deterministic pre-Scout.
+      //
+      // Monotonic optimization only: routing seeds are heuristic, evidence and
+      // mutation authority still come exclusively from the existing Scout.
+      const deterministicScoutPlan = compileDeterministicScoutRequest({
+        messages: event.messages,
+        taskShape: state.taskShape,
+      })
+      const deterministicScoutFastpathEnabled =
+        process.env.OPENCODE_CPU_ONE_CALL_EXECUTOR === "1"
+      const deterministicScoutEligible =
+        deterministicScoutFastpathEnabled &&
+        state.modelCalls === 0 &&
+        state.executionState === EXEC_STATE_LOCATE &&
+        state.taskShape?.status === "compiled" &&
+        state.taskShape?.shape === "additive" &&
+        deterministicScoutPlan.applied === true &&
+        canMergeDeterministicScoutContext(event.system) &&
+        state.deterministicScoutTurnID !== state.turnID
+
+      if (deterministicScoutEligible) {
+        state.deterministicScoutTurnID = state.turnID
+        const deterministicScoutStarted = performance.now()
+        let deterministicScoutResult = null
+        let deterministicScoutError = null
+
+        try {
+          deterministicScoutResult = await deterministicSearchExecutor(
+            deterministicScoutPlan.input,
+            {
+              sessionID,
+              directory: root,
+              cwd: root,
+              worktree: root,
+            },
+          )
+        } catch (error) {
+          deterministicScoutError =
+            error instanceof Error ? error.message : String(error)
+        }
+
+        const deterministicScoutContent =
+          typeof deterministicScoutResult?.content === "string"
+            ? deterministicScoutResult.content
+            : ""
+
+        const modelContextCompilerMode =
+          resolveModelContextCompilerMode(
+            process.env.OPENCODE_CPU_MODEL_CONTEXT_COMPILER,
+          )
+        const modelContextCompilerBudget =
+          resolveModelContextBudgetBytes(
+            process.env.OPENCODE_CPU_MODEL_CONTEXT_MAX_BYTES,
+          )
+        const repairContextCompilerBudget =
+          resolveRepairContextBudgetBytes(
+            process.env.OPENCODE_CPU_REPAIR_CONTEXT_MAX_BYTES,
+          )
+        let modelContextCompilation = Object.freeze({
+          protocol: MODEL_CONTEXT_COMPILER_PROTOCOL,
+          status: "not_attempted",
+          ok: false,
+          reason: "authorized_additive_capability_unavailable",
+          source_bytes: Buffer.byteLength(
+            deterministicScoutContent,
+            "utf8",
+          ),
+          compiled_bytes: 0,
+          saved_bytes: 0,
+          reduction_ratio: 0,
+          critical_file_coverage_complete: false,
+          execution_contract_coverage_complete: false,
+          execution_contract_sha256: null,
+          capsule_sha256: null,
+          token_authority: false,
+          token_count: null,
+        })
+        if (
+          deterministicScoutContent.length > 0 &&
+          state.additiveMutationCapability?.ready === true &&
+          state.additiveMutationCapability?.mutation_authority === true
+        ) {
+          try {
+            modelContextCompilation =
+              await compileAdditiveExecutionCapsule({
+                root,
+                capability: state.additiveMutationCapability,
+                baselineContent: deterministicScoutContent,
+                maxBytes: modelContextCompilerBudget,
+              })
+          } catch (error) {
+            modelContextCompilation = Object.freeze({
+              protocol: MODEL_CONTEXT_COMPILER_PROTOCOL,
+              status: "abstained",
+              ok: false,
+              reason: "context_compiler_exception",
+              error: error instanceof Error ? error.message : String(error),
+              source_bytes: Buffer.byteLength(
+                deterministicScoutContent,
+                "utf8",
+              ),
+              compiled_bytes: 0,
+              saved_bytes: 0,
+              reduction_ratio: 0,
+              critical_file_coverage_complete: false,
+              execution_contract_coverage_complete: false,
+              execution_contract_sha256: null,
+              capsule_sha256: null,
+              token_authority: false,
+              token_count: null,
+            })
+          }
+        }
+
+        let deterministicScoutSelectedContent =
+          deterministicScoutContent
+        let modelContextSelectedSource =
+          "deterministic_scout_baseline"
+
+        if (
+          modelContextCompilerMode === "active" &&
+          modelContextCompilation.ok === true &&
+          modelContextCompilation
+            .execution_contract_coverage_complete === true &&
+          modelContextCompilation.semantic_coverage_complete === true
+        ) {
+          const compiledCapsule =
+            snapshotCompiledExecutionCapsule(
+              modelContextCompilation,
+            )
+          if (!compiledCapsule) {
+            state.executionContextBlockReason =
+              "model_context_capsule_snapshot_invalid"
+            applyExecutionEvent(
+              state,
+              "fatal",
+              state.executionContextBlockReason,
+            )
+            deterministicScoutSelectedContent =
+              `EXECUTION_CONTEXT_BLOCKED reason=${state.executionContextBlockReason} ` +
+              "action=report_blocked"
+            modelContextSelectedSource =
+              "execution_context_blocked"
+          } else if (
+            state.executionContextCapsuleSha256 &&
+            state.executionContextCapsuleSha256 !==
+              compiledCapsule.capsule_sha256
+          ) {
+            state.executionContextBlockReason =
+              "execution_context_capsule_drift"
+            applyExecutionEvent(
+              state,
+              "fatal",
+              state.executionContextBlockReason,
+            )
+            deterministicScoutSelectedContent =
+              `EXECUTION_CONTEXT_BLOCKED reason=${state.executionContextBlockReason} ` +
+              "action=report_blocked"
+            modelContextSelectedSource =
+              "execution_context_blocked"
+          } else {
+            state.executionContextCapsule = compiledCapsule
+            state.executionContextCapsuleSha256 =
+              compiledCapsule.capsule_sha256
+            state.executionContextContractSha256 =
+              compiledCapsule.execution_contract_sha256
+            state.executionContextBlockReason = null
+            deterministicScoutSelectedContent =
+              modelContextCompilation.content
+            modelContextSelectedSource =
+              "compiled_execution_capsule"
+          }
+        }
+
+        if (
+          modelContextCompilerMode === "active" &&
+          state.additiveMutationCapability?.ready === true &&
+          state.additiveMutationCapability
+            ?.mutation_authority === true &&
+          (
+            modelContextCompilation.ok !== true ||
+            modelContextCompilation.semantic_coverage_complete !== true
+          )
+        ) {
+          state.executionContextBlockReason =
+            typeof modelContextCompilation.reason === "string" &&
+            modelContextCompilation.reason.length > 0
+              ? `model_context_${modelContextCompilation.reason}`
+              : "model_context_active_compile_failed"
+          applyExecutionEvent(
+            state,
+            "fatal",
+            state.executionContextBlockReason,
+          )
+          deterministicScoutSelectedContent =
+            `EXECUTION_CONTEXT_BLOCKED reason=${state.executionContextBlockReason} ` +
+            "action=report_blocked"
+          modelContextSelectedSource =
+            "execution_context_blocked"
+        }
+
+        state.executionContextSelectedSource =
+          modelContextSelectedSource
+        state.repairContextProjectionStatus = null
+        state.repairContextProjectionReason = null
+        state.repairContextProjectionBytes = 0
+        state.repairContextProjectionSha256 = null
+        state.repairContextSourceCapsuleSha256 = null
+
+        const deterministicScoutContextMerge =
+          deterministicScoutSelectedContent.length > 0
+            ? mergeDeterministicScoutContext(
+                event,
+                deterministicScoutSelectedContent,
+              )
+            : Object.freeze({
+                protocol: null,
+                applied: false,
+                reason: "content_unavailable",
+                carrier_kind: null,
+                carrier_index: null,
+                system_entries_before: Array.isArray(event.system)
+                  ? event.system.length
+                  : typeof event.system === "string"
+                    ? 1
+                    : null,
+                system_entries_after: Array.isArray(event.system)
+                  ? event.system.length
+                  : typeof event.system === "string"
+                    ? 1
+                    : null,
+                content_bytes: 0,
+                block_bytes: 0,
+                content_sha256: null,
+                content_trust: null,
+              })
+        const deterministicScoutContextAppended =
+          deterministicScoutContextMerge.applied === true
+
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: nowMs(),
+          protocol: AGENT_PROTOCOL,
+          kind: "deterministic_scout_preflight",
+          deterministic_scout_protocol:
+            DETERMINISTIC_SCOUT_ENTRY_PROTOCOL,
+          sessionID,
+          turnID: state.turnID,
+          project_root: root,
+          enabled: deterministicScoutFastpathEnabled,
+          applied: true,
+          reason:
+            deterministicScoutError !== null
+              ? "search_executor_error"
+              : deterministicScoutContextAppended
+                ? "search_result_injected"
+                : "search_result_unavailable",
+          query_count:
+            deterministicScoutPlan.input?.queries?.length ?? 0,
+          queries: deterministicScoutPlan.input?.queries ?? [],
+          routing_authority: false,
+          mutation_authority: false,
+          model_context_compiler_protocol:
+            MODEL_CONTEXT_COMPILER_PROTOCOL,
+          model_context_compiler_mode: modelContextCompilerMode,
+          model_context_compiler_status: modelContextCompilation.status,
+          model_context_compiler_reason: modelContextCompilation.reason,
+          model_context_compiler_budget_bytes: modelContextCompilerBudget,
+          model_context_source_bytes:
+            modelContextCompilation.source_bytes ?? null,
+          model_context_compiled_bytes:
+            modelContextCompilation.compiled_bytes ?? null,
+          model_context_saved_bytes:
+            modelContextCompilation.saved_bytes ?? null,
+          model_context_reduction_ratio:
+            modelContextCompilation.reduction_ratio ?? null,
+          model_context_critical_coverage:
+            modelContextCompilation.critical_file_coverage_complete === true,
+          model_context_execution_contract_coverage:
+            modelContextCompilation.execution_contract_coverage_complete === true,
+          model_context_execution_contract_sha256:
+            modelContextCompilation.execution_contract_sha256 ?? null,
+          model_context_execution_contract_bytes:
+            modelContextCompilation.execution_contract_bytes ?? null,
+          model_context_critical_evidence_bytes:
+            modelContextCompilation.critical_evidence_bytes ?? null,
+          model_context_minimum_required_bytes:
+            modelContextCompilation.minimum_required_bytes ?? null,
+          model_context_over_budget_bytes:
+            modelContextCompilation.over_budget_bytes ?? null,
+          model_context_semantic_coverage:
+            modelContextCompilation.semantic_coverage_complete === true,
+          model_context_semantic_coverage_sha256:
+            modelContextCompilation.semantic_coverage_sha256 ?? null,
+          model_context_semantic_coverage_scope_count:
+            modelContextCompilation.semantic_coverage_scope_count ?? 0,
+          model_context_structural_planner_protocol:
+            modelContextCompilation.structural_planner_protocol ?? null,
+          model_context_structural_planner_status:
+            modelContextCompilation.structural_planner_status ?? null,
+          model_context_structural_planner_reason:
+            modelContextCompilation.structural_planner_reason ?? null,
+          model_context_structural_planner_backend:
+            modelContextCompilation.structural_planner_backend ?? null,
+          model_context_structural_planner_elapsed_ms:
+            modelContextCompilation.structural_planner_elapsed_ms ?? null,
+          model_context_structural_planner_parsed_files:
+            modelContextCompilation.structural_planner_parsed_files ?? 0,
+          model_context_structural_planner_fallback_files:
+            modelContextCompilation.structural_planner_fallback_files ?? 0,
+          model_context_structural_plan_sha256:
+            modelContextCompilation.structural_plan_sha256 ?? null,
+          model_context_selected_evidence_levels:
+            modelContextCompilation.selected_evidence_levels ?? [],
+          model_context_capsule_sha256:
+            state.executionContextCapsuleSha256 ??
+            modelContextCompilation.capsule_sha256 ??
+            null,
+          model_context_token_authority:
+            modelContextCompilation.token_authority === true,
+          model_context_token_count:
+            modelContextCompilation.token_count ?? null,
+          model_context_selected_source: modelContextSelectedSource,
+          repair_context_budget_bytes: repairContextCompilerBudget,
+          repair_context_projection_status:
+            state.repairContextProjectionStatus,
+          repair_context_projection_reason:
+            state.repairContextProjectionReason,
+          repair_context_projection_bytes:
+            state.repairContextProjectionBytes,
+          repair_context_projection_sha256:
+            state.repairContextProjectionSha256,
+          repair_context_source_capsule_sha256:
+            state.repairContextSourceCapsuleSha256,
+          execution_context_block_reason:
+            state.executionContextBlockReason,
+          context_appended: deterministicScoutContextAppended,
+          context_carrier_protocol:
+            deterministicScoutContextMerge.protocol ?? null,
+          context_carrier_reason:
+            deterministicScoutContextMerge.reason ?? null,
+          context_carrier_kind:
+            deterministicScoutContextMerge.carrier_kind ?? null,
+          context_carrier_index:
+            deterministicScoutContextMerge.carrier_index ?? null,
+          context_system_entries_before:
+            deterministicScoutContextMerge.system_entries_before ?? null,
+          context_system_entries_after:
+            deterministicScoutContextMerge.system_entries_after ?? null,
+          context_content_bytes:
+            deterministicScoutContextMerge.content_bytes ?? null,
+          context_block_bytes:
+            deterministicScoutContextMerge.block_bytes ?? null,
+          context_content_sha256:
+            deterministicScoutContextMerge.content_sha256 ?? null,
+          context_content_trust:
+            deterministicScoutContextMerge.content_trust ?? null,
+          error: deterministicScoutError,
+          execution_state: state.executionState,
+          execution_reason: state.executionReason,
+          next_action: nextActionForExecutionState(state),
+          elapsed_ms:
+            Math.round(
+              (performance.now() - deterministicScoutStarted) * 100,
+            ) / 100,
+        })
+        if (
+          state.executionState === EXEC_STATE_MUTATE &&
+          deterministicScoutContextMerge.applied !== true
+        ) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_blocked",
+            reason: "deterministic_context_carrier",
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            execution_state: state.executionState,
+            context_carrier_protocol:
+              deterministicScoutContextMerge.protocol ?? null,
+            context_carrier_reason:
+              deterministicScoutContextMerge.reason ?? null,
+            context_system_entries_before:
+              deterministicScoutContextMerge.system_entries_before ?? null,
+            context_system_entries_after:
+              deterministicScoutContextMerge.system_entries_after ?? null,
+          })
+          throw new Error(
+            `CPU_AGENT deterministic_context_carrier ` +
+            `reason=${deterministicScoutContextMerge.reason ?? "unknown"}`,
+          )
+        }
+      }
+
+      const repairExecutionContextEligible =
+        resolveModelContextCompilerMode(
+          process.env.OPENCODE_CPU_MODEL_CONTEXT_COMPILER,
+        ) === "active" &&
+        state.executionState === EXEC_STATE_REPAIR &&
+        state.additiveRepairLock?.repairable === true
+
+      if (repairExecutionContextEligible) {
+        const repairContextCompilerBudget =
+          resolveRepairContextBudgetBytes(
+            process.env.OPENCODE_CPU_REPAIR_CONTEXT_MAX_BYTES,
+          )
+        let repairContextProjection = Object.freeze({
+          protocol: "repair-execution-context-projection-v1",
+          ok: false,
+          reason: "repair_execution_context_capsule_missing",
+          bytes: 0,
+          projection_sha256: null,
+          source_capsule_sha256:
+            state.executionContextCapsuleSha256,
+          target_slots: Object.freeze([]),
+          target_files: Object.freeze([]),
+        })
+
+        if (state.executionContextCapsule) {
+          try {
+            repairContextProjection =
+              await buildRepairExecutionProjection({
+                root,
+                capsule: state.executionContextCapsule,
+                capability: state.additiveMutationCapability,
+                repairHint: state.additiveRepairLock,
+                maxBytes: repairContextCompilerBudget,
+              })
+          } catch (error) {
+            repairContextProjection = Object.freeze({
+              protocol: "repair-execution-context-projection-v1",
+              ok: false,
+              reason: "repair_context_projection_exception",
+              error:
+                error instanceof Error
+                  ? error.message
+                  : String(error),
+              bytes: 0,
+              projection_sha256: null,
+              source_capsule_sha256:
+                state.executionContextCapsuleSha256,
+              target_slots: Object.freeze([]),
+              target_files: Object.freeze([]),
+            })
+          }
+        }
+
+        let repairContextContent = null
+        let repairContextSelectedSource = null
+        if (repairContextProjection.ok === true) {
+          repairContextContent = repairContextProjection.content
+          repairContextSelectedSource =
+            "persisted_execution_capsule_repair_projection"
+        }
+
+        state.repairContextProjectionStatus =
+          repairContextProjection.ok === true
+            ? "compiled"
+            : "not_compiled"
+        state.repairContextProjectionReason =
+          repairContextProjection.reason ?? null
+        state.repairContextProjectionBytes =
+          repairContextProjection.bytes ?? 0
+        state.repairContextProjectionSha256 =
+          repairContextProjection.projection_sha256 ?? null
+        state.repairContextSourceCapsuleSha256 =
+          repairContextProjection.source_capsule_sha256 ?? null
+
+        if (!repairContextContent) {
+          state.executionContextBlockReason =
+            repairContextProjection.reason ||
+            "repair_context_projection_unavailable"
+          applyExecutionEvent(
+            state,
+            "fatal",
+            state.executionContextBlockReason,
+          )
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "execution_context_repair_projection",
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            applied: false,
+            reason: state.executionContextBlockReason,
+            repair_context_budget_bytes:
+              repairContextCompilerBudget,
+            source_capsule_sha256:
+              state.executionContextCapsuleSha256,
+            projection_sha256:
+              state.repairContextProjectionSha256,
+            target_slots:
+              repairContextProjection.target_slots ?? [],
+            target_files:
+              repairContextProjection.target_files ?? [],
+            repair_protocol:
+              repairContextProjection.protocol ?? null,
+            coverage_failure_sha256:
+              repairContextProjection.coverage_failure_sha256 ??
+              state.additiveRepairLock?.coverage_failure_sha256 ??
+              null,
+            failed_candidate_sha256:
+              repairContextProjection.failed_candidate_sha256 ??
+              state.additiveRepairLock?.failed_candidate_sha256 ??
+              null,
+            repair_progress_status:
+              state.additiveRepairLock?.repair_progress?.status ??
+              null,
+            repair_progress_strict:
+              state.additiveRepairLock?.repair_progress
+                ?.strict_progress === true,
+            repair_required_bytes:
+              repairContextProjection.required_bytes ?? null,
+            repair_over_budget_bytes:
+              repairContextProjection.over_budget_bytes ?? null,
+            routing_authority: false,
+            mutation_authority: false,
+          })
+          throw new Error(
+            `CPU_AGENT execution_context_repair_blocked reason=${state.executionContextBlockReason}`,
+          )
+        }
+
+        if (!canMergeDeterministicScoutContext(event.system)) {
+          state.executionContextBlockReason =
+            "repair_context_carrier_unsupported"
+          applyExecutionEvent(
+            state,
+            "fatal",
+            state.executionContextBlockReason,
+          )
+          throw new Error(
+            `CPU_AGENT execution_context_repair_blocked reason=${state.executionContextBlockReason}`,
+          )
+        }
+
+        const repairContextMerge =
+          mergeDeterministicScoutContext(
+            event,
+            repairContextContent,
+          )
+        if (repairContextMerge.applied !== true) {
+          state.executionContextBlockReason =
+            `repair_context_carrier_${repairContextMerge.reason ?? "unavailable"}`
+          applyExecutionEvent(
+            state,
+            "fatal",
+            state.executionContextBlockReason,
+          )
+          throw new Error(
+            `CPU_AGENT execution_context_repair_blocked reason=${state.executionContextBlockReason}`,
+          )
+        }
+
+        state.executionContextBlockReason = null
+        state.executionContextSelectedSource =
+          repairContextSelectedSource
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: nowMs(),
+          protocol: AGENT_PROTOCOL,
+          kind: "execution_context_repair_projection",
+          sessionID,
+          turnID: state.turnID,
+          project_root: root,
+          applied: true,
+          reason: "repair_projection_injected",
+          selected_source: repairContextSelectedSource,
+          repair_context_budget_bytes:
+            repairContextCompilerBudget,
+          repair_context_bytes:
+            Buffer.byteLength(repairContextContent, "utf8"),
+          source_capsule_sha256:
+            state.executionContextCapsuleSha256,
+          projection_sha256:
+            state.repairContextProjectionSha256,
+          target_slots:
+            repairContextProjection.target_slots ?? [],
+          target_files:
+            repairContextProjection.target_files ?? [],
+          context_carrier_protocol:
+            repairContextMerge.protocol ?? null,
+          context_carrier_reason:
+            repairContextMerge.reason ?? null,
+          routing_authority: false,
+          mutation_authority: false,
+        })
+      }
+
       const allowedTools = allowedToolsForState(state)
       const allowedSet = new Set(allowedTools)
       for (const name of Object.keys(event.tools)) {
         if (!allowedSet.has(name)) delete event.tools[name]
       }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          event.tools,
+          EXECUTE_ADDITIVE_PLAN_TOOL,
+        )
+      ) {
+        const schemaBinding = bindAdditiveToolSchemaToCapability(
+          event.tools[EXECUTE_ADDITIVE_PLAN_TOOL],
+          state.additiveMutationCapability,
+        )
+        if (schemaBinding.ok !== true) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_blocked",
+            reason: schemaBinding.reason,
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            execution_state: state.executionState,
+            tool_frontier_protocol: TOOL_FRONTIER_PROTOCOL,
+            mutation_tool: EXECUTE_ADDITIVE_PLAN_TOOL,
+          })
+          throw new Error(
+            `CPU_AGENT ${schemaBinding.reason} ` +
+            `state=${state.executionState}`,
+          )
+        }
+        const obligationSchemaBinding = bindObligationBoundToolSchema(
+          schemaBinding.tool,
+          state.additiveMutationCapability,
+          state.taskRequirements,
+        )
+        if (obligationSchemaBinding.ok !== true) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_blocked",
+            reason: obligationSchemaBinding.reason,
+            detail: obligationSchemaBinding.detail ?? null,
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            execution_state: state.executionState,
+            tool_frontier_protocol: TOOL_FRONTIER_PROTOCOL,
+            mutation_tool: EXECUTE_ADDITIVE_PLAN_TOOL,
+            obligation_bound_synthesis_protocol:
+              OBLIGATION_BOUND_SYNTHESIS_PROTOCOL,
+          })
+          throw new Error(
+            `CPU_AGENT ${obligationSchemaBinding.reason} ` +
+            `state=${state.executionState}`,
+          )
+        }
+        event.tools[EXECUTE_ADDITIVE_PLAN_TOOL] = obligationSchemaBinding.tool
+      }
+
       const frontierToolNames = Object.keys(event.tools).sort()
       const frontierToolSchema = Object.fromEntries(
         frontierToolNames.map((name) => [name, event.tools[name]]),
@@ -18183,22 +20623,82 @@ export default {
 
       const elapsed = Math.max(0, nowMs() - state.turnStartedAt)
 
-      if (elapsed >= MAX_TURN_WALL_MS) {
+      const governorNowMs = nowMs()
+      const governorAdmission = resolveGovernorAdmission({
+        nowMs: governorNowMs,
+        taskStartedAt:
+          state.governorTaskStartedAt ?? state.turnStartedAt,
+        phaseStartedAt:
+          state.governorPhaseStartedAt ?? state.turnStartedAt,
+        phaseBudgetMs: MAX_TURN_WALL_MS,
+        taskBudgetMs: MAX_TURN_WALL_MS * GOVERNOR_MAX_ACTIVE_PHASES,
+        latencyProfile: state.modelLatencyProfile,
+      })
+
+      if (governorAdmission.admitted !== true) {
         await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
-          ts: nowMs(),
+          ts: governorNowMs,
           protocol: AGENT_PROTOCOL,
+          governor_protocol: GOVERNOR_LATENCY_PROTOCOL,
+          time_semantics_protocol: TIME_SEMANTICS_PROTOCOL,
+          governor_task_window_semantics:
+            GOVERNOR_TASK_WINDOW_SEMANTICS,
+          task_sla_enforced: GOVERNOR_TASK_SLA_ENFORCED,
+          product_watchdog_mode: GOVERNOR_PRODUCT_WATCHDOG_MODE,
+          production_hard_lease_promoted:
+            GOVERNOR_PRODUCTION_HARD_LEASE_PROMOTED,
+          benchmark_deadline_authority: false,
           kind: "model_blocked",
-          reason: "turn_wall_budget",
+          reason: "turn_wall_admission",
+          governor_reason: governorAdmission.reason,
+          governor_admission_policy:
+            governorAdmission.admission_policy ?? null,
+          governor_admission_blocker:
+            governorAdmission.admission_blocker ?? null,
           sessionID,
           turnID: state.turnID,
           project_root: root,
-          elapsed_ms: elapsed,
-          limit_ms: MAX_TURN_WALL_MS,
+          execution_state: state.executionState,
+          primary_execution_reason: state.executionReason ?? null,
+          repair_eligible: state.executionState === EXEC_STATE_REPAIR,
+          repair_dispatched: false,
+          repair_block_reason:
+            state.executionState === EXEC_STATE_REPAIR
+              ? governorAdmission.admission_blocker ??
+                governorAdmission.reason ??
+                "governor_admission"
+              : null,
+          governor_phase: state.governorPhase,
+          governor_base_phase_budget_ms:
+            governorAdmission.base_phase_budget_ms ?? MAX_TURN_WALL_MS,
+          governor_effective_phase_budget_ms:
+            governorAdmission.effective_phase_budget_ms ?? MAX_TURN_WALL_MS,
+          governor_latency_margin_ms:
+            governorAdmission.reserve_margin_ms ?? 0,
+          governor_required_model_window_ms:
+            governorAdmission.required_model_window_ms ?? 0,
+          governor_task_dispatch_headroom_ms:
+            governorAdmission.task_dispatch_headroom_ms ?? null,
+          governor_phase_dispatch_headroom_ms:
+            governorAdmission.phase_dispatch_headroom_ms ?? null,
+          phase_elapsed_ms: governorAdmission.phase_elapsed_ms ?? null,
+          phase_remaining_ms: governorAdmission.phase_remaining_ms ?? null,
+          task_elapsed_ms: governorAdmission.task_elapsed_ms ?? null,
+          task_remaining_ms: governorAdmission.task_remaining_ms ?? null,
+          observed_model_latency_reserve_ms:
+            governorAdmission.reserve_ms ?? 0,
+          model_latency_samples: state.modelLatencySamples ?? 0,
+          model_latency_max_ms: state.modelLatencyMaxMs ?? 0,
           model_calls: state.modelCalls,
         })
 
         throw new Error(
-          `CPU_GOVERNOR turn_wall_budget elapsed_ms=${elapsed} limit_ms=${MAX_TURN_WALL_MS}`,
+          `CPU_GOVERNOR ${governorAdmission.reason} ` +
+          `blocker=${governorAdmission.admission_blocker ?? "none"} ` +
+          `phase=${state.governorPhase} ` +
+          `phase_remaining_ms=${governorAdmission.phase_remaining_ms ?? 0} ` +
+          `task_remaining_ms=${governorAdmission.task_remaining_ms ?? 0} ` +
+          `reserve_ms=${governorAdmission.reserve_ms ?? 0}`,
         )
       }
 
@@ -18221,7 +20721,98 @@ export default {
       }
 
       state.modelCalls += 1
-      state.lastSeen = nowMs()
+      state.lastModelDispatchStartedAt = nowMs()
+      state.lastSeen = state.lastModelDispatchStartedAt
+
+
+
+      let modelViabilityCaptureControl = null
+      if (state.modelCalls === 1) {
+        try {
+          const modelViabilityCaptureControlRaw = await readFile(
+            path.resolve(
+              root,
+              ".opencode",
+              "model-viability-capture-control.json",
+            ),
+          )
+          const parsedModelViabilityCaptureControl = JSON.parse(
+            modelViabilityCaptureControlRaw.toString("utf8"),
+          )
+          if (
+            parsedModelViabilityCaptureControl?.protocol ===
+              "model-viability-capture-control-v1" &&
+            parsedModelViabilityCaptureControl?.enabled === true &&
+            typeof parsedModelViabilityCaptureControl?.nonce === "string" &&
+            /^[0-9a-f]{64}$/i.test(parsedModelViabilityCaptureControl.nonce) &&
+            typeof parsedModelViabilityCaptureControl?.expected_task_text_sha256 === "string" &&
+            /^[0-9a-f]{64}$/i.test(
+              parsedModelViabilityCaptureControl.expected_task_text_sha256,
+            ) &&
+            state.taskTextSha256 ===
+              parsedModelViabilityCaptureControl.expected_task_text_sha256
+          ) {
+            modelViabilityCaptureControl = parsedModelViabilityCaptureControl
+          }
+        } catch {
+          modelViabilityCaptureControl = null
+        }
+      }
+
+      if (modelViabilityCaptureControl !== null) {
+        const modelViabilityRequest = {
+          system: event.system ?? null,
+          messages: event.messages ?? null,
+          tools: event.tools ?? null,
+        }
+        const modelViabilityRawRequestSha256 = createHash("sha256")
+          .update(JSON.stringify(modelViabilityRequest))
+          .digest("hex")
+
+        try {
+          await writeProjectTrace(root, "model-viability-request.jsonl", {
+            ts: nowMs(),
+            protocol: "model-viability-request-capture-v1",
+            kind: "model_viability_request_capture",
+            capture_mode: "shadow_only",
+            capture_control_protocol: modelViabilityCaptureControl.protocol,
+            capture_control_nonce: modelViabilityCaptureControl.nonce,
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            providerID: event.model?.providerID ?? null,
+            modelID: event.model?.id ?? null,
+            model_call: state.modelCalls,
+            task_text_sha256: state.taskTextSha256 ?? null,
+            raw_request_sha256: modelViabilityRawRequestSha256,
+            tool_names:
+              event.tools && typeof event.tools === "object"
+                ? Object.keys(event.tools)
+                : [],
+            system: modelViabilityRequest.system,
+            messages: modelViabilityRequest.messages,
+            tools: modelViabilityRequest.tools,
+            mutation_authority: false,
+            scheduling_authority: false,
+          })
+        } catch (error) {
+          await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+            ts: nowMs(),
+            protocol: AGENT_PROTOCOL,
+            kind: "model_viability_capture_failed",
+            sessionID,
+            turnID: state.turnID,
+            project_root: root,
+            model_call: state.modelCalls,
+            reason:
+              error instanceof Error
+                ? error.message
+                : String(error),
+            mutation_authority: false,
+            scheduling_authority: false,
+          })
+        }
+      }
 
       let contextBytes = null
       let systemBytes = null
@@ -18329,8 +20920,57 @@ export default {
         tool_frontier_names: frontierToolNames,
         tool_frontier_schema_sha256: frontierToolSchemaSha256,
         execution_state: state.executionState,
+        model_context_selected_source:
+          state.executionContextSelectedSource,
+        execution_context_capsule_sha256:
+          state.executionContextCapsuleSha256,
+        execution_context_contract_sha256:
+          state.executionContextContractSha256,
+        execution_context_block_reason:
+          state.executionContextBlockReason,
+        repair_context_projection_status:
+          state.repairContextProjectionStatus,
+        repair_context_projection_reason:
+          state.repairContextProjectionReason,
+        repair_context_projection_bytes:
+          state.repairContextProjectionBytes,
+        repair_context_projection_sha256:
+          state.repairContextProjectionSha256,
+        repair_context_source_capsule_sha256:
+          state.repairContextSourceCapsuleSha256,
         execution_reason: state.executionReason,
         execution_event: state.executionEvent,
+        execution_readiness_protocol:
+          state.executionReadiness?.protocol ?? EXECUTION_READINESS_PROTOCOL,
+        execution_readiness_status:
+          state.executionReadiness?.status ?? null,
+        execution_readiness_reason:
+          state.executionReadiness?.reason ?? null,
+        execution_readiness_failure_kind:
+          state.executionReadiness?.failure_kind ?? null,
+        execution_readiness_required_mutation_shape:
+          state.executionReadiness?.required_mutation_shape ?? null,
+        execution_readiness_available_mutation_operations:
+          state.executionReadiness?.available_mutation_operations ?? [],
+        execution_readiness_mutation_authority:
+          state.executionReadiness?.mutation_authority ?? false,
+        observed_model_latency_reserve_ms: modelDispatchReserveMs(state),
+        governor_protocol: GOVERNOR_LATENCY_PROTOCOL,
+        governor_phase: state.governorPhase ?? phaseForExecutionState(state.executionState),
+        governor_phase_started_at_ms: state.governorPhaseStartedAt ?? null,
+        governor_task_started_at_ms: state.governorTaskStartedAt ?? null,
+        governor_base_phase_budget_ms: MAX_TURN_WALL_MS,
+        governor_phase_budget_ms:
+          effectivePhaseBudgetMs({
+            basePhaseBudgetMs: MAX_TURN_WALL_MS,
+            taskBudgetMs:
+              MAX_TURN_WALL_MS * GOVERNOR_MAX_ACTIVE_PHASES,
+            latencyProfile: state.modelLatencyProfile,
+          }) ?? MAX_TURN_WALL_MS,
+        governor_task_budget_ms:
+          MAX_TURN_WALL_MS * GOVERNOR_MAX_ACTIVE_PHASES,
+        model_latency_samples: state.modelLatencySamples ?? 0,
+        model_latency_max_ms: state.modelLatencyMaxMs ?? 0,
         next_action: nextActionForExecutionState(state),
         edit_capsule_path: state.editCapsulePath,
         edit_capsule_sha256: state.editCapsuleHash,
@@ -18348,6 +20988,7 @@ export default {
         turn_patch_accepted: state.patchAccepted,
         turn_evidence_bytes: state.evidenceBytes,
       })
+
     }))
 
     return async () => {

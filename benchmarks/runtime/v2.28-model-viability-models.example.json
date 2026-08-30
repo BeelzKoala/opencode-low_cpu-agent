@@ -1,0 +1,15 @@
+{
+  "protocol": "model-viability-model-matrix-v1",
+  "defaults": {
+    "timeout_s": 90,
+    "temperature": 0.0,
+    "max_tokens": 1024
+  },
+  "models": [
+    {
+      "name": "north-current-server",
+      "url": "http://127.0.0.1:8080/v1/chat/completions",
+      "model": "north-mini-code-local"
+    }
+  ]
+}

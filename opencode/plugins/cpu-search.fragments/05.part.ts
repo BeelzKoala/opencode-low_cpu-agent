@@ -1,4 +1,354 @@
 
+function rawHeaderReserveLines({
+  scanComplete,
+  discoveryComplete,
+  selectedScanComplete,
+  candidateFiles,
+  selectedFiles,
+  uniqueHits,
+  querySummary,
+}) {
+  // This is deliberately conservative.
+  //
+  // The reserve must contain every field that the real RAW header may emit.
+  // "false" is at least as long as "true", shown_hits cannot require more
+  // digits than unique_hits, and the reasons line contains the union of all
+  // RAW incomplete reasons.
+  return [
+    `SEARCH complete=false scan_complete=${scanComplete} ` +
+      `lexical_discovery_complete=${discoveryComplete} ` +
+      `selected_scan_complete=${selectedScanComplete} ` +
+      `evidence_complete=false selected_evidence_complete=false ` +
+      `candidate_files=${candidateFiles} selected_files=${selectedFiles} ` +
+      `unique_hits=${uniqueHits} shown_hits=${uniqueHits}`,
+    ...querySummary,
+    "INCOMPLETE reasons=" +
+      "lexical_discovery_incomplete,probe_subset,scan_incomplete," +
+      "budgeted_emit_subset,output_budget",
+  ]
+}
+
+function normalizePublicEvent(raw) {
+  if (raw?.payload && typeof raw.payload === "object") return raw.payload
+  return raw
+}
+
+function taskContextValueKind(value) {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+function taskContextPartTypes(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  const seen = new Set()
+  for (const part of value) {
+    const type = typeof part?.type === "string" ? part.type : taskContextValueKind(part)
+    if (seen.has(type)) continue
+    seen.add(type)
+    out.push(type)
+    if (out.length >= TASK_CONTEXT_MAX_REPORTED_PART_TYPES) break
+  }
+  return out
+}
+
+function normalizeTaskTextChunk(value, source) {
+  if (typeof value !== "string") {
+    return {
+      ok: false,
+      reason: "task_text_chunk_not_string",
+      text: "",
+      source,
+    }
+  }
+
+  const raw = value.trim()
+  if (!raw) {
+    return {
+      ok: false,
+      reason: "task_text_chunk_empty",
+      text: "",
+      source,
+    }
+  }
+
+  // OpenCode context may expose one JSON-string serialization layer.
+  // Decode exactly one layer; never recursively parse arbitrary values.
+  //
+  // Some host paths may preserve the outer JSON quotes while materializing
+  // escaped control characters as literal U+0000..U+001F characters.
+  // Strict JSON.parse rejects those. The fallback repairs ONLY those
+  // characters and then requires strict JSON.parse to succeed.
+  if (
+    source === "content_text_part_text" &&
+    raw.startsWith('"')
+  ) {
+    let decoded = null
+    let decodedSource =
+      "content_text_part_text_json_string"
+
+    try {
+      decoded = JSON.parse(raw)
+    } catch {
+      if (
+        !raw.endsWith('"') ||
+        !/[\u0000-\u001f]/u.test(raw)
+      ) {
+        return {
+          ok: false,
+          reason: "task_text_representation_invalid",
+          text: "",
+          source,
+        }
+      }
+
+      const repaired = raw.replace(
+        /[\u0000-\u001f]/gu,
+        (value) =>
+          JSON.stringify(value).slice(1, -1),
+      )
+
+      try {
+        decoded = JSON.parse(repaired)
+      } catch {
+        return {
+          ok: false,
+          reason: "task_text_representation_invalid",
+          text: "",
+          source,
+        }
+      }
+
+      decodedSource =
+        "content_text_part_text_json_string_controls_repaired"
+    }
+
+    if (typeof decoded !== "string") {
+      return {
+        ok: false,
+        reason: "task_text_representation_not_string",
+        text: "",
+        source,
+      }
+    }
+
+    const text = decoded.trim()
+
+    if (!text) {
+      return {
+        ok: false,
+        reason: "task_text_chunk_empty",
+        text: "",
+        source: decodedSource,
+      }
+    }
+
+    return {
+      ok: true,
+      reason:
+        decodedSource ===
+        "content_text_part_text_json_string"
+          ? "task_text_json_string_decoded"
+          : "task_text_json_string_controls_repaired",
+      text,
+      source: decodedSource,
+    }
+  }
+
+  return {
+    ok: true,
+    reason: "task_text_plain",
+    text: raw,
+    source,
+  }
+}
+
+function taskContextIsUserMessage(message) {
+  return (
+    message != null &&
+    typeof message === "object" &&
+    (
+      message.role === "user" ||
+      message.type === "user"
+    )
+  )
+}
+
+function extractUserMessageText(message) {
+  if (!taskContextIsUserMessage(message)) {
+    return {
+      ok: false,
+      reason: "not_user_message",
+      text: "",
+      textBytes: 0,
+      sources: [],
+      shape: null,
+    }
+  }
+
+  const chunks = []
+  const sources = []
+  const seenChunks = new Set()
+  let partBudgetExceeded = false
+  let representationFailure = null
+
+  const add = (value, source) => {
+    if (typeof value !== "string") return
+
+    const normalized = normalizeTaskTextChunk(value, source)
+
+    if (!normalized.ok) {
+      if (
+        normalized.reason === "task_text_representation_invalid" ||
+        normalized.reason === "task_text_representation_not_string"
+      ) {
+        representationFailure ??= normalized.reason
+      }
+      return
+    }
+
+    const text = normalized.text
+    if (!text || seenChunks.has(text)) return
+
+    seenChunks.add(text)
+    chunks.push(text)
+
+    if (
+      sources.length < TASK_CONTEXT_MAX_REPORTED_SOURCES &&
+      !sources.includes(normalized.source)
+    ) {
+      sources.push(normalized.source)
+    }
+  }
+
+  const readTextParts = (value, family) => {
+    if (!Array.isArray(value)) return
+
+    if (value.length > TASK_CONTEXT_MAX_PARTS) {
+      partBudgetExceeded = true
+      return
+    }
+
+    for (const part of value) {
+      if (part?.type !== "text") continue
+
+      if (family === "content") {
+        add(part?.text, "content_text_part_text")
+        add(part?.content, "content_text_part_content")
+      } else {
+        add(part?.text, "parts_text")
+        add(part?.content, "parts_content")
+      }
+    }
+  }
+
+  if (typeof message.content === "string") {
+    add(message.content, "content_string")
+  } else {
+    readTextParts(message.content, "content")
+  }
+
+  readTextParts(message.parts, "parts")
+  add(message.text, "message_text")
+
+  const shape = {
+    content_kind: taskContextValueKind(message.content),
+    content_part_types: taskContextPartTypes(message.content),
+    parts_kind: taskContextValueKind(message.parts),
+    parts_part_types: taskContextPartTypes(message.parts),
+    has_message_text: typeof message.text === "string",
+  }
+
+  if (partBudgetExceeded) {
+    return {
+      ok: false,
+      reason: "task_part_budget_exceeded",
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  if (representationFailure) {
+    return {
+      ok: false,
+      reason: representationFailure,
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  if (chunks.length < 1) {
+    return {
+      ok: false,
+      reason: "user_task_text_unavailable",
+      text: "",
+      textBytes: 0,
+      sources,
+      shape,
+    }
+  }
+
+  const text = chunks.join("\n")
+  const textBytes = Buffer.byteLength(text, "utf8")
+
+  if (textBytes > TASK_CONTEXT_MAX_TEXT_BYTES) {
+    return {
+      ok: false,
+      reason: "task_text_budget_exceeded",
+      text: "",
+      textBytes,
+      sources,
+      shape,
+    }
+  }
+
+  return {
+    ok: true,
+    reason: "task_text_observed",
+    text,
+    textBytes,
+    sources,
+    shape,
+  }
+}
+
+function classifyMutationIntent(text) {
+  const value = String(text ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
+  if (!value) return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"empty_task" }
+
+  const explicitEnglishRename = /(?:^|[.!?]\s*)(?:please\s+)?rename\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
+  const explicitEnglishChangeName = /\bchange\s+(?:the\s+)?(?:name|identifier)\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
+  const explicitRussianRename = /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?]).{1,180}?(?:\sв\s|\sна\s|->|→)/iu
+
+  if (explicitEnglishRename.test(value) || explicitEnglishChangeName.test(value) || explicitRussianRename.test(value)) {
+    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"rename_symbol", reason:"explicit_rename_with_destination" }
+  }
+
+  const lower = value.toLowerCase()
+  const negativeRename =
+    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
+    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
+    /(?:^|\s)(?:не|без)\s+переимен/iu.test(lower)
+  const incompleteImperativeRename =
+    /(?:^|[.!?]\s*)(?:please\s+)?rename\b/iu.test(value) ||
+    /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?])/iu.test(value) ||
+    /\bchange\s+(?:the\s+)?(?:name|identifier)\b/iu.test(value)
+
+  if (incompleteImperativeRename && !negativeRename) {
+    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"rename_intent_incomplete" }
+  }
+  return {
+    protocol:MUTATION_INTENT_PROTOCOL,
+    kind:"generic_edit",
+    reason: negativeRename ? "non_rename_task_with_negative_rename_constraint" : "generic_edit_task",
+  }
+}
+
 
 function userTurnSnapshotFromContext(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : []
@@ -309,6 +659,31 @@ async function subscribeEvents(ctx) {
         )
 
       if (assistantDone) {
+        const completionObservedAtMs = nowMs()
+        await writeProjectTrace(root, "cpu-agent-trace.jsonl", {
+          ts: completionObservedAtMs,
+          protocol: AGENT_PROTOCOL,
+          cost_observation_protocol: RUNTIME_COST_OBSERVATION_PROTOCOL,
+          kind: "model_completion",
+          sessionID,
+          turnID: state.turnID,
+          model_call: state.modelCalls,
+          project_root: root,
+          observed_at_ms: completionObservedAtMs,
+          message_created_at_ms:
+            Number.isFinite(info.time?.created) ? info.time.created : null,
+          message_completed_at_ms:
+            Number.isFinite(info.time?.completed) ? info.time.completed : null,
+          messageID: info.id,
+          parentID: info.parentID ?? null,
+          providerID: info.providerID ?? null,
+          modelID: info.modelID ?? null,
+          finish: info.finish ?? null,
+          error: info.error?.name ?? null,
+          mutation_authority: false,
+          scheduling_authority: false,
+        })
+
         await recordModelUsage(ctx, state, sessionID, root, {
           source: "message_updated",
           messageID: info.id,

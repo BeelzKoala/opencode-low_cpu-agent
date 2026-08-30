@@ -8,6 +8,7 @@ rust-version = "1.88"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 
 # Exact pins: upstream Rust API is not treated as stable.
 ast-grep-core = "=0.45.1"
@@ -39,6 +40,14 @@ name = "opencode-structural-index"
 path = "src/structural_index.rs"
 
 [[bin]]
+name = "opencode-context-planner"
+path = "src/context_planner.rs"
+
+[[bin]]
+name = "opencode-sealed-edit-site"
+path = "src/sealed_edit_site.rs"
+
+[[bin]]
 name = "opencode-retrieval-ranker"
 path = "src/retrieval_ranker.rs"
 
@@ -49,3 +58,7 @@ path = "src/semantic_resolver.rs"
 [[bin]]
 name = "opencode-completion-authorizer"
 path = "src/completion_authorizer.rs"
+
+[[bin]]
+name = "opencode-sealed-slice-store"
+path = "src/sealed_slice_store.rs"

@@ -873,7 +873,7 @@ print(
 )
 
 print(
-    "PASS LocalizationDecision remains sole final readiness solver"
+    "PASS LocalizationDecision remains sole localization-authority solver"
 )
 
 print(

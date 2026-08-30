@@ -1,17 +1,17 @@
 {
   "entrypoint": "opencode/plugins/cpu-search.ts",
-  "entrypoint_bytes": 572374,
-  "entrypoint_sha256": "64356075347d6072905bb1e3d7ceefb96e13d66de826c2ba6ee0c95fdefa092b",
+  "entrypoint_bytes": 672243,
+  "entrypoint_sha256": "649d83860efe5e2b0a684baef81ae45730608eca1ea80997819fa98b1d3d51c3",
   "parts": [
     {
-      "bytes": 66164,
+      "bytes": 77434,
       "path": "opencode/plugins/cpu-search.fragments/00.part.ts",
-      "sha256": "b7aeb82fb2cbb5daafc41404528071c0b3bb268cdcd80bcd24e6ebb447a92402"
+      "sha256": "6d914efd97b1483524bca67f9c44b7d6af998ff0f33e06cd1924438faf98ff06"
     },
     {
-      "bytes": 66065,
+      "bytes": 70831,
       "path": "opencode/plugins/cpu-search.fragments/01.part.ts",
-      "sha256": "8539856252570c589b4a74bcc778d86efb1cce6492e5c46cf5f2c9018ddeca78"
+      "sha256": "ffc54eb136d82dd8606423f1b18471ff4175e49948b79977bd9030f4c3c2764a"
     },
     {
       "bytes": 68701,
@@ -19,39 +19,39 @@
       "sha256": "261a501c063393e02b0e1925caf9ad579bc7479a5897a01d5d88002e89c34984"
     },
     {
-      "bytes": 69203,
+      "bytes": 65898,
       "path": "opencode/plugins/cpu-search.fragments/03.part.ts",
-      "sha256": "a02d73c8c873be882cb0565a04095073d305902a5eef78995b685b93c731bdb7"
+      "sha256": "a0d3b98eb7166a787a6160a5424960665b3383134083f2f7e1a661d7027366fb"
     },
     {
-      "bytes": 66205,
+      "bytes": 67035,
       "path": "opencode/plugins/cpu-search.fragments/04.part.ts",
-      "sha256": "74aa35572d9d5f8b001058b3d813dc29a2035077ec014390da481f73115c8cc2"
+      "sha256": "d3daa04bf0d3e01ffde335c72562c2e74affbc014f8d4394bc5d38a10053f9c9"
     },
     {
-      "bytes": 11186,
+      "bytes": 21303,
       "path": "opencode/plugins/cpu-search.fragments/05.part.ts",
-      "sha256": "8b5d497e3b792682214e930239f6b19853bf36a67c40cd66b215d45c09362a78"
+      "sha256": "97636c6621c2c8d46d1e7ac5b4809694a84f46e4aa909c1879e8b98b5349f3d8"
     },
     {
-      "bytes": 65557,
+      "bytes": 71323,
       "path": "opencode/plugins/cpu-search.fragments/06.part.ts",
-      "sha256": "ec75565d132c674ee97485ba219a40158a286b3eef7f1c5505900934371b29fb"
+      "sha256": "99b830e57287e1590004c51ab1acd90f8a148a4fa9daa14c86b3740ea248b17b"
     },
     {
-      "bytes": 65598,
+      "bytes": 76705,
       "path": "opencode/plugins/cpu-search.fragments/07.part.ts",
-      "sha256": "5db2fea6fa9f127359628d2b7282ecfaf8371d0ac949c99e273abe193f7ccc92"
+      "sha256": "84d22bd4adbbb27ac9fa68a8da2c604d8dd72e1ce23f00e61bd7af703dd498e8"
     },
     {
-      "bytes": 65550,
+      "bytes": 72349,
       "path": "opencode/plugins/cpu-search.fragments/08.part.ts",
-      "sha256": "6d01627b0724410409b5e6a1d308ccc668647f2e816169d550482ad035ce92d2"
+      "sha256": "7494522ca4bf04ad60a33e46d24249831923615a1d0a6a87543a5835db8e0340"
     },
     {
-      "bytes": 28145,
+      "bytes": 80664,
       "path": "opencode/plugins/cpu-search.fragments/09.part.ts",
-      "sha256": "1a0315921cbd108b68a35fd66099fb638a116d677d5d527b8f059b604aa395b6"
+      "sha256": "09c2e79b85f3091bbabdb0eb0c9c52092b5c377f4bb9f7d052147b1b1511bb9a"
     }
   ],
   "protocol": "cpu-search-fragments-v1",

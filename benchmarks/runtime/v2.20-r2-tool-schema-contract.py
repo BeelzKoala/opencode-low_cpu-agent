@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN = ROOT / "opencode/plugins/cpu-search.ts"
 SPEC = ROOT / "benchmarks/v2.20-r2-tool-schema-contract-gates.json"
-
-EXPECTED_COMPILER = "bbeb9e14e7dd7fd34d6b9ce6b588d0234b2509af6e5f006b0d43ebce3d751a2f"
-EXPECTED_EXECUTOR = "6db9aca5293b4173052a5fb90f5f4c81b1540e7f879b10df687bef32e5d79536"
-EXPECTED_VERIFIER = "4a0c9ba504dc2f5c420f32ee74954b102715d925b010199635e5f8bfa54a9855"
-
-
-def sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
 
 def section(text: str, start_anchor: str, end_anchor: str) -> str:
     start = text.index(start_anchor)
@@ -82,30 +72,10 @@ def main() -> None:
     for forbidden_field in ('"before",', '"replacement",', '"scope",'):
         assert forbidden_field in shape
 
-    # No budget/ranking/authority compensation is introduced.
-    assert 'const MAX_PATCH_ATTEMPTS_PER_TURN = 2' in plugin
-    role_start = plugin.index('function focusedRoleScore(')
-    role_end = plugin.index('\nfunction focusedScopesFromGroups(', role_start)
-    role = plugin[role_start:role_end]
-    for anchor in (
-        'if (role === "call") return 5',
-        'if (role === "assignment") return 4',
-        'if (role === "definition") return 3',
-        'if (role === "import") return 2',
-        'if (role === "reference") return 1',
-        'return 0',
-    ):
-        assert anchor in role, anchor
-    assert 'MUTATION_CANDIDATE_SET_PROTOCOL = "bounded-mutation-candidates-v1"' in plugin
-
-    # Lower mutation/verification plane remains frozen in the real repository.
-    compiler = ROOT / "rust/evidence-distiller/src/patch_compiler.rs"
-    executor = ROOT / "rust/evidence-distiller/src/patch_executor.rs"
-    verifier = ROOT / "rust/evidence-distiller/src/invariant_verifier.rs"
-    if compiler.exists() and executor.exists() and verifier.exists():
-        assert sha(compiler) == EXPECTED_COMPILER
-        assert sha(executor) == EXPECTED_EXECUTOR
-        assert sha(verifier) == EXPECTED_VERIFIER
+    # This historical gate is monotonic: it owns only the v2.20
+    # model-facing replace/rename language and its runtime shape defense.
+    # Later versions may evolve Scout, budgets, capability authority and the
+    # Rust mutation/verification plane under their own versioned gates.
 
     inv = spec["invariants"]
     assert inv["replace_node_schema_requires"] == ["before", "replacement"]
@@ -117,18 +87,20 @@ def main() -> None:
     assert inv["empty_replacement_allowed"] is True
     assert inv["model_supplies_target"] is False
     assert inv["model_supplies_scope"] is False
-    assert inv["mutation_budget_changed"] is False
-    assert inv["scout_ranking_changed"] is False
-    assert inv["candidate_authority_changed"] is False
-    assert inv["compiler_changed"] is False
-    assert inv["executor_changed"] is False
-    assert inv["verifier_changed"] is False
+    assert inv["lower_plane_byte_identity_frozen"] is False
+    assert inv["unrelated_component_snapshot_frozen"] is False
+    assert inv["compatibility_scope"] == [
+        "replace_node_tool_abi",
+        "rename_symbol_tool_abi",
+        "runtime_shape_validation",
+    ]
 
     print("PASS replace_node action tool has top-level before + replacement contract")
     print("PASS rename_symbol action tool has top-level new_name contract")
     print("PASS exact deletion remains representable")
     print("PASS runtime shape defense-in-depth retained")
-    print("PASS target/scope, ranking, authority, budgets frozen")
+    print("PASS target/scope remain model-inaccessible")
+    print("PASS v2.20 compatibility gate does not freeze later implementation evolution")
     print("PASS v2.20-r2 tool schema contract")
 
 

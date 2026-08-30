@@ -9,6 +9,52 @@ quick() {
   git diff --cached --check
   python3 scripts/build-plugin.py --check
   python3 scripts/check-interface-freeze.py
+  python3 scripts/check-plugin-import-closure.py \
+    --plugin-root opencode/plugins \
+    --entry cpu-search.ts \
+    --manifest scripts/install-plugin-stack.sh
+  node benchmarks/runtime/v2.28-e2.0-bounded-additive-governor.mjs
+  node benchmarks/runtime/v2.28-e2.0-r11-governor-admission-headroom.mjs
+  node benchmarks/runtime/v2.28-e2.1-coherence.mjs
+  node benchmarks/runtime/v2.28-e2.5-additive-v1-compat.mjs
+  node benchmarks/runtime/v2.28-e2.2-empty-transaction-repair.mjs
+  node benchmarks/runtime/v2.28-e2.2-r12-multi-anchor-context.mjs
+  node benchmarks/runtime/v2.28-e2.2-plugin-source-integrity.mjs
+  python3 benchmarks/runtime/v2.28-e2.2-mutation-frontier-replay.py --self-test
+  node benchmarks/runtime/v2.28-e2.3-a-one-call-executor.mjs
+  node benchmarks/runtime/v2.28-e2.4-a-deterministic-context-carrier.mjs
+  node benchmarks/runtime/v2.28-e2.5-sealed-additive-site.mjs
+  node benchmarks/runtime/v2.28-e2.5-r2.1-current-python-mutation-compiler.mjs
+  node benchmarks/runtime/v2.28-e2.6-r5-r1-evidence-context-compiler.mjs
+  node benchmarks/runtime/v2.28-e2.6-r5-r1.1-execution-contract-equivalence.mjs
+  node benchmarks/runtime/v2.28-e2.6-r5-r1.2-compact-critical-evidence.mjs
+  node benchmarks/runtime/v2.28-e2.6-r5-context-planner-foundation.mjs
+  node benchmarks/runtime/v2.28-e2.7-a-repair-truth-plane.mjs
+  node benchmarks/runtime/v2.28-e2.7-b-repair-convergence.mjs
+  node benchmarks/runtime/v2.28-e2.8-obligation-bound-synthesis.mjs
+  python3 benchmarks/runtime/v2.28-e2.9-time-semantics.py
+  python3 benchmarks/runtime/v2.28-e2.7-c-timeout-contract.py
+  python3 benchmarks/runtime/v2.28-model-viability-gate.py
+python3 benchmarks/runtime/v2.28-model-viability-prompt-equivalence.py
+python3 benchmarks/runtime/v2.28-inference-viability-ladder-gate.py
+  node benchmarks/runtime/v2.28-e2.5-r4-r3-host-bound-obligation-coverage.mjs
+  node --check benchmarks/runtime/runtime-cost-reducer-v2.mjs
+  node --check benchmarks/runtime/runtime-cost-backfill-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3a-r3-operational-cost-reducer.mjs
+  python3 -m py_compile benchmarks/runtime/v2.17-real-task.py
+  node --check benchmarks/runtime/runtime-cost-profile-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3b1-persistent-cost-profile.mjs
+  node --check benchmarks/runtime/runtime-cost-admission-evidence-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3b2a-admission-evidence.mjs
+  node --check benchmarks/runtime/runtime-cost-deadline-index-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3b2a2-deadline-risk-certificate.mjs
+  node --check benchmarks/runtime/runtime-cost-prequential-replay-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3b2a3-prequential-policy-replay.mjs
+  node --check benchmarks/runtime/execution-lease-v1.mjs
+  node --check benchmarks/runtime/synthetic-http-cancellation-probe-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3c-a-execution-lease-cancellation-probe.mjs
+  node --check benchmarks/runtime/llama-server-cancellation-probe-v1.mjs
+  node benchmarks/runtime/v2.28-e2.5-r3c-a2-llama-cancellation-probe.mjs
   python3 benchmarks/runtime/v2.25-stabilization-action-routing.py
   python3 benchmarks/runtime/v2.25-task-context-v1.py
   python3 benchmarks/runtime/v2.27-task-action-fastpath.py
@@ -32,6 +78,9 @@ quick() {
   python3 benchmarks/runtime/v2.28-e1.4-r3-route-conditioned-frontier.py
   python3 benchmarks/runtime/v2.28-e1.4-r4-reverse-include-witnesses.py
   python3 benchmarks/runtime/v2.28-e1.5-task-bound-localization-layer.py
+  python3 benchmarks/runtime/v2.28-e1.6-data-capability-localization.py
+  node benchmarks/runtime/v2.28-e1.7-scout-evidence-closure.mjs
+  node benchmarks/runtime/v2.28-e1.8-execution-readiness.mjs
   python3 scripts/check-plugin-import-closure.py --plugin-root opencode/plugins --entry cpu-search.ts --manifest scripts/install-plugin-stack.sh
   python3 benchmarks/corpus/v1/check.py
   python3 benchmarks/corpus/v2/check.py
@@ -67,6 +116,15 @@ quick() {
   node --check opencode/plugins/cpu-search-core/task-search-plan-v1.mjs
   node --check opencode/plugins/cpu-search-core/action-commit-v1.mjs
   node --check opencode/plugins/cpu-search-core/terminal-commit-v1.mjs
+  node --check opencode/plugins/cpu-search-core/execution-readiness-v1.mjs
+  node --check opencode/plugins/cpu-search-core/additive-mutation-v1.mjs
+  node --check opencode/plugins/cpu-search-core/additive-mutation-v2.mjs
+  node --check opencode/plugins/cpu-search-core/additive-mutation-v3.mjs
+  node --check opencode/plugins/cpu-search-core/python-additive-compiler-v1.mjs
+  node --check opencode/plugins/cpu-search-core/sealed-additive-site-v1.mjs
+  node --check opencode/plugins/cpu-search-core/governor-latency-v1.mjs
+  node --check opencode/plugins/cpu-search-core/scout-evidence-closure-v1.mjs
+  node --check opencode/plugins/cpu-search-core/execution-readiness-v1.mjs
   bash -n scripts/install-plugin-stack.sh
   echo "PASS ci quick"
 }

@@ -1,3 +1,4 @@
+use opencode_evidence_distiller::crypto_hash::sha256_file;
 use anyhow::{Context, Result};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 use opencode_evidence_distiller::impact_index_core::{
@@ -28,10 +29,14 @@ const COMPILER_PROTOCOL: &str = "patch-compiler-v2";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
 const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
+const ADDITIVE_CAPABILITY_PROTOCOL: &str = "scout-additive-capability-v1";
 const MUTATION_CONFINEMENT_PROTOCOL: &str = "mutation-slice-v1";
 const MAX_STRUCTURAL_SLICE_NODES: usize = 16;
-const MAX_CHANGED_FILES: usize = 2;
-const MAX_EDITS: usize = 4;
+const MAX_CHANGED_FILES: usize = 5;
+const LEGACY_MAX_CHANGED_FILES: usize = 2;
+const MAX_EDITS: usize = 8;
+const LEGACY_MAX_EDITS: usize = 4;
+const ADDITIVE_MAX_CREATE_DEPTH: usize = 2;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +62,8 @@ struct Mutation {
     replacement: Option<String>,
     #[serde(default)]
     new_name: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +107,8 @@ struct ScoutHandoff {
     #[serde(default)]
     capability: Option<LocalMutationCapability>,
     #[serde(default)]
+    additive_capability: Option<AdditiveMutationCapability>,
+    #[serde(default)]
     files: Vec<HandoffFile>,
 }
 
@@ -116,9 +125,55 @@ struct LocalMutationTarget {
     symbol_name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveMutationCapability {
+    protocol: String,
+    operation: String,
+    #[serde(default)]
+    existing_slots: Vec<AdditiveExistingSlot>,
+    #[serde(default)]
+    create_slots: Vec<AdditiveCreateSlot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveExistingSlot {
+    slot: String,
+    file: String,
+    sha256: String,
+    #[serde(default)]
+    evidence_lines: Vec<usize>,
+    #[serde(default)]
+    allowed_operations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveCreateSlot {
+    slot: String,
+    root: String,
+    source_file: String,
+    source_sha256: String,
+    #[serde(default)]
+    allowed_extensions: Vec<String>,
+    max_depth: usize,
+    #[serde(default)]
+    allowed_operations: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HandoffFile {
     file: String,
+    #[serde(default)]
+    fingerprint: Option<Fingerprint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Fingerprint {
+    kind: String,
+    strong: bool,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    evidence_fresh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -315,21 +370,95 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
         .context("handoff_json_invalid")
 }
 
+fn extension_with_dot(rel: &str) -> Option<String> {
+    let ext = Path::new(rel).extension()?.to_str()?;
+    if ext.is_empty() { None } else { Some(format!(".{ext}").to_ascii_lowercase()) }
+}
+
+fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
+    if slot.slot.is_empty()
+        || !slot.allowed_operations.iter().any(|op| op == "create_file")
+        || slot.max_depth == 0
+        || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
+    {
+        return false;
+    }
+    let Some(root) = safe_rel(&slot.root) else { return false; };
+    let Some(file) = safe_rel(rel) else { return false; };
+    let prefix = format!("{root}/");
+    let Some(local) = file.strip_prefix(&prefix) else { return false; };
+    if local.is_empty() || local.split('/').count() > slot.max_depth { return false; }
+    let Some(ext) = extension_with_dot(&file) else { return false; };
+    slot.allowed_extensions.iter().any(|value| value.eq_ignore_ascii_case(&ext))
+}
+
+fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
+    let Some(capability) = handoff.additive_capability.as_ref() else {
+        return Err("additive_capability_invalid");
+    };
+    if handoff.capability_protocol.as_deref() != Some(ADDITIVE_CAPABILITY_PROTOCOL)
+        || capability.protocol != ADDITIVE_CAPABILITY_PROTOCOL
+        || capability.operation != "additive_surface"
+        || capability.existing_slots.is_empty()
+        || capability.existing_slots.len() > MAX_CHANGED_FILES.saturating_sub(1)
+        || capability.create_slots.is_empty()
+        || capability.create_slots.len() > 2
+        || !handoff.allowed_mutations.iter().any(|value| value == "replace_exact")
+        || !handoff.allowed_mutations.iter().any(|value| value == "create_file")
+    {
+        return Err("additive_capability_invalid");
+    }
+    let files = handoff.files.iter().filter_map(|row| {
+        safe_rel(&row.file).map(|rel| (rel, row))
+    }).collect::<BTreeMap<_, _>>();
+    for slot in &capability.existing_slots {
+        let Some(rel) = safe_rel(&slot.file) else { return Err("additive_existing_slot_invalid"); };
+        let Some(row) = files.get(&rel) else { return Err("additive_existing_slot_invalid"); };
+        let Some(fingerprint) = row.fingerprint.as_ref() else { return Err("additive_existing_slot_invalid"); };
+        if slot.slot.is_empty()
+            || slot.sha256.len() != 64
+            || !slot.sha256.chars().all(|c| c.is_ascii_hexdigit())
+            || slot.evidence_lines.is_empty()
+            || !slot.allowed_operations.iter().any(|op| op == "replace_exact")
+            || fingerprint.kind != "sha256"
+            || !fingerprint.strong
+            || fingerprint.evidence_fresh != Some(true)
+            || fingerprint.sha256.as_deref().map(|value| value.eq_ignore_ascii_case(&slot.sha256)) != Some(true)
+        {
+            return Err("additive_existing_slot_invalid");
+        }
+    }
+    for slot in &capability.create_slots {
+        let Some(source) = safe_rel(&slot.source_file) else { return Err("additive_create_slot_invalid"); };
+        let Some(root) = safe_rel(&slot.root) else { return Err("additive_create_slot_invalid"); };
+        let Some(row) = files.get(&source) else { return Err("additive_create_slot_invalid"); };
+        let Some(fingerprint) = row.fingerprint.as_ref() else { return Err("additive_create_slot_invalid"); };
+        if slot.slot.is_empty()
+            || slot.source_sha256.len() != 64
+            || !slot.source_sha256.chars().all(|c| c.is_ascii_hexdigit())
+            || slot.allowed_extensions.is_empty()
+            || slot.max_depth == 0
+            || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
+            || !slot.allowed_operations.iter().any(|op| op == "create_file")
+            || Path::new(&source).parent().and_then(normalize_rel).as_deref() != Some(root.as_str())
+            || fingerprint.kind != "sha256"
+            || !fingerprint.strong
+            || fingerprint.evidence_fresh != Some(true)
+            || fingerprint.sha256.as_deref().map(|value| value.eq_ignore_ascii_case(&slot.source_sha256)) != Some(true)
+        {
+            return Err("additive_create_slot_invalid");
+        }
+    }
+    Ok(())
+}
+
 fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
     match handoff.scope_mode.as_deref() {
         None => Ok(()),
         Some("local_mutation_capability") => {
-            let Some(capability) = handoff.capability.as_ref() else {
-                return Err("local_capability_invalid");
-            };
-            let Some(target_file) = safe_rel(&capability.target.file) else {
-                return Err("local_capability_invalid");
-            };
-            let Some(handoff_file) = handoff
-                .files
-                .first()
-                .and_then(|value| safe_rel(&value.file))
-            else {
+            let Some(capability) = handoff.capability.as_ref() else { return Err("local_capability_invalid"); };
+            let Some(target_file) = safe_rel(&capability.target.file) else { return Err("local_capability_invalid"); };
+            let Some(handoff_file) = handoff.files.first().and_then(|value| safe_rel(&value.file)) else {
                 return Err("local_capability_invalid");
             };
             if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
@@ -345,28 +474,39 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
             }
             Ok(())
         }
+        Some("additive_mutation_capability") => validate_additive_handoff(handoff),
         Some(_) => Err("handoff_scope_mode_invalid"),
     }
 }
 
+
 fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool {
     match handoff.scope_mode.as_deref() {
         Some("local_mutation_capability") => {
-            let Some(capability) = handoff.capability.as_ref() else {
-                return false;
-            };
-            handoff
-                .allowed_mutations
-                .iter()
-                .any(|value| value == &mutation.kind)
+            let Some(capability) = handoff.capability.as_ref() else { return false; };
+            handoff.allowed_mutations.iter().any(|value| value == &mutation.kind)
                 && capability.operation == mutation.kind
                 && capability.target.symbol_name == mutation.symbol
                 && safe_rel(&capability.target.file) == safe_rel(&mutation.file)
+        }
+        Some("additive_mutation_capability") => {
+            let Some(capability) = handoff.additive_capability.as_ref() else { return false; };
+            if mutation.symbol != "<additive>" { return false; }
+            let Some(rel) = safe_rel(&mutation.file) else { return false; };
+            match mutation.kind.as_str() {
+                "replace_exact" => capability.existing_slots.iter().any(|slot| {
+                    safe_rel(&slot.file).as_deref() == Some(rel.as_str())
+                        && slot.allowed_operations.iter().any(|op| op == "replace_exact")
+                }),
+                "create_file" => capability.create_slots.iter().any(|slot| additive_create_slot_allows(slot, &rel)),
+                _ => false,
+            }
         }
         None => true,
         Some(_) => false,
     }
 }
+
 
 fn run_git(root: &Path, args: &[&str]) -> Result<()> {
     let out = Command::new("git")
@@ -532,14 +672,18 @@ fn replay_file(
     let mut current = source.to_string();
     let mut original_ranges = Vec::new();
     for edit in edits {
+        if edit.kind == "create_file" {
+            if !current.is_empty() || !edit.before.is_empty() || edit.after.is_empty() || edit.confinement.is_some() {
+                return Err("edit_contract_invalid");
+            }
+            current = edit.after.clone();
+            continue;
+        }
         if edit.before == edit.after {
             return Err("edit_contract_invalid");
         }
         if edit.kind == "replace_slice" {
-            let confinement = edit
-                .confinement
-                .as_ref()
-                .ok_or("slice_certificate_missing")?;
+            let confinement = edit.confinement.as_ref().ok_or("slice_certificate_missing")?;
             if confinement.protocol != MUTATION_CONFINEMENT_PROTOCOL
                 || confinement.start_byte >= confinement.end_byte
                 || confinement.owner_start > confinement.start_byte
@@ -569,6 +713,7 @@ fn replay_file(
     }
     Ok((current, original_ranges))
 }
+
 
 fn parse_ok(path: &Path, source: &str) -> bool {
     let Some(lang) = SupportLang::from_path(path) else {
@@ -1102,6 +1247,39 @@ fn verify(request: &Request) -> Result<Response> {
             Some(reason.to_string()),
         ));
     }
+    let additive_scope = handoff.scope_mode.as_deref() == Some("additive_mutation_capability");
+    if additive_scope {
+        let capability = handoff.additive_capability.as_ref().expect("validated additive capability");
+        for slot in &capability.existing_slots {
+            let Some(rel) = safe_rel(&slot.file) else {
+                return Ok(Response::finish(started, Vec::new(), checks, true, Some("additive_existing_slot_invalid".to_string())));
+            };
+            let actual = sha256_file(&root.join(&rel)).ok();
+            if actual.as_deref().map(|value| value.eq_ignore_ascii_case(&slot.sha256)) != Some(true) {
+                return Ok(Response::finish(started, Vec::new(), checks, true, Some("additive_existing_source_stale".to_string())));
+            }
+        }
+        for slot in &capability.create_slots {
+            let Some(source) = safe_rel(&slot.source_file) else {
+                return Ok(Response::finish(started, Vec::new(), checks, true, Some("additive_create_slot_invalid".to_string())));
+            };
+            let actual = sha256_file(&root.join(&source)).ok();
+            if actual.as_deref().map(|value| value.eq_ignore_ascii_case(&slot.source_sha256)) != Some(true) {
+                return Ok(Response::finish(started, Vec::new(), checks, true, Some("additive_create_source_stale".to_string())));
+            }
+        }
+    }
+    if !additive_scope
+        && (request.edits.len() > LEGACY_MAX_EDITS || request.changed_files.len() > LEGACY_MAX_CHANGED_FILES)
+    {
+        return Ok(Response::finish(
+            started,
+            Vec::new(),
+            checks,
+            true,
+            Some("verification_contract_invalid".to_string()),
+        ));
+    }
     for mutation in &request.mutations {
         if !handoff_allows_mutation(&handoff, mutation) {
             return Ok(Response::finish(
@@ -1155,9 +1333,27 @@ fn verify(request: &Request) -> Result<Response> {
         .iter()
         .filter_map(|e| safe_rel(&e.file))
         .collect::<BTreeSet<_>>();
+    let created_files = request
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.kind == "create_file")
+        .filter_map(|mutation| safe_rel(&mutation.file))
+        .collect::<BTreeSet<_>>();
+    let authorized_created = handoff
+        .additive_capability
+        .as_ref()
+        .map(|capability| {
+            created_files.iter().filter(|file| {
+                capability.create_slots.iter().any(|slot| additive_create_slot_allows(slot, file))
+            }).cloned().collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut authorized_changed = allowed.clone();
+    authorized_changed.extend(authorized_created.iter().cloned());
     if changed.len() != request.changed_files.len()
         || changed != edit_files
-        || !changed.is_subset(&allowed)
+        || !changed.is_subset(&authorized_changed)
+        || created_files != authorized_created
     {
         return Ok(Response::finish(
             started,
@@ -1259,17 +1455,30 @@ fn verify(request: &Request) -> Result<Response> {
     let mut edit_ranges = BTreeMap::<String, Vec<(usize, usize)>>::new();
     for file in &changed {
         let path = root.join(file);
-        let meta = fs::metadata(&path).context("changed_file_unavailable")?;
-        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-            return Ok(Response::finish(
-                started,
-                changed.iter().cloned().collect(),
-                checks,
-                true,
-                Some("changed_file_invalid".to_string()),
-            ));
-        }
-        let source = fs::read_to_string(&path).context("changed_file_not_utf8")?;
+        let source = if created_files.contains(file) {
+            if path.exists() {
+                return Ok(Response::finish(
+                    started,
+                    changed.iter().cloned().collect(),
+                    checks,
+                    true,
+                    Some("create_target_exists".to_string()),
+                ));
+            }
+            String::new()
+        } else {
+            let meta = fs::metadata(&path).context("changed_file_unavailable")?;
+            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+                return Ok(Response::finish(
+                    started,
+                    changed.iter().cloned().collect(),
+                    checks,
+                    true,
+                    Some("changed_file_invalid".to_string()),
+                ));
+            }
+            fs::read_to_string(&path).context("changed_file_not_utf8")?
+        };
         let file_edits = request
             .edits
             .iter()
@@ -1300,6 +1509,12 @@ fn verify(request: &Request) -> Result<Response> {
     )?;
     let verification = (|| -> Result<Option<String>> {
         for file in &changed {
+            if created_files.contains(file) {
+                if wt.join(file).exists() {
+                    return Ok(Some("worktree_create_target_exists".to_string()));
+                }
+                continue;
+            }
             let wt_source =
                 fs::read_to_string(wt.join(file)).context("worktree_file_unavailable")?;
             if wt_source != before[file] {
@@ -1312,6 +1527,12 @@ fn verify(request: &Request) -> Result<Response> {
         run_git(&wt, &["apply", "--check", &patch_s])?;
         run_git(&wt, &["apply", &patch_s])?;
         let _ = fs::remove_file(&patch_file);
+        if !created_files.is_empty() {
+            for file in &created_files {
+                let file_s = file.as_str();
+                run_git(&wt, &["add", "-N", "--", file_s])?;
+            }
+        }
         let diff_names = run_git_output(&wt, &["diff", "--name-only", "--no-ext-diff"], false)?
             .lines()
             .filter_map(|line| safe_rel(line.trim()))
@@ -1366,8 +1587,11 @@ fn verify(request: &Request) -> Result<Response> {
                 detail: Some(validity.detail()),
             });
 
-            let top_pass =
-                top_level_conserved(&root.join(file), &before[file], &actual, &edit_ranges[file]);
+            let top_pass = if created_files.contains(file) {
+                true
+            } else {
+                top_level_conserved(&root.join(file), &before[file], &actual, &edit_ranges[file])
+            };
             checks.push(Check {
                 kind: "top_level_conservation".to_string(),
                 pass: top_pass,
@@ -1420,6 +1644,36 @@ fn verify(request: &Request) -> Result<Response> {
                 });
             }
 
+            if mutation.kind == "replace_exact" {
+                let matching = request.edits.iter().filter(|edit| {
+                    safe_rel(&edit.file).as_deref() == Some(file.as_str())
+                        && edit.kind == "replace_exact"
+                        && edit.confinement.is_none()
+                        && mutation.before.as_deref() == Some(edit.before.as_str())
+                        && mutation.replacement.as_deref() == Some(edit.after.as_str())
+                }).count();
+                checks.push(Check {
+                    kind: "additive_mutation_binding".to_string(),
+                    pass: matching == 1,
+                    file: Some(file.clone()),
+                    detail: Some(format!("kind=replace_exact matching_edits={matching}")),
+                });
+            } else if mutation.kind == "create_file" {
+                let matching = request.edits.iter().filter(|edit| {
+                    safe_rel(&edit.file).as_deref() == Some(file.as_str())
+                        && edit.kind == "create_file"
+                        && edit.confinement.is_none()
+                        && edit.before.is_empty()
+                        && mutation.content.as_deref() == Some(edit.after.as_str())
+                }).count();
+                checks.push(Check {
+                    kind: "additive_mutation_binding".to_string(),
+                    pass: matching == 1,
+                    file: Some(file.clone()),
+                    detail: Some(format!("kind=create_file matching_edits={matching}")),
+                });
+            }
+
             let before_defs = definition_count(&root.join(&file), before_src, &mutation.symbol);
             let target_pass = match mutation.kind.as_str() {
                 "rename_symbol" => match mutation.new_name.as_deref() {
@@ -1433,6 +1687,17 @@ fn verify(request: &Request) -> Result<Response> {
                 "replace_body" | "replace_expr" | "replace_node" => {
                     before_defs == 1
                         && definition_count(&wt.join(&file), &after_src, &mutation.symbol) == 1
+                }
+                "replace_exact" => mutation.before.as_deref().map(|before| {
+                    unique_pos(before_src, before).is_some()
+                        && after_src.as_str() != before_src.as_str()
+                }).unwrap_or(false),
+                "create_file" => {
+                    created_files.contains(&file)
+                        && before_src.is_empty()
+                        && mutation.content.as_deref()
+                            .map(|content| content == after_src.as_str())
+                            .unwrap_or(false)
                 }
                 _ => false,
             };

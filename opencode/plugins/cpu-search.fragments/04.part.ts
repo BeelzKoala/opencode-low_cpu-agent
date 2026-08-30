@@ -1,4 +1,342 @@
 
+function selectFairReservedFiles(rankedFiles, queryResults, limit) {
+  const selected = new Set()
+  const coveredQueries = new Set()
+  const activeQueries = (queryResults ?? [])
+    .map((result) => ({
+      queryIndex: result.queryIndex,
+      files: Array.isArray(result?.files)
+        ? [...new Set(result.files)]
+        : [...new Set((result?.matches ?? []).map((match) => match.file))],
+    }))
+    .filter((result) => result.files.length > 0)
+    .sort((a, b) => a.files.length - b.files.length || a.queryIndex - b.queryIndex)
+
+  for (const result of activeQueries) {
+    if (selected.size >= limit) break
+    if (coveredQueries.has(result.queryIndex)) continue
+    const fileKeys = new Set(result.files.map((file) => evidenceFileKey(file)))
+    const candidate = rankedFiles.find(
+      (entry) => fileKeys.has(evidenceFileKey(entry.file)) && !selected.has(entry.file),
+    )
+    if (!candidate) continue
+    selected.add(candidate.file)
+    for (const queryIndex of candidate.queries ?? []) coveredQueries.add(queryIndex)
+  }
+
+  return rankedFiles.filter((entry) => selected.has(entry.file))
+}
+
+function bestStructuralProbeCandidate(probedFiles) {
+  return (probedFiles ?? []).find(
+    (entry) =>
+      Number.isInteger(entry?.probeDefinitionHints) &&
+      entry.probeDefinitionHints > 0,
+  ) ?? null
+}
+
+function impactEmitEntry(entry) {
+  const primary = entry.relations?.[0] ?? {}
+  const sample = entry.validationKind === "forward_scope_definition"
+    ? entry.declarationMatches?.[0]
+    : entry.reverseUsageMatches?.[0]
+  return {
+    file: entry.file,
+    origin: "impact",
+    queries: new Set(entry.queries ?? []),
+    coverage: 0,
+    pathAffinity: 0,
+    rarity: 0,
+    impact: {
+      seed: primary.seed ?? null,
+      direction: entry.validationKind === "forward_scope_definition" ? "forward" : "reverse",
+      kind: primary.kind ?? null,
+      bindings: entry.displayBindings ?? [],
+      validationKind: entry.validationKind,
+      sample: sample ?? null,
+    },
+  }
+}
+
+function selectEmitFilesWithImpact(probedFiles, discoveryResults, validatedImpact) {
+  const selected = []
+  const selectedKeys = new Set()
+
+  const reserve = selectFairReservedFiles(
+    probedFiles,
+    discoveryResults,
+    EMIT_MAX_FILES,
+  )
+
+  for (const entry of reserve) {
+    if (selected.length >= EMIT_MAX_FILES) break
+    selected.push({ ...entry, origin: "lexical" })
+    selectedKeys.add(evidenceFileKey(entry.file))
+  }
+
+  // Direct lexical structural evidence has precedence over graph-derived
+  // auxiliary context. The candidate is chosen from the existing post-probe
+  // relevance order; this adds no new relevance score.
+  //
+  // This is only a routing reservation. probeDefinitionHints is never treated
+  // as proof of ownership; downstream distiller/source validation must still
+  // establish the actual structural owner before mutation authority exists.
+  const structuralCandidate =
+    bestStructuralProbeCandidate(probedFiles)
+
+  if (
+    structuralCandidate &&
+    selected.length < EMIT_MAX_FILES
+  ) {
+    const key =
+      evidenceFileKey(structuralCandidate.file)
+
+    if (!selectedKeys.has(key)) {
+      selected.push({
+        ...structuralCandidate,
+        origin: "lexical",
+      })
+      selectedKeys.add(key)
+    }
+  }
+
+  let impactEmitted = 0
+  for (const entry of validatedImpact ?? []) {
+    if (selected.length >= EMIT_MAX_FILES || impactEmitted >= IMPACT_GRAPH_EMIT_MAX_FILES) break
+    const key = evidenceFileKey(entry.file)
+    if (selectedKeys.has(key)) continue
+    selected.push(impactEmitEntry(entry))
+    selectedKeys.add(key)
+    impactEmitted += 1
+  }
+
+  for (const entry of probedFiles ?? []) {
+    if (selected.length >= EMIT_MAX_FILES) break
+    const key = evidenceFileKey(entry.file)
+    if (selectedKeys.has(key)) continue
+    selected.push({ ...entry, origin: "lexical" })
+    selectedKeys.add(key)
+  }
+
+  return selected
+}
+
+function impactEvidenceFactsForSelected(selectedFiles) {
+  const facts = new Set()
+  for (const entry of selectedFiles ?? []) {
+    if (entry?.origin !== "impact") continue
+    const sample = entry?.impact?.sample
+    if (typeof entry?.file === "string" && Number.isInteger(sample?.line)) {
+      facts.add(hitLineFact(entry.file, sample.line))
+    }
+  }
+  return facts
+}
+
+function integerList(values) {
+  if (!Array.isArray(values)) return null
+
+  const result = [...new Set(values)]
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b)
+
+  return result.length > 0 ? result : null
+}
+
+function lineList(values) {
+  const lines = integerList(values)
+  return lines ? lines.join(",") : "-"
+}
+
+function queryLabels(values) {
+  const queries = integerList(values)
+  return queries ? queries.map((value) => `Q${value}`).join(",") : null
+}
+
+function validateEvidenceGroup(group) {
+  if (
+    typeof group?.file !== "string" ||
+    typeof group?.symbol_kind !== "string" ||
+    typeof group?.symbol_name !== "string" ||
+    typeof group?.role !== "string" ||
+    typeof group?.node_kind !== "string" ||
+    typeof group?.match_text !== "string" ||
+    typeof group?.anchor !== "string" ||
+    !Number.isInteger(group?.start_line) ||
+    !Number.isInteger(group?.end_line) ||
+    !Number.isInteger(group?.hit_count) ||
+    group.hit_count < 1 ||
+    !queryLabels(group?.queries) ||
+    !Array.isArray(group?.hit_lines) ||
+    !Array.isArray(group?.variants) ||
+    group.variants.length < 1
+  ) {
+    return false
+  }
+
+  let variantHits = 0
+
+  for (const variant of group.variants) {
+    if (
+      typeof variant?.subject_text !== "string" ||
+      typeof variant?.statement_text !== "string" ||
+      !Number.isInteger(variant?.hit_count) ||
+      variant.hit_count < 1 ||
+      !queryLabels(variant?.queries) ||
+      !Array.isArray(variant?.hit_lines)
+    ) {
+      return false
+    }
+
+    variantHits += variant.hit_count
+  }
+
+  return variantHits === group.hit_count
+}
+
+async function renderHybridEvidence(root, groups, bodyBudgetBytes) {
+  const core = []
+  const facts = new Set()
+  let coreBytes = 0
+
+  function pushCore(line) {
+    const cost = bytes(line + "\n")
+    if (coreBytes + cost > bodyBudgetBytes) return false
+    core.push(line)
+    coreBytes += cost
+    return true
+  }
+
+  for (const group of groups) {
+    if (!validateEvidenceGroup(group)) {
+      return {
+        body: [],
+        bodyBytes: 0,
+        coreBytes: 0,
+        complete: false,
+        contextSamples: 0,
+        shownGroups: 0,
+        shownVariants: 0,
+        reason: "invalid_group",
+      }
+    }
+
+    const q = queryLabels(group.queries)
+    const header =
+      `${group.file}:${group.start_line}-${group.end_line} [${q}] ` +
+      `symbol=${JSON.stringify(group.symbol_name)} ` +
+      `role=${group.role} ` +
+      `anchor=${JSON.stringify(group.anchor)} ` +
+      `match=${JSON.stringify(group.match_text)} ` +
+      `hits=${group.hit_count} variants=${group.variants.length} ` +
+      `lines=${lineList(group.hit_lines)}` +
+      (group.lines_truncated ? ",…" : "")
+
+    if (!pushCore(header)) {
+      return {
+        body: core,
+        bodyBytes: coreBytes,
+        coreBytes,
+        complete: false,
+        contextSamples: 0,
+        shownGroups: 0,
+        shownVariants: 0,
+        reason: "witness_output_budget",
+      }
+    }
+
+    facts.add(groupFact(group))
+
+    for (const variant of group.variants) {
+      const vq = queryLabels(variant.queries)
+      const same = variant.subject_text === variant.statement_text
+      const detail = same
+        ? `subject=${JSON.stringify(variant.subject_text)}`
+        : `subject=${JSON.stringify(variant.subject_text)} statement=${JSON.stringify(variant.statement_text)}`
+
+      const line =
+        `  x${variant.hit_count} [${vq}] ${detail} ` +
+        `lines=${lineList(variant.hit_lines)}` +
+        (variant.lines_truncated ? ",…" : "")
+
+      if (!pushCore(line)) {
+        return {
+          body: core,
+          bodyBytes: coreBytes,
+          coreBytes,
+          complete: false,
+          contextSamples: 0,
+          shownGroups: 0,
+          shownVariants: 0,
+          reason: "witness_output_budget",
+        }
+      }
+
+      facts.add(witnessFact(group, variant))
+    }
+  }
+
+  // Witnesses are complete at this point. Context is deliberately sampled,
+  // never confused with complete raw context. Samples are all-or-nothing per
+  // group and use the already-proven file loader/path confinement.
+  const body = [...core]
+  let bodyBytes = coreBytes
+  let contextSamples = 0
+  const cache = new Map()
+
+  for (const group of groups) {
+    const lines = await loadLines(root, group.file, cache)
+    if (!lines || lines.length < 1) continue
+
+    for (const variant of group.variants.slice(0, HYBRID_CONTEXT_SAMPLES_PER_GROUP)) {
+      const exemplar = integerList(variant.hit_lines)?.[0]
+      if (!exemplar) continue
+
+      const start = Math.max(1, exemplar - HYBRID_CONTEXT_RADIUS)
+      const end = Math.min(lines.length, exemplar + HYBRID_CONTEXT_RADIUS)
+      const block = [
+        `  variant_context=${group.file}:${start}-${end} subject=${JSON.stringify(variant.subject_text)}`,
+      ]
+
+      for (let n = start; n <= end; n++) {
+        const marker = n === exemplar ? ">" : " "
+        block.push(`  ${marker} ${String(n).padStart(5)} | ${clipLine(lines[n - 1])}`)
+      }
+
+      const blockBytes = block.reduce(
+        (total, line) => total + bytes(line + "\n"),
+        0,
+      )
+      if (bodyBytes + blockBytes > bodyBudgetBytes) continue
+
+      body.push(...block)
+      bodyBytes += blockBytes
+      contextSamples += 1
+
+      for (let n = start; n <= end; n++) {
+        facts.add(sourceLineFact(group.file, n))
+      }
+    }
+  }
+
+  const shownVariants = groups.reduce(
+    (total, group) => total + group.variants.length,
+    0,
+  )
+
+  return {
+    body,
+    facts,
+    bodyBytes,
+    coreBytes,
+    complete: true,
+    contextSamples,
+    shownGroups: groups.length,
+    shownVariants,
+    reason: null,
+  }
+}
+
 async function renderEvidence(root, hits, bodyBudgetBytes) {
   const byFile = new Map()
 
@@ -1978,355 +2316,5 @@ function renderSearchIndex(results, groups, bodyBudgetBytes) {
     sampleCount,
     structuralGroupsShown,
     discriminativeFacetsShown,
-  }
-}
-
-function rawHeaderReserveLines({
-  scanComplete,
-  discoveryComplete,
-  selectedScanComplete,
-  candidateFiles,
-  selectedFiles,
-  uniqueHits,
-  querySummary,
-}) {
-  // This is deliberately conservative.
-  //
-  // The reserve must contain every field that the real RAW header may emit.
-  // "false" is at least as long as "true", shown_hits cannot require more
-  // digits than unique_hits, and the reasons line contains the union of all
-  // RAW incomplete reasons.
-  return [
-    `SEARCH complete=false scan_complete=${scanComplete} ` +
-      `lexical_discovery_complete=${discoveryComplete} ` +
-      `selected_scan_complete=${selectedScanComplete} ` +
-      `evidence_complete=false selected_evidence_complete=false ` +
-      `candidate_files=${candidateFiles} selected_files=${selectedFiles} ` +
-      `unique_hits=${uniqueHits} shown_hits=${uniqueHits}`,
-    ...querySummary,
-    "INCOMPLETE reasons=" +
-      "lexical_discovery_incomplete,probe_subset,scan_incomplete," +
-      "budgeted_emit_subset,output_budget",
-  ]
-}
-
-function normalizePublicEvent(raw) {
-  if (raw?.payload && typeof raw.payload === "object") return raw.payload
-  return raw
-}
-
-function taskContextValueKind(value) {
-  if (value === null) return "null"
-  if (Array.isArray(value)) return "array"
-  return typeof value
-}
-
-function taskContextPartTypes(value) {
-  if (!Array.isArray(value)) return []
-  const out = []
-  const seen = new Set()
-  for (const part of value) {
-    const type = typeof part?.type === "string" ? part.type : taskContextValueKind(part)
-    if (seen.has(type)) continue
-    seen.add(type)
-    out.push(type)
-    if (out.length >= TASK_CONTEXT_MAX_REPORTED_PART_TYPES) break
-  }
-  return out
-}
-
-function normalizeTaskTextChunk(value, source) {
-  if (typeof value !== "string") {
-    return {
-      ok: false,
-      reason: "task_text_chunk_not_string",
-      text: "",
-      source,
-    }
-  }
-
-  const raw = value.trim()
-  if (!raw) {
-    return {
-      ok: false,
-      reason: "task_text_chunk_empty",
-      text: "",
-      source,
-    }
-  }
-
-  // OpenCode context may expose one JSON-string serialization layer.
-  // Decode exactly one layer; never recursively parse arbitrary values.
-  //
-  // Some host paths may preserve the outer JSON quotes while materializing
-  // escaped control characters as literal U+0000..U+001F characters.
-  // Strict JSON.parse rejects those. The fallback repairs ONLY those
-  // characters and then requires strict JSON.parse to succeed.
-  if (
-    source === "content_text_part_text" &&
-    raw.startsWith('"')
-  ) {
-    let decoded = null
-    let decodedSource =
-      "content_text_part_text_json_string"
-
-    try {
-      decoded = JSON.parse(raw)
-    } catch {
-      if (
-        !raw.endsWith('"') ||
-        !/[\u0000-\u001f]/u.test(raw)
-      ) {
-        return {
-          ok: false,
-          reason: "task_text_representation_invalid",
-          text: "",
-          source,
-        }
-      }
-
-      const repaired = raw.replace(
-        /[\u0000-\u001f]/gu,
-        (value) =>
-          JSON.stringify(value).slice(1, -1),
-      )
-
-      try {
-        decoded = JSON.parse(repaired)
-      } catch {
-        return {
-          ok: false,
-          reason: "task_text_representation_invalid",
-          text: "",
-          source,
-        }
-      }
-
-      decodedSource =
-        "content_text_part_text_json_string_controls_repaired"
-    }
-
-    if (typeof decoded !== "string") {
-      return {
-        ok: false,
-        reason: "task_text_representation_not_string",
-        text: "",
-        source,
-      }
-    }
-
-    const text = decoded.trim()
-
-    if (!text) {
-      return {
-        ok: false,
-        reason: "task_text_chunk_empty",
-        text: "",
-        source: decodedSource,
-      }
-    }
-
-    return {
-      ok: true,
-      reason:
-        decodedSource ===
-        "content_text_part_text_json_string"
-          ? "task_text_json_string_decoded"
-          : "task_text_json_string_controls_repaired",
-      text,
-      source: decodedSource,
-    }
-  }
-
-  return {
-    ok: true,
-    reason: "task_text_plain",
-    text: raw,
-    source,
-  }
-}
-
-function taskContextIsUserMessage(message) {
-  return (
-    message != null &&
-    typeof message === "object" &&
-    (
-      message.role === "user" ||
-      message.type === "user"
-    )
-  )
-}
-
-function extractUserMessageText(message) {
-  if (!taskContextIsUserMessage(message)) {
-    return {
-      ok: false,
-      reason: "not_user_message",
-      text: "",
-      textBytes: 0,
-      sources: [],
-      shape: null,
-    }
-  }
-
-  const chunks = []
-  const sources = []
-  const seenChunks = new Set()
-  let partBudgetExceeded = false
-  let representationFailure = null
-
-  const add = (value, source) => {
-    if (typeof value !== "string") return
-
-    const normalized = normalizeTaskTextChunk(value, source)
-
-    if (!normalized.ok) {
-      if (
-        normalized.reason === "task_text_representation_invalid" ||
-        normalized.reason === "task_text_representation_not_string"
-      ) {
-        representationFailure ??= normalized.reason
-      }
-      return
-    }
-
-    const text = normalized.text
-    if (!text || seenChunks.has(text)) return
-
-    seenChunks.add(text)
-    chunks.push(text)
-
-    if (
-      sources.length < TASK_CONTEXT_MAX_REPORTED_SOURCES &&
-      !sources.includes(normalized.source)
-    ) {
-      sources.push(normalized.source)
-    }
-  }
-
-  const readTextParts = (value, family) => {
-    if (!Array.isArray(value)) return
-
-    if (value.length > TASK_CONTEXT_MAX_PARTS) {
-      partBudgetExceeded = true
-      return
-    }
-
-    for (const part of value) {
-      if (part?.type !== "text") continue
-
-      if (family === "content") {
-        add(part?.text, "content_text_part_text")
-        add(part?.content, "content_text_part_content")
-      } else {
-        add(part?.text, "parts_text")
-        add(part?.content, "parts_content")
-      }
-    }
-  }
-
-  if (typeof message.content === "string") {
-    add(message.content, "content_string")
-  } else {
-    readTextParts(message.content, "content")
-  }
-
-  readTextParts(message.parts, "parts")
-  add(message.text, "message_text")
-
-  const shape = {
-    content_kind: taskContextValueKind(message.content),
-    content_part_types: taskContextPartTypes(message.content),
-    parts_kind: taskContextValueKind(message.parts),
-    parts_part_types: taskContextPartTypes(message.parts),
-    has_message_text: typeof message.text === "string",
-  }
-
-  if (partBudgetExceeded) {
-    return {
-      ok: false,
-      reason: "task_part_budget_exceeded",
-      text: "",
-      textBytes: 0,
-      sources,
-      shape,
-    }
-  }
-
-  if (representationFailure) {
-    return {
-      ok: false,
-      reason: representationFailure,
-      text: "",
-      textBytes: 0,
-      sources,
-      shape,
-    }
-  }
-
-  if (chunks.length < 1) {
-    return {
-      ok: false,
-      reason: "user_task_text_unavailable",
-      text: "",
-      textBytes: 0,
-      sources,
-      shape,
-    }
-  }
-
-  const text = chunks.join("\n")
-  const textBytes = Buffer.byteLength(text, "utf8")
-
-  if (textBytes > TASK_CONTEXT_MAX_TEXT_BYTES) {
-    return {
-      ok: false,
-      reason: "task_text_budget_exceeded",
-      text: "",
-      textBytes,
-      sources,
-      shape,
-    }
-  }
-
-  return {
-    ok: true,
-    reason: "task_text_observed",
-    text,
-    textBytes,
-    sources,
-    shape,
-  }
-}
-
-function classifyMutationIntent(text) {
-  const value = String(text ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim()
-  if (!value) return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"empty_task" }
-
-  const explicitEnglishRename = /(?:^|[.!?]\s*)(?:please\s+)?rename\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
-  const explicitEnglishChangeName = /\bchange\s+(?:the\s+)?(?:name|identifier)\b.{1,180}?(?:\bto\b|\bas\b|->|→)/iu
-  const explicitRussianRename = /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?]).{1,180}?(?:\sв\s|\sна\s|->|→)/iu
-
-  if (explicitEnglishRename.test(value) || explicitEnglishChangeName.test(value) || explicitRussianRename.test(value)) {
-    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"rename_symbol", reason:"explicit_rename_with_destination" }
-  }
-
-  const lower = value.toLowerCase()
-  const negativeRename =
-    /\b(?:do\s+not|don't|never|avoid)\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
-    /\bwithout\b.{0,80}\brenam(?:e|ing)\b/iu.test(lower) ||
-    /(?:^|\s)(?:не|без)\s+переимен/iu.test(lower)
-  const incompleteImperativeRename =
-    /(?:^|[.!?]\s*)(?:please\s+)?rename\b/iu.test(value) ||
-    /(?:^|[.!?]\s*)(?:пожалуйста[,\s]+)?переимен(?:уй|уйте)(?=\s|$|[,:;.!?])/iu.test(value) ||
-    /\bchange\s+(?:the\s+)?(?:name|identifier)\b/iu.test(value)
-
-  if (incompleteImperativeRename && !negativeRename) {
-    return { protocol:MUTATION_INTENT_PROTOCOL, kind:"unknown", reason:"rename_intent_incomplete" }
-  }
-  return {
-    protocol:MUTATION_INTENT_PROTOCOL,
-    kind:"generic_edit",
-    reason: negativeRename ? "non_rename_task_with_negative_rename_constraint" : "generic_edit_task",
   }
 }

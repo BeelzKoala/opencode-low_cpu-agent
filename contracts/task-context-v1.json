@@ -1,5 +1,5 @@
 {
-  "adapter_protocol": "task-context-adapter-v1.1-json-string",
+  "adapter_protocol": "task-context-adapter-v1.2-json-string-controls",
   "authority": "routing_only",
   "extension_policy": {
     "grammar_change_requires_intent_protocol_bump": true,
@@ -27,7 +27,8 @@
     "parts_text",
     "parts_content",
     "message_text",
-    "content_text_part_text_json_string"
+    "content_text_part_text_json_string",
+    "content_text_part_text_json_string_controls_repaired"
   ],
   "rules": {
     "intent_latched_once_per_turn": true,

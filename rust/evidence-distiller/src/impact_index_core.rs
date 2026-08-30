@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
+use ast_grep_core::{Node, tree_sitter::StrDoc};
+use ast_grep_language::{LanguageExt, SupportLang};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
-    process::Command,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::{Command, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const PROTOCOL: &str = "impact-index-v1";
@@ -199,6 +201,58 @@ struct Response {
 
 const MAX_SYMBOL_CLOSURE_BINDINGS: usize = 64;
 
+const MAX_DATA_PROVIDER_IDENTITIES: usize = 8;
+const DEFAULT_MAX_DATA_PROVIDER_FILES_PER_IDENTITY: usize = 8;
+const MAX_DATA_PROVIDER_FILES_PER_IDENTITY: usize = 16;
+const MAX_DATA_PROVIDER_RESULTS_PER_IDENTITY: usize = 16;
+const DATA_PROVIDER_RG_TIMEOUT_MS: u64 = 150;
+const DATA_PROVIDER_RG_MAX_STDOUT_BYTES: usize = 128 * 1024;
+const DATA_PROVIDER_RG_MAX_STDERR_BYTES: usize = 4 * 1024;
+
+type ProviderSgNode<'a> = Node<'a, StrDoc<SupportLang>>;
+
+#[derive(Debug, Deserialize)]
+struct DataProviderIdentityRequest {
+    #[serde(default)]
+    identities: Vec<String>,
+    #[serde(default)]
+    max_files_per_identity: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DataProviderCandidate {
+    file: String,
+    symbol: String,
+    configuration_identity: String,
+    constructor_family: String,
+    constructor: String,
+    witness_line: usize,
+    witness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DataProviderIdentityObservation {
+    identity: String,
+    search_complete: bool,
+    truncated: bool,
+    reason: Option<String>,
+    candidate_files: Vec<String>,
+    files_scanned: usize,
+    candidates: Vec<DataProviderCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+struct DataProviderIdentityResponse {
+    protocol: &'static str,
+    mode: &'static str,
+    ready: bool,
+    complete: bool,
+    reason: Option<String>,
+    observations: Vec<DataProviderIdentityObservation>,
+    elapsed_ms: f64,
+}
+
+
 #[derive(Debug, Deserialize)]
 struct ModeRequest {
     root: String,
@@ -211,6 +265,29 @@ struct SymbolClosureRequest {
     pub source_symbol: String,
     #[serde(default)]
     max_bindings: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolBindingIntoFileRequest {
+    source_file: String,
+    source_symbol: String,
+    importer_file: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SymbolBindingIntoFileResponse {
+    protocol: &'static str,
+    mode: &'static str,
+    ready: bool,
+    complete: bool,
+    reason: Option<String>,
+    source_file: Option<String>,
+    source_symbol: Option<String>,
+    importer_file: Option<String>,
+    bindings: Vec<SymbolClosureBinding>,
+    inventory_kind: Option<String>,
+    inventory_files: usize,
+    elapsed_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1787,6 +1864,462 @@ fn neighbors(request: &Request, root: &Path, path: &Path, started: Instant) -> R
     })
 }
 
+
+fn provider_constant_identity(raw: &str) -> Option<String> {
+    if raw.len() < 3 || raw.len() > 80 {
+        return None;
+    }
+    let first = raw.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    if !raw
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn provider_node_text(node: &ProviderSgNode<'_>, max_chars: usize) -> String {
+    node.text()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn provider_has_parse_errors(root: &ProviderSgNode<'_>) -> bool {
+    root.clone()
+        .dfs()
+        .any(|node| node.is_error() || node.is_missing())
+}
+
+fn python_psycopg2_aliases(
+    path: &Path,
+    source: &str,
+) -> (BTreeSet<String>, BTreeSet<String>, bool) {
+    let (imports, stats) = parse_imports(path, source);
+    let mut modules = BTreeSet::new();
+    let mut connects = BTreeSet::new();
+
+    for import in imports {
+        if import.spec != "psycopg2" {
+            continue;
+        }
+        match import.kind.as_str() {
+            "python_import" => {
+                for binding in import.bindings {
+                    if ident(&binding).as_deref() == Some(binding.as_str()) {
+                        modules.insert(binding);
+                    }
+                }
+            }
+            "python_from" => {
+                for pair in import.binding_pairs {
+                    if pair.source == "connect"
+                        && ident(&pair.local).as_deref() == Some(pair.local.as_str())
+                    {
+                        connects.insert(pair.local);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let unsupported =
+        (stats.unsupported_alias > 0 || stats.unsupported_dynamic > 0)
+            && source.contains("psycopg2");
+
+    (modules, connects, unsupported)
+}
+
+fn python_psycopg2_constructor(
+    call: &ProviderSgNode<'_>,
+    modules: &BTreeSet<String>,
+    connects: &BTreeSet<String>,
+) -> Option<String> {
+    if call.kind().as_ref() != "call" {
+        return None;
+    }
+    let callee = call.field("function")?;
+    let name = provider_node_text(&callee, 160);
+    if connects.contains(&name) {
+        return Some(name);
+    }
+    for alias in modules {
+        if name == format!("{alias}.connect") {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn python_call_has_identity_splat(call: &ProviderSgNode<'_>, identity: &str) -> bool {
+    let Some(arguments) = call.field("arguments") else {
+        return false;
+    };
+    for node in arguments.dfs() {
+        if node.kind().as_ref() != "dictionary_splat" {
+            continue;
+        }
+        if node
+            .dfs()
+            .filter(|child| child.kind().as_ref() == "identifier")
+            .any(|child| provider_node_text(&child, 80) == identity)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn python_innermost_function_owner(
+    functions: &[ProviderSgNode<'_>],
+    call: &ProviderSgNode<'_>,
+) -> Option<String> {
+    let call_range = call.range();
+    let mut owners = functions
+        .iter()
+        .filter(|function| {
+            let range = function.range();
+            range.start <= call_range.start && call_range.end <= range.end
+        })
+        .filter_map(|function| {
+            let name_node = function.field("name")?;
+            let name = provider_node_text(&name_node, 160);
+            if ident(&name).as_deref() != Some(name.as_str()) {
+                return None;
+            }
+            let range = function.range();
+            Some((name, range.end.saturating_sub(range.start)))
+        })
+        .collect::<Vec<_>>();
+    owners.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    owners.into_iter().next().map(|(name, _)| name)
+}
+
+fn extract_python_data_provider_candidates(
+    rel: &str,
+    source: &str,
+    identity: &str,
+) -> Result<Vec<DataProviderCandidate>> {
+    let ast = SupportLang::Python.ast_grep(source);
+    let root = ast.root();
+    anyhow::ensure!(
+        !provider_has_parse_errors(&root),
+        "provider_parse_contains_error"
+    );
+
+    let (modules, connects, unsupported) =
+        python_psycopg2_aliases(Path::new(rel), source);
+    anyhow::ensure!(!unsupported, "provider_import_syntax_unsupported");
+    if modules.is_empty() && connects.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let functions = root
+        .clone()
+        .dfs()
+        .filter(|node| node.kind().as_ref() == "function_definition")
+        .collect::<Vec<_>>();
+    let mut out = BTreeSet::new();
+
+    for call in root.dfs() {
+        let Some(constructor) =
+            python_psycopg2_constructor(&call, &modules, &connects)
+        else {
+            continue;
+        };
+        if !python_call_has_identity_splat(&call, identity) {
+            continue;
+        }
+        let Some(symbol) = python_innermost_function_owner(&functions, &call) else {
+            continue;
+        };
+        out.insert(DataProviderCandidate {
+            file: rel.to_string(),
+            symbol,
+            configuration_identity: identity.to_string(),
+            constructor_family: "python-psycopg2".to_string(),
+            constructor,
+            witness_line: call.start_pos().line() + 1,
+            witness: provider_node_text(&call, MAX_WITNESS_CHARS),
+        });
+        if out.len() > MAX_DATA_PROVIDER_RESULTS_PER_IDENTITY {
+            anyhow::bail!("provider_result_budget_exceeded");
+        }
+    }
+
+    Ok(out.into_iter().collect())
+}
+
+fn read_child_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let Ok(count) = reader.read(&mut chunk) else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(out.len());
+        if count > remaining {
+            out.extend_from_slice(&chunk[..remaining]);
+            return (out, true);
+        }
+        out.extend_from_slice(&chunk[..count]);
+    }
+    (out, false)
+}
+
+fn bounded_provider_identity_files(
+    root: &Path,
+    identity: &str,
+    max_files: usize,
+) -> DataProviderIdentityObservation {
+    let mut command = Command::new("rg");
+    command
+        .current_dir(root)
+        .arg("--files-with-matches")
+        .arg("--null")
+        .arg("--fixed-strings")
+        .arg("--no-messages")
+        .arg("--max-filesize")
+        .arg("1M")
+        .arg("-g")
+        .arg("*.py")
+        .arg("-g")
+        .arg("!.git/**")
+        .arg("-g")
+        .arg("!.opencode/**")
+        .arg("-g")
+        .arg("!node_modules/**")
+        .arg("-g")
+        .arg("!target/**")
+        .arg("-g")
+        .arg("!dist/**")
+        .arg("-g")
+        .arg("!build/**")
+        .arg("--")
+        .arg(identity)
+        .arg(".")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let failure = |reason: &str, truncated: bool| DataProviderIdentityObservation {
+        identity: identity.to_string(),
+        search_complete: false,
+        truncated,
+        reason: Some(reason.to_string()),
+        candidate_files: Vec::new(),
+        files_scanned: 0,
+        candidates: Vec::new(),
+    };
+
+    let Ok(mut child) = command.spawn() else {
+        return failure("provider_rg_spawn_failed", false);
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return failure("provider_rg_stdout_unavailable", false);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return failure("provider_rg_stderr_unavailable", false);
+    };
+
+    let stdout_reader = std::thread::spawn(move || {
+        read_child_limited(stdout, DATA_PROVIDER_RG_MAX_STDOUT_BYTES)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        read_child_limited(stderr, DATA_PROVIDER_RG_MAX_STDERR_BYTES)
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(DATA_PROVIDER_RG_TIMEOUT_MS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let (stdout, stdout_limited) =
+        stdout_reader.join().unwrap_or_else(|_| (Vec::new(), true));
+    let (stderr, _) =
+        stderr_reader.join().unwrap_or_else(|_| (Vec::new(), true));
+
+    if status.is_none() {
+        return failure("provider_rg_timeout", false);
+    }
+    if stdout_limited {
+        return failure("provider_rg_stdout_limit", true);
+    }
+
+    let status = status.expect("checked above");
+    if status.code() != Some(0) && status.code() != Some(1) {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        return failure(
+            if detail.is_empty() {
+                "provider_rg_failed"
+            } else {
+                "provider_rg_failed_with_stderr"
+            },
+            false,
+        );
+    }
+
+    let files = stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|raw| {
+            if raw.is_empty() {
+                return None;
+            }
+            let raw = String::from_utf8_lossy(raw);
+            normalize_rel(Path::new(raw.trim_start_matches("./")))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if files.len() > max_files {
+        return DataProviderIdentityObservation {
+            identity: identity.to_string(),
+            search_complete: false,
+            truncated: true,
+            reason: Some("provider_candidate_files_truncated".to_string()),
+            candidate_files: files.into_iter().take(max_files).collect(),
+            files_scanned: 0,
+            candidates: Vec::new(),
+        };
+    }
+
+    DataProviderIdentityObservation {
+        identity: identity.to_string(),
+        search_complete: true,
+        truncated: false,
+        reason: None,
+        candidate_files: files,
+        files_scanned: 0,
+        candidates: Vec::new(),
+    }
+}
+
+fn data_provider_identity(
+    request: &DataProviderIdentityRequest,
+    root: &Path,
+    started: Instant,
+) -> Result<DataProviderIdentityResponse> {
+    let identities = request
+        .identities
+        .iter()
+        .filter_map(|value| provider_constant_identity(value))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if identities.len() > MAX_DATA_PROVIDER_IDENTITIES {
+        return Ok(DataProviderIdentityResponse {
+            protocol: PROTOCOL,
+            mode: "data_provider_identity",
+            ready: false,
+            complete: false,
+            reason: Some("provider_identity_budget_exceeded".to_string()),
+            observations: Vec::new(),
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    let max_files = request
+        .max_files_per_identity
+        .unwrap_or(DEFAULT_MAX_DATA_PROVIDER_FILES_PER_IDENTITY)
+        .clamp(1, MAX_DATA_PROVIDER_FILES_PER_IDENTITY);
+    let mut observations = Vec::new();
+
+    for identity in identities {
+        let mut observation = bounded_provider_identity_files(root, &identity, max_files);
+        if !observation.search_complete || observation.truncated {
+            observations.push(observation);
+            continue;
+        }
+
+        let mut candidates = BTreeSet::new();
+        let mut failed = None;
+        for rel in &observation.candidate_files {
+            let path = root.join(rel);
+            let metadata = match fs::metadata(&path) {
+                Ok(value) => value,
+                Err(_) => {
+                    failed = Some("provider_candidate_stat_failed".to_string());
+                    break;
+                }
+            };
+            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+                failed = Some("provider_candidate_file_invalid".to_string());
+                break;
+            }
+            let source = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(_) => {
+                    failed = Some("provider_candidate_read_failed".to_string());
+                    break;
+                }
+            };
+            observation.files_scanned += 1;
+            match extract_python_data_provider_candidates(rel, &source, &identity) {
+                Ok(rows) => {
+                    for row in rows {
+                        candidates.insert(row);
+                    }
+                }
+                Err(_) => {
+                    failed = Some("provider_source_validation_failed".to_string());
+                    break;
+                }
+            }
+            if candidates.len() > MAX_DATA_PROVIDER_RESULTS_PER_IDENTITY {
+                failed = Some("provider_result_budget_exceeded".to_string());
+                break;
+            }
+        }
+
+        if let Some(reason) = failed {
+            observation.search_complete = false;
+            observation.reason = Some(reason);
+            observation.candidates.clear();
+        } else {
+            observation.candidates = candidates.into_iter().collect();
+        }
+        observations.push(observation);
+    }
+
+    observations.sort_by(|a, b| a.identity.cmp(&b.identity));
+    Ok(DataProviderIdentityResponse {
+        protocol: PROTOCOL,
+        mode: "data_provider_identity",
+        ready: true,
+        complete: true,
+        reason: None,
+        observations,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
 fn closure_failure(
     started: Instant,
     source_file: Option<String>,
@@ -1921,6 +2454,296 @@ fn importer_has_unproven_member_use(root: &Path, edge: &EdgeRecord, symbol: &str
      * receiver/member validator is added.
      */
     source.contains(symbol)
+}
+
+fn symbol_binding_failure(
+    started: Instant,
+    source_file: Option<String>,
+    source_symbol: Option<String>,
+    importer_file: Option<String>,
+    reason: &'static str,
+    inventory_kind: Option<String>,
+    inventory_files: usize,
+) -> SymbolBindingIntoFileResponse {
+    SymbolBindingIntoFileResponse {
+        protocol: PROTOCOL,
+        mode: "symbol_binding_into_file",
+        ready: false,
+        complete: false,
+        reason: Some(reason.to_string()),
+        source_file,
+        source_symbol,
+        importer_file,
+        bindings: Vec::new(),
+        inventory_kind,
+        inventory_files,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    }
+}
+
+fn symbol_binding_into_file(
+    request: &SymbolBindingIntoFileRequest,
+    root: &Path,
+    started: Instant,
+) -> Result<SymbolBindingIntoFileResponse> {
+    let requested_source = request.source_file.trim_start_matches("./");
+    let requested_importer = request.importer_file.trim_start_matches("./");
+
+    let Some(source_file) = normalize_rel(Path::new(requested_source)) else {
+        return Ok(symbol_binding_failure(
+            started,
+            None,
+            Some(request.source_symbol.clone()),
+            None,
+            "binding_source_file_invalid",
+            None,
+            0,
+        ));
+    };
+
+    let Some(importer_file) = normalize_rel(Path::new(requested_importer)) else {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(request.source_symbol.clone()),
+            None,
+            "binding_importer_file_invalid",
+            None,
+            0,
+        ));
+    };
+
+    let Some(source_symbol) = ident(&request.source_symbol) else {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            None,
+            Some(importer_file),
+            "binding_source_symbol_invalid",
+            None,
+            0,
+        ));
+    };
+
+    if source_symbol != request.source_symbol {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(request.source_symbol.clone()),
+            Some(importer_file),
+            "binding_source_symbol_invalid",
+            None,
+            0,
+        ));
+    }
+
+    /*
+     * This is relation-local completeness, not global symbol closure.
+     *
+     * Inventory is still bounded and must be complete so module resolution
+     * cannot become falsely unique. Only the exact importer is parsed; parse
+     * failures or unsupported syntax elsewhere are irrelevant to this
+     * relation.
+     */
+    let (paths, capped, inventory_kind) = inventory(root)?;
+
+    if capped {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(source_symbol),
+            Some(importer_file),
+            "binding_inventory_truncated",
+            Some(inventory_kind),
+            paths.len(),
+        ));
+    }
+
+    let mut file_set = HashSet::new();
+
+    for absolute in &paths {
+        let Ok(rel) = rel_string(root, absolute) else {
+            return Ok(symbol_binding_failure(
+                started,
+                Some(source_file),
+                Some(source_symbol),
+                Some(importer_file),
+                "binding_inventory_path_invalid",
+                Some(inventory_kind),
+                file_set.len(),
+            ));
+        };
+
+        file_set.insert(rel);
+    }
+
+    if !file_set.contains(&source_file) {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(source_symbol),
+            Some(importer_file),
+            "binding_source_file_missing",
+            Some(inventory_kind),
+            file_set.len(),
+        ));
+    }
+
+    if !file_set.contains(&importer_file) {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(source_symbol),
+            Some(importer_file),
+            "binding_importer_file_missing",
+            Some(inventory_kind),
+            file_set.len(),
+        ));
+    }
+
+    let importer_path = root.join(&importer_file);
+    let Ok(importer_source) = fs::read_to_string(&importer_path) else {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(source_symbol),
+            Some(importer_file),
+            "binding_importer_read_failed",
+            Some(inventory_kind),
+            file_set.len(),
+        ));
+    };
+
+    let (imports, parse_stats) = parse_imports(&importer_path, &importer_source);
+
+    if (parse_stats.unsupported_alias > 0 || parse_stats.unsupported_dynamic > 0)
+        && importer_source.contains(&source_symbol)
+    {
+        return Ok(symbol_binding_failure(
+            started,
+            Some(source_file),
+            Some(source_symbol),
+            Some(importer_file),
+            "binding_importer_syntax_unsupported",
+            Some(inventory_kind),
+            file_set.len(),
+        ));
+    }
+
+    let mut bindings = BTreeSet::<SymbolClosureBinding>::new();
+
+    for import in imports {
+        let mentions_symbol = import
+            .source_symbols
+            .iter()
+            .any(|value| value == &source_symbol)
+            || import
+                .binding_pairs
+                .iter()
+                .any(|pair| pair.source == source_symbol);
+
+        let resolved = resolve_import(&importer_file, &import, &file_set);
+
+        match resolved {
+            Resolution::Ambiguous if mentions_symbol => {
+                return Ok(symbol_binding_failure(
+                    started,
+                    Some(source_file),
+                    Some(source_symbol),
+                    Some(importer_file),
+                    "binding_import_ambiguous",
+                    Some(inventory_kind),
+                    file_set.len(),
+                ));
+            }
+            Resolution::Unresolved if mentions_symbol => {
+                return Ok(symbol_binding_failure(
+                    started,
+                    Some(source_file),
+                    Some(source_symbol),
+                    Some(importer_file),
+                    "binding_import_unresolved",
+                    Some(inventory_kind),
+                    file_set.len(),
+                ));
+            }
+            Resolution::Ambiguous | Resolution::Unresolved | Resolution::External => continue,
+            Resolution::Resolved(target) if target != source_file => continue,
+            Resolution::Resolved(_) => {}
+        }
+
+        if import.confidence != "exact_local" {
+            return Ok(symbol_binding_failure(
+                started,
+                Some(source_file),
+                Some(source_symbol),
+                Some(importer_file),
+                "binding_confidence_not_exact",
+                Some(inventory_kind),
+                file_set.len(),
+            ));
+        }
+
+        let matching_pairs = import
+            .binding_pairs
+            .iter()
+            .filter(|pair| pair.source == source_symbol)
+            .collect::<Vec<_>>();
+
+        if matching_pairs.is_empty() {
+            /*
+             * `import service; service.symbol()` is a real dependency on the
+             * source module, but current BindingPair cannot prove the member
+             * relation. Fail closed for this exact importer only.
+             */
+            if importer_source.contains(&source_symbol) {
+                return Ok(symbol_binding_failure(
+                    started,
+                    Some(source_file),
+                    Some(source_symbol),
+                    Some(importer_file),
+                    "binding_member_binding_unsupported",
+                    Some(inventory_kind),
+                    file_set.len(),
+                ));
+            }
+            continue;
+        }
+
+        for pair in matching_pairs {
+            bindings.insert(SymbolClosureBinding {
+                importer: importer_file.clone(),
+                target: source_file.clone(),
+                kind: import.kind.clone(),
+                witness_line: import.line,
+                spec: import.spec.clone(),
+                source_symbol: source_symbol.clone(),
+                local_symbol: pair.local.clone(),
+                witness: import.witness.clone(),
+                confidence: import.confidence.clone(),
+                propagates: false,
+            });
+        }
+    }
+
+    Ok(SymbolBindingIntoFileResponse {
+        protocol: PROTOCOL,
+        mode: "symbol_binding_into_file",
+        ready: true,
+        complete: true,
+        reason: if bindings.is_empty() {
+            Some("exact_binding_absent".to_string())
+        } else {
+            None
+        },
+        source_file: Some(source_file),
+        source_symbol: Some(source_symbol),
+        importer_file: Some(importer_file),
+        bindings: bindings.into_iter().collect(),
+        inventory_kind: Some(inventory_kind),
+        inventory_files: file_set.len(),
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
 }
 
 fn symbol_closure(
@@ -2214,6 +3037,19 @@ pub fn run_cli() -> Result<()> {
     let path = cache_path(&root);
 
     match mode_request.mode.as_str() {
+        "data_provider_identity" => {
+            let request: DataProviderIdentityRequest =
+                serde_json::from_str(&input)
+                    .context("invalid data provider identity request")?;
+            let response = data_provider_identity(&request, &root, started)?;
+            serde_json::to_writer(io::stdout(), &response)?;
+        }
+        "symbol_binding_into_file" => {
+            let request: SymbolBindingIntoFileRequest =
+                serde_json::from_str(&input).context("invalid symbol binding into file request")?;
+            let response = symbol_binding_into_file(&request, &root, started)?;
+            serde_json::to_writer(io::stdout(), &response)?;
+        }
         "symbol_closure" => {
             let request: SymbolClosureRequest =
                 serde_json::from_str(&input).context("invalid symbol closure request")?;
@@ -2473,6 +3309,143 @@ mod tests {
             Instant::now(),
         )
         .unwrap()
+    }
+
+    fn run_binding_test(
+        root: &Path,
+        source_file: &str,
+        source_symbol: &str,
+        importer_file: &str,
+    ) -> SymbolBindingIntoFileResponse {
+        let canonical = fs::canonicalize(root).unwrap();
+        let request = SymbolBindingIntoFileRequest {
+            source_file: source_file.to_string(),
+            source_symbol: source_symbol.to_string(),
+            importer_file: importer_file.to_string(),
+        };
+
+        symbol_binding_into_file(&request, &canonical, Instant::now()).unwrap()
+    }
+
+    #[test]
+    fn data_provider_identity_extracts_exact_psycopg2_config() {
+        let source = r#"
+import psycopg2
+DB = {}
+REPORTING_DB = {}
+def primary():
+    return psycopg2.connect(**DB)
+def reporting():
+    return psycopg2.connect(**REPORTING_DB)
+"#;
+        let rows = extract_python_data_provider_candidates(
+            "database.py",
+            source,
+            "REPORTING_DB",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "reporting");
+        assert_eq!(rows[0].configuration_identity, "REPORTING_DB");
+    }
+
+    #[test]
+    fn data_provider_identity_rejects_arbitrary_connect() {
+        let source = r#"
+import serializer
+REPORTING_DB = {}
+def no():
+    return serializer.connect(**REPORTING_DB)
+"#;
+        assert!(extract_python_data_provider_candidates(
+            "service.py",
+            source,
+            "REPORTING_DB",
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn data_provider_identity_supports_module_alias() {
+        let source = r#"
+import psycopg2 as pg
+REPORTING_DB = {}
+def reporting():
+    return pg.connect(**REPORTING_DB)
+"#;
+        let rows = extract_python_data_provider_candidates(
+            "database.py",
+            source,
+            "REPORTING_DB",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "reporting");
+    }
+
+    #[test]
+    fn data_provider_identity_supports_connect_alias() {
+        let source = r#"
+from psycopg2 import connect as db_connect
+REPORTING_DB = {}
+def reporting():
+    return db_connect(**REPORTING_DB)
+"#;
+        let rows = extract_python_data_provider_candidates(
+            "database.py",
+            source,
+            "REPORTING_DB",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "reporting");
+    }
+
+    #[test]
+    fn symbol_binding_into_file_is_target_conditioned() {
+        let root = closure_test_root("target-conditioned-binding");
+
+        fs::write(root.join("service.py"), "def handle():\n    return 1\n").unwrap();
+        fs::write(
+            root.join("host.py"),
+            "from service import handle as h\n\ndef call():\n    return h()\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("unrelated.py"),
+            "import service\n\ndef call():\n    return service.handle()\n",
+        )
+        .unwrap();
+
+        let targeted = run_binding_test(&root, "service.py", "handle", "host.py");
+        assert!(targeted.ready, "{targeted:?}");
+        assert!(targeted.complete, "{targeted:?}");
+        assert_eq!(targeted.reason, None);
+        assert_eq!(targeted.bindings.len(), 1);
+        assert_eq!(targeted.bindings[0].importer, "host.py");
+        assert_eq!(targeted.bindings[0].target, "service.py");
+        assert_eq!(targeted.bindings[0].source_symbol, "handle");
+        assert_eq!(targeted.bindings[0].local_symbol, "h");
+        assert_eq!(targeted.bindings[0].confidence, "exact_local");
+
+        let global = run_closure_test(&root, "service.py", "handle");
+        assert!(!global.ready);
+        assert!(!global.complete);
+        assert_eq!(
+            global.reason.as_deref(),
+            Some("closure_member_binding_unsupported")
+        );
+
+        let namespace = run_binding_test(&root, "service.py", "handle", "unrelated.py");
+        assert!(!namespace.ready);
+        assert!(!namespace.complete);
+        assert_eq!(
+            namespace.reason.as_deref(),
+            Some("binding_member_binding_unsupported")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

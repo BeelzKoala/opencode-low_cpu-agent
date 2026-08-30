@@ -1460,6 +1460,7 @@ function getSessionState(sessionID) {
       contractFailureSignatures: new Set(),
       contractFailures: 0,
       activeMutationTool: null,
+      additiveRepairLock: null,
       taskContextProtocol: TASK_CONTEXT_PROTOCOL,
       taskContextAdapterProtocol: TASK_CONTEXT_ADAPTER_PROTOCOL,
       taskContextLatched: false,
@@ -1473,6 +1474,7 @@ function getSessionState(sessionID) {
       taskAction: null,
       taskRequirements: null,
       taskRoleEvidence: [],
+      dataCapabilityObservation: null,
       actionCommitSha256: null,
       actionCommitDispatches: 0,
       terminalCommit: null,
@@ -1497,6 +1499,27 @@ function getSessionState(sessionID) {
       executionState: EXEC_STATE_LOCATE,
       executionReason: "session_start",
       executionEvent: "session_start",
+      executionReadiness: initialExecutionReadiness("session_start"),
+      additiveMutationCapability: null,
+      additiveMutationHandoffPath: null,
+      additiveMutationContext: null,
+      executionContextCapsule: null,
+      executionContextCapsuleSha256: null,
+      executionContextContractSha256: null,
+      executionContextBlockReason: null,
+      executionContextSelectedSource: null,
+      repairContextProjectionStatus: null,
+      repairContextProjectionReason: null,
+      repairContextProjectionBytes: 0,
+      repairContextProjectionSha256: null,
+      repairContextSourceCapsuleSha256: null,
+      lastModelDispatchStartedAt: null,
+      modelLatencySamples: 0,
+      modelLatencyMaxMs: 0,
+      modelLatencyProfile: initialLatencyProfile(),
+      governorTaskStartedAt: now,
+      governorPhaseStartedAt: now,
+      governorPhase: phaseForExecutionState(EXEC_STATE_LOCATE),
       editCapsulePath: null,
       editCapsuleHash: null,
       proofObligations: [],
@@ -1549,6 +1572,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.contractFailureSignatures.clear()
   state.contractFailures = 0
   state.activeMutationTool = null
+  state.additiveRepairLock = null
   state.taskContextProtocol = TASK_CONTEXT_PROTOCOL
   state.taskContextAdapterProtocol = TASK_CONTEXT_ADAPTER_PROTOCOL
   state.taskContextLatched = false
@@ -1565,6 +1589,7 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.taskShape = null
   state.additiveLocalizationPlan = null
   state.taskRoleEvidence = []
+  state.dataCapabilityObservation = null
   state.actionCommitSha256 = null
   state.actionCommitDispatches = 0
   state.mutationIntent = "unknown"
@@ -1575,6 +1600,27 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.executionState = EXEC_STATE_LOCATE
   state.executionReason = "turn_start"
   state.executionEvent = "turn_start"
+  state.executionReadiness = initialExecutionReadiness("turn_start")
+  state.additiveMutationCapability = null
+  state.additiveMutationHandoffPath = null
+  state.additiveMutationContext = null
+  state.executionContextCapsule = null
+  state.executionContextCapsuleSha256 = null
+  state.executionContextContractSha256 = null
+  state.executionContextBlockReason = null
+  state.executionContextSelectedSource = null
+  state.repairContextProjectionStatus = null
+  state.repairContextProjectionReason = null
+  state.repairContextProjectionBytes = 0
+  state.repairContextProjectionSha256 = null
+  state.repairContextSourceCapsuleSha256 = null
+  state.lastModelDispatchStartedAt = null
+  state.modelLatencySamples = 0
+  state.modelLatencyMaxMs = 0
+  state.modelLatencyProfile = initialLatencyProfile()
+  state.governorTaskStartedAt = startedAt
+  state.governorPhaseStartedAt = startedAt
+  state.governorPhase = phaseForExecutionState(EXEC_STATE_LOCATE)
   state.editCapsulePath = null
   state.editCapsuleHash = null
   state.proofObligations = []
@@ -1586,6 +1632,7 @@ function transitionExecutionState(current, event) {
   if (event === "turn_start") return EXEC_STATE_LOCATE
   if (event === "scout_ready") return EXEC_STATE_MUTATE
   if (event === "scout_needs_evidence") return EXEC_STATE_LOCATE
+  if (event === "readiness_safe_fail") return EXEC_STATE_SAFE_FAIL
   if (event === "patch_retry") return EXEC_STATE_REPAIR
   if (event === "patch_rescout") return EXEC_STATE_LOCATE
   if (event === "patch_ready") return EXEC_STATE_DONE
@@ -1593,6 +1640,39 @@ function transitionExecutionState(current, event) {
   if (event === "verification_rescout") return EXEC_STATE_LOCATE
   if (event === "fatal") return EXEC_STATE_SAFE_FAIL
   return current
+}
+
+function applyExecutionReadiness(state, readiness) {
+  if (!state || !readiness || readiness.protocol !== EXECUTION_READINESS_PROTOCOL) {
+    return applyExecutionEvent(
+      state,
+      "fatal",
+      "execution_readiness_invalid",
+    )
+  }
+
+  state.executionReadiness = readiness
+  return applyExecutionEvent(
+    state,
+    readiness.execution_event,
+    readiness.reason,
+  )
+}
+
+function observeModelLatencyAtToolBoundary(state, observedAt = nowMs()) {
+  if (!state || !Number.isFinite(state.lastModelDispatchStartedAt)) return null
+
+  const elapsed = Math.max(0, observedAt - state.lastModelDispatchStartedAt)
+  state.lastModelDispatchStartedAt = null
+  state.modelLatencySamples = (state.modelLatencySamples ?? 0) + 1
+  state.modelLatencyMaxMs = Math.max(state.modelLatencyMaxMs ?? 0, elapsed)
+  state.modelLatencyProfile = observeLatency(state.modelLatencyProfile, elapsed)
+  return elapsed
+}
+
+function modelDispatchReserveMs(state) {
+  if (!state) return 0
+  return latencyReserveMs(state.modelLatencyProfile)
 }
 
 function allowedToolsForExecutionState(executionState) {
@@ -1627,6 +1707,15 @@ function resolveMutationActionForState(state) {
     typeof state?.scoutHandoffPath === "string" &&
     state.scoutHandoffPath.length > 0
 
+  const additiveCapability = state?.additiveMutationCapability ?? null
+  const additiveReady =
+    additiveCapability?.protocol === ADDITIVE_MUTATION_CAPABILITY_PROTOCOL &&
+    additiveCapability?.ready === true &&
+    additiveCapability?.mutation_authority === true &&
+    additiveCapability?.operation === "additive_surface" &&
+    typeof state?.additiveMutationHandoffPath === "string" &&
+    state.additiveMutationHandoffPath.length > 0
+
   if (
     state.executionState === EXEC_STATE_REPAIR &&
     typeof state.activeMutationTool === "string"
@@ -1637,23 +1726,36 @@ function resolveMutationActionForState(state) {
     if (state.activeMutationTool === EXECUTE_REPLACE_NODE_TOOL && replaceReady) {
       return { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "repair_sticky_replace" }
     }
+    if (state.activeMutationTool === EXECUTE_ADDITIVE_PLAN_TOOL && additiveReady) {
+      return { tool: EXECUTE_ADDITIVE_PLAN_TOOL, reason: "repair_sticky_additive" }
+    }
     return { tool: null, reason: "repair_capability_unavailable" }
   }
 
-  if (state?.mutationIntent === "rename_symbol") {
+  const selected =
+    state?.executionReadiness?.selected_mutation_operation ?? null
+
+  if (selected === "additive_surface") {
+    return additiveReady
+      ? { tool: EXECUTE_ADDITIVE_PLAN_TOOL, reason: "readiness_additive_authorized" }
+      : { tool: null, reason: "additive_capability_unavailable" }
+  }
+
+  if (selected === "rename_symbol") {
     return renameReady
-      ? { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "rename_intent_authorized" }
+      ? { tool: EXECUTE_RENAME_SYMBOL_TOOL, reason: "readiness_rename_authorized" }
       : { tool: null, reason: "rename_capability_unavailable" }
   }
 
-  if (state?.mutationIntent === "generic_edit") {
+  if (selected === "replace_node") {
     return replaceReady
-      ? { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "generic_edit_authorized" }
+      ? { tool: EXECUTE_REPLACE_NODE_TOOL, reason: "readiness_replace_authorized" }
       : { tool: null, reason: "replace_capability_unavailable" }
   }
 
-  return { tool: null, reason: "mutation_intent_unknown" }
+  return { tool: null, reason: "readiness_operation_unresolved" }
 }
+
 
 function mutationToolsForState(state) {
   const resolution = resolveMutationActionForState(state)
@@ -1663,31 +1765,61 @@ function mutationToolsForState(state) {
 
 function allowedToolsForState(state) {
   if (!state) return []
-  if (state.executionState === EXEC_STATE_LOCATE) return ["search"]
-  if (
-    state.executionState === EXEC_STATE_MUTATE ||
-    state.executionState === EXEC_STATE_REPAIR
-  ) {
+
+  const readinessStatus = state.executionReadiness?.status ?? null
+
+  if (state.executionState === EXEC_STATE_LOCATE) {
+    return readinessStatus === EXECUTION_READINESS_STATUS.SAFE_FAIL ||
+      readinessStatus === EXECUTION_READINESS_STATUS.READY_TO_MUTATE
+      ? []
+      : ["search"]
+  }
+
+  if (state.executionState === EXEC_STATE_MUTATE) {
+    if (readinessStatus !== EXECUTION_READINESS_STATUS.READY_TO_MUTATE) {
+      return []
+    }
     return mutationToolsForState(state)
   }
+
+  if (state.executionState === EXEC_STATE_REPAIR) {
+    return mutationToolsForState(state)
+  }
+
   return []
 }
 
 function applyExecutionEvent(state, event, reason, details = null) {
   if (!state) return null
-  const next = transitionExecutionState(state.executionState, event)
+  const previous = state.executionState
+  const previousPhase = phaseForExecutionState(previous)
+  const next = transitionExecutionState(previous, event)
+  const nextPhase = phaseForExecutionState(next)
+  const observedAt = nowMs()
+
   state.executionState = next
   state.executionReason = reason ?? event
   state.executionEvent = event
+
+  if (previousPhase !== nextPhase) {
+    state.governorPhase = nextPhase
+    state.governorPhaseStartedAt = observedAt
+  }
+
   if (event !== "patch_rescout" && event !== "verification_rescout") {
     state.pendingRescout = null
   } else {
     state.pendingRescout = details ?? { reason: reason ?? event }
     state.activeMutationTool = null
+    state.additiveRepairLock = null
+    state.executionReadiness =
+      initialExecutionReadiness(reason ?? event)
   }
-  state.lastSeen = nowMs()
+
+  state.lastSeen = observedAt
   return next
 }
+
 
 function toolAllowedForExecutionState(state, toolName) {
   if (!state) return false

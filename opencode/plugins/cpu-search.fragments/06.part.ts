@@ -36,6 +36,8 @@ export default {
             : null
         const state = getSessionState(sessionID)
         const root = await rootForTool(ctx, toolContext, sessionID, state)
+        const observedModelLatencyMs =
+          observeModelLatencyAtToolBoundary(state)
         const runtimeIdentity = await runtimeStackIdentity()
 
         const trace = async (record) => {
@@ -52,6 +54,9 @@ export default {
             executor_runs: state?.executorRuns ?? null,
             executed_patches: state?.executedPatches ?? null,
             turn_model_calls: state?.modelCalls ?? null,
+            observed_model_latency_ms: observedModelLatencyMs,
+            model_latency_samples: state?.modelLatencySamples ?? 0,
+            model_latency_max_ms: state?.modelLatencyMaxMs ?? 0,
             scout_handoff_path: state?.scoutHandoffPath ?? null,
             edit_capsule_path: state?.editCapsulePath ?? null,
             bound_mutation_target: state?.boundMutationTarget ?? null,
@@ -63,6 +68,10 @@ export default {
             mutation_tool_abi_protocol: MUTATION_TOOL_ABI_PROTOCOL,
             mutation_tool: toolName,
             semantic_kind: forcedKind,
+            obligation_bound_synthesis_protocol:
+              forcedKind === "additive_surface"
+                ? OBLIGATION_BOUND_SYNTHESIS_PROTOCOL
+                : null,
             mutation_dispatch_origin: dispatchOrigin,
             action_commit_protocol: actionCommit?.protocol ?? null,
             action_commit_sha256: actionCommit?.commit_sha256 ?? null,
@@ -194,12 +203,30 @@ export default {
           "scope",
         ].find((field) => mutationFieldPresent(rawInput, field))
 
+        const obligationBoundRequest =
+          forcedKind === "additive_surface" && !forbiddenRawAuthorityField
+            ? materializeObligationBoundAdditiveRequest({
+                capability: state.additiveMutationCapability,
+                taskRequirements: state.taskRequirements,
+                request: rawInput,
+              })
+            : null
+
         const shape = forbiddenRawAuthorityField
           ? mutationShapeFailure(
               forcedKind,
               `action_tool_forbids_${forbiddenRawAuthorityField}`,
             )
-          : validateMutationShape(input)
+          : forcedKind === "additive_surface"
+            ? obligationBoundRequest?.ok === true
+              ? validateAdditiveMutationRequest(obligationBoundRequest.request)
+              : mutationShapeFailure(
+                  forcedKind,
+                  obligationBoundRequest?.detail ??
+                    obligationBoundRequest?.reason ??
+                    "obligation_bound_request_invalid",
+                )
+            : validateMutationShape(input)
 
         // Tool-schema/transport violations are not semantic patch attempts.
         // With action-specific top-level required fields these should be
@@ -271,6 +298,84 @@ export default {
           }
         }
 
+        if (
+          forcedKind === "additive_surface" &&
+          state.executionState === EXEC_STATE_REPAIR &&
+          state.additiveRepairLock
+        ) {
+          const repairAuthorityOk =
+            state.additiveRepairLock?.tool === toolName &&
+            additiveRepairAuthorityMatches({
+              hint: state.additiveRepairLock,
+              capability: state.additiveMutationCapability,
+              executionContextSha256:
+                state.executionContextCapsuleSha256,
+            })
+
+          if (!repairAuthorityOk) {
+            state.additiveRepairLock = null
+            applyExecutionEvent(
+              state,
+              "fatal",
+              "additive_repair_authority_drift",
+            )
+            await trace({
+              admitted: false,
+              failure_layer: "orchestrator_contract",
+              reason: "additive_repair_authority_drift",
+              action: "stop",
+              compiler_run: false,
+              executor_run: false,
+            })
+            return {
+              content:
+                "PATCH_STOP reason=additive_repair_authority_drift " +
+                "action=report_blocked",
+              metadata: {
+                protocol: EXECUTION_LOOP_PROTOCOL,
+                action: "stop",
+                reason: "additive_repair_authority_drift",
+                failure_layer: "orchestrator_contract",
+                compiler_run: false,
+                executor_run: false,
+              },
+            }
+          }
+        }
+
+        if (
+          forcedKind === "additive_surface" &&
+          state.executionContextBlockReason
+        ) {
+          const contextBlockReason =
+            state.executionContextBlockReason
+          applyExecutionEvent(
+            state,
+            "fatal",
+            contextBlockReason,
+          )
+          await trace({
+            admitted: false,
+            failure_layer: "orchestrator_contract",
+            reason: contextBlockReason,
+            action: "stop",
+            compiler_run: false,
+            executor_run: false,
+          })
+          return {
+            content:
+              `PATCH_STOP reason=${contextBlockReason} ` +
+              "action=report_blocked",
+            metadata: {
+              protocol: EXECUTION_LOOP_PROTOCOL,
+              action: "stop",
+              reason: contextBlockReason,
+              failure_layer: "orchestrator_contract",
+              compiler_run: false,
+              executor_run: false,
+            },
+          }
+        }
         state.activeMutationTool = toolName
 
         if (state.executionState === EXEC_STATE_REPAIR) {
@@ -281,11 +386,41 @@ export default {
         state.lastSeen = nowMs()
 
         const authorization =
-          await materializeCapabilityBoundMutation(
-            root,
-            state,
-            input,
-          )
+          forcedKind === "additive_surface"
+            ? await (async () => {
+                const plan = await materializeAdditiveMutationPlan({
+                  root,
+                  capability: state.additiveMutationCapability,
+                  request: obligationBoundRequest.request,
+                })
+                if (plan.ok === true) {
+                  return {
+                    ...plan,
+                    handoff_path: state.additiveMutationHandoffPath,
+                  }
+                }
+
+                const repairHint = buildAdditiveRepairHint({
+                  failure: plan,
+                  capability: state.additiveMutationCapability,
+                  request: obligationBoundRequest.request,
+                  executionContextSha256:
+                    state.executionContextCapsuleSha256,
+                  previousRepairHint:
+                    state.additiveRepairLock,
+                })
+                return {
+                  ...plan,
+                  repairable: repairHint.repairable === true,
+                  rescout: false,
+                  repair_hint: repairHint,
+                }
+              })()
+            : await materializeCapabilityBoundMutation(
+                root,
+                state,
+                input,
+              )
 
         if (authorization.ok !== true) {
           const reason =
@@ -298,11 +433,59 @@ export default {
               ? authorization.detail
               : reason
 
+          const authorizationFailureLayer =
+            forcedKind === "additive_surface" &&
+            reason === "additive_plan_coverage_incomplete"
+              ? "synthesis_validation"
+              : "scope_authorization"
+
           const canRetryAuthorization =
             authorization.repairable === true &&
             state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
 
           if (canRetryAuthorization) {
+            const additiveRepairHint =
+              forcedKind === "additive_surface"
+                ? authorization.repair_hint ?? null
+                : null
+
+            if (forcedKind === "additive_surface") {
+              if (
+                additiveRepairHint?.repairable !== true ||
+                !additiveRepairAuthorityMatches({
+                  hint: additiveRepairHint,
+                  capability: state.additiveMutationCapability,
+                  executionContextSha256:
+                    state.executionContextCapsuleSha256,
+                })
+              ) {
+                state.additiveRepairLock = null
+                applyExecutionEvent(
+                  state,
+                  "fatal",
+                  "additive_repair_authority_unavailable",
+                )
+                return {
+                  content:
+                    "PATCH_STOP reason=additive_repair_authority_unavailable " +
+                    "action=report_blocked",
+                  metadata: {
+                    protocol: EXECUTION_LOOP_PROTOCOL,
+                    action: "stop",
+                    reason: "additive_repair_authority_unavailable",
+                    failure_layer: "orchestrator_contract",
+                    compiler_run: false,
+                    executor_run: false,
+                  },
+                }
+              }
+
+              state.additiveRepairLock = Object.freeze({
+                ...additiveRepairHint,
+                tool: toolName,
+              })
+            }
+
             applyExecutionEvent(
               state,
               "patch_retry",
@@ -311,26 +494,78 @@ export default {
 
             await trace({
               admitted: false,
-              failure_layer: "scope_authorization",
+              failure_layer: authorizationFailureLayer,
               reason,
               scope_detail: detail,
+              repair_hint: additiveRepairHint,
               action: "retry",
               compiler_run: false,
               executor_run: false,
             })
 
+            const repairAction =
+              forcedKind === "additive_surface"
+                ? "revise_additive_transaction"
+                : "revise_semantic_owner_binding"
+            const repairDetail =
+              additiveRepairHint
+                ? ` repair_protocol=${ADDITIVE_REPAIR_HINT_PROTOCOL}` +
+                  ` operation_index=${additiveRepairHint.operation_index ?? "none"}` +
+                  ` field=${additiveRepairHint.field ?? "none"}`
+                : ""
+            const repairCoverageDetail =
+              additiveRepairHint
+                ? [
+                    [
+                      "missing_slots",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_slots,
+                    ],
+                    [
+                      "missing_roles",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_roles,
+                    ],
+                    [
+                      "missing_obligations",
+                      additiveRepairHint.failure_diagnostics
+                        ?.missing_obligations,
+                    ],
+                    [
+                      "observed_unused_existing_slots",
+                      additiveRepairHint.slot_usage
+                        ?.unused_existing_slots,
+                    ],
+                    [
+                      "observed_unused_create_slots",
+                      additiveRepairHint.slot_usage
+                        ?.unused_create_slots,
+                    ],
+                  ]
+                    .filter(([, values]) =>
+                      Array.isArray(values) && values.length > 0,
+                    )
+                    .map(([key, values]) =>
+                      ` ${key}=${values.join(",")}`,
+                    )
+                    .join("")
+                : ""
+
             return {
               content:
                 `PATCH_RETRY reason=${reason} ` +
                 `detail=${detail} ` +
-                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-                `action=revise_semantic_owner_binding`,
+                `attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN}` +
+                repairDetail +
+                repairCoverageDetail +
+                ` action=${repairAction}`,
               metadata: {
                 protocol: EXECUTION_LOOP_PROTOCOL,
                 action: "retry",
                 reason,
                 detail,
-                failure_layer: "scope_authorization",
+                repair_hint: additiveRepairHint,
+                failure_layer: authorizationFailureLayer,
                 compiler_run: false,
                 executor_run: false,
               },
@@ -350,7 +585,7 @@ export default {
 
             await trace({
               admitted: false,
-              failure_layer: "scope_authorization",
+              failure_layer: authorizationFailureLayer,
               reason,
               scope_detail: detail,
               action: "rescout",
@@ -369,7 +604,7 @@ export default {
                 action: "rescout",
                 reason,
                 detail,
-                failure_layer: "scope_authorization",
+                failure_layer: authorizationFailureLayer,
                 compiler_run: false,
                 executor_run: false,
               },
@@ -408,10 +643,14 @@ export default {
           }
         }
 
-        const mutation =
-          authorization.mutation
+        if (forcedKind === "additive_surface") {
+          state.additiveRepairLock = null
+        }
 
-        const mutations = [mutation]
+        const mutations =
+          Array.isArray(authorization.mutations)
+            ? authorization.mutations
+            : [authorization.mutation]
 
         const activeMutationHandoffPath =
           authorization.handoff_path
@@ -881,60 +1120,8 @@ export default {
         }
     }
 
-    await track(ctx.tool.transform((tools) => {
-      tools.add({
-        name: "search",
-        description:
-          "Search the active project with 1 to 4 regular expressions in one call. " +
-          "Search first performs repository-wide lexical discovery, applies bounded deterministic structural BM25F/RRF reranking when available, and keeps query fairness separate from relevance, " +
-          "and probes up to eight candidates before emitting at most four evidence files in the same tool call. " +
-          "Returns bounded line-numbered evidence and explicit completeness metadata. " +
-          "lexical_discovery_complete=true means the file-level rg pass saw every matching file " +
-          "for the requested regex/path/glob. scan_complete=true is stronger: every discovered file " +
-          "was probed and every matching line was scanned. " +
-          "A ROUTE block is heuristic routing only; retained_unemitted files remain lexical candidates " +
-          "and must not be treated as irrelevant or absent. " +
-          "Completeness is lexical: scan_complete=true means all matches for the requested " +
-          "regex/path/glob were scanned across the probed universe, not that a semantic category is exhaustively absent. " +
-          "evidence_complete=true means every discovered hit line is represented, not that " +
-          "the surrounding function or file is fully shown. representation=focused adds bounded " +
-          "containing-scope context chosen from structurally relevant non-module matches but still " +
-          "does not imply whole-file context. Turn evidence is deduplicated: prior_evidence_reused=true " +
-          "means omitted facts remain available in earlier tool results. Scope contextualization is one-shot " +
-          "per hit within a turn; SEARCH_NO_PROGRESS means change the search dimension instead of retrying " +
-          "equivalent context. representation=index is now only a narrow-scope fallback when selected line " +
-          "evidence itself cannot fit or complete; broad repository routing is probed and budgeted before returning. " +
-          "When Scout proves one mutation-authorized structural owner, v2.18 derives a bounded local capability even if unrelated global discovery remains partial; competing production owners fail closed. Global rename still requires a globally ready handoff. The causal controller then exposes only capability-derived action-specific mutation tools.",
-        input: {
-          type: "object",
-          properties: {
-            queries: {
-              type: "array",
-              minItems: 1,
-              maxItems: MAX_QUERIES,
-              items: { type: "string", minLength: 1, maxLength: 200 },
-              description: "One to four regular expressions.",
-            },
-            path: {
-              type: "string",
-              minLength: 1,
-              description: "Optional project-relative file or directory. Default: project root.",
-            },
-            glob: {
-              type: "string",
-              minLength: 1,
-              description: "Optional file glob such as **/*.py.",
-            },
-          },
-          required: ["queries"],
-          additionalProperties: false,
-        },
-        options: {
-          codemode: false,
-          permission: "search",
-        },
-
-        execute: async (input, toolContext) => {
+    // E2.3-A: one Scout implementation, two entry paths.
+    const deterministicSearchExecutor = async (input, toolContext) => {
           const started = performance.now()
           const sessionID =
             typeof toolContext?.sessionID === "string" && toolContext.sessionID.length > 0
@@ -943,6 +1130,8 @@ export default {
 
           const state = getSessionState(sessionID)
           const root = await rootForTool(ctx, toolContext, sessionID, state)
+          const observedModelLatencyMs =
+            observeModelLatencyAtToolBoundary(state)
 
           if (!root) {
             return {

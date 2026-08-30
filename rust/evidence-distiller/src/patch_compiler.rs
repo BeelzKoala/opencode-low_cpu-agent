@@ -6,6 +6,7 @@ use opencode_evidence_distiller::impact_index_core::{
     SymbolClosureBinding, resolve_symbol_closure,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -18,12 +19,21 @@ const PROTOCOL: &str = "patch-compiler-v2";
 const MUTATION_PROTOCOL: &str = "mutation-plan-v1";
 const EDIT_PROTOCOL: &str = "edit-script-v3-certified-slice";
 const HANDOFF_PROTOCOL: &str = "scout-handoff-v1";
+const BASE_STATE_PROTOCOL: &str = "sealed-base-state-v1";
 const LOCAL_CAPABILITY_PROTOCOL: &str = "scout-local-capability-v1";
+const ADDITIVE_CAPABILITY_PROTOCOL: &str = "scout-additive-capability-v1";
 const MUTATION_CONFINEMENT_PROTOCOL: &str = "mutation-slice-v1";
 const MAX_STRUCTURAL_SLICE_NODES: usize = 16;
-const MAX_MUTATIONS: usize = 4;
-const MAX_LOWERED_EDITS: usize = 4;
-const MAX_CHANGED_FILES: usize = 2;
+const MAX_MUTATIONS: usize = 8;
+const MAX_LOWERED_EDITS: usize = 8;
+const MAX_CHANGED_FILES: usize = 5;
+const LEGACY_MAX_MUTATIONS: usize = 4;
+const LEGACY_MAX_LOWERED_EDITS: usize = 4;
+const LEGACY_MAX_CHANGED_FILES: usize = 2;
+const ADDITIVE_MAX_CREATE_DEPTH: usize = 2;
+const ADDITIVE_MAX_REPLACE_BYTES: usize = 12 * 1024;
+const ADDITIVE_MAX_CREATE_BYTES: usize = 16 * 1024;
+const ADDITIVE_MAX_PLAN_BYTES: usize = 32 * 1024;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
@@ -57,6 +67,8 @@ struct Mutation {
     new_name: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +90,8 @@ struct ScoutHandoff {
     #[serde(default)]
     capability: Option<LocalMutationCapability>,
     #[serde(default)]
+    additive_capability: Option<AdditiveMutationCapability>,
+    #[serde(default)]
     files: Vec<HandoffFile>,
 }
 
@@ -92,6 +106,38 @@ struct LocalMutationCapability {
 struct LocalMutationTarget {
     file: String,
     symbol_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveMutationCapability {
+    protocol: String,
+    operation: String,
+    existing_slots: Vec<AdditiveExistingSlot>,
+    create_slots: Vec<AdditiveCreateSlot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveExistingSlot {
+    slot: String,
+    file: String,
+    sha256: String,
+    #[serde(default)]
+    evidence_lines: Vec<usize>,
+    #[serde(default)]
+    allowed_operations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdditiveCreateSlot {
+    slot: String,
+    root: String,
+    source_file: String,
+    source_sha256: String,
+    #[serde(default)]
+    allowed_extensions: Vec<String>,
+    max_depth: usize,
+    #[serde(default)]
+    allowed_operations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +159,15 @@ struct SliceConfinement {
     envelope: String,
 }
 
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct BasePrecondition {
+    protocol: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct Edit {
     file: String,
@@ -121,6 +176,8 @@ struct Edit {
     after: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     confinement: Option<SliceConfinement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<BasePrecondition>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,9 +340,11 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
             }
             Ok(())
         }
+        Some("additive_mutation_capability") => validate_additive_handoff(handoff),
         Some(_) => Err("handoff_scope_mode_invalid"),
     }
 }
+
 
 fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool {
     match handoff.scope_mode.as_deref() {
@@ -301,9 +360,117 @@ fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool 
                 && capability.target.symbol_name == mutation.symbol
                 && safe_rel(&capability.target.file) == safe_rel(&mutation.file)
         }
+        Some("additive_mutation_capability") => {
+            let Some(capability) = handoff.additive_capability.as_ref() else {
+                return false;
+            };
+            if mutation.symbol != "<additive>"
+                || !handoff.allowed_mutations.iter().any(|value| value == &mutation.kind)
+            {
+                return false;
+            }
+            let Some(file) = safe_rel(&mutation.file) else {
+                return false;
+            };
+            match mutation.kind.as_str() {
+                "replace_exact" => capability.existing_slots.iter().any(|slot| {
+                    safe_rel(&slot.file).as_deref() == Some(file.as_str())
+                        && slot.allowed_operations.iter().any(|op| op == "replace_exact")
+                }),
+                "create_file" => capability.create_slots.iter().any(|slot| {
+                    additive_create_slot_allows(slot, &file)
+                }),
+                _ => false,
+            }
+        }
         None => true,
         Some(_) => false,
     }
+}
+
+
+fn extension_with_dot(rel: &str) -> Option<String> {
+    let ext = Path::new(rel).extension()?.to_str()?;
+    if ext.is_empty() { None } else { Some(format!(".{ext}").to_lowercase()) }
+}
+
+fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
+    if slot.slot.is_empty()
+        || slot.max_depth == 0
+        || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
+        || !slot.allowed_operations.iter().any(|op| op == "create_file")
+    {
+        return false;
+    }
+    let Some(root) = safe_rel(&slot.root) else { return false; };
+    let Some(file) = safe_rel(rel) else { return false; };
+    let prefix = format!("{root}/");
+    let Some(rest) = file.strip_prefix(&prefix) else { return false; };
+    if rest.is_empty() || rest.split('/').count() > slot.max_depth {
+        return false;
+    }
+    let Some(ext) = extension_with_dot(&file) else { return false; };
+    slot.allowed_extensions.iter().any(|allowed| allowed.to_lowercase() == ext)
+}
+
+fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
+    let Some(capability) = handoff.additive_capability.as_ref() else {
+        return Err("additive_capability_invalid");
+    };
+    if handoff.capability_protocol.as_deref() != Some(ADDITIVE_CAPABILITY_PROTOCOL)
+        || capability.protocol != ADDITIVE_CAPABILITY_PROTOCOL
+        || capability.operation != "additive_surface"
+        || capability.existing_slots.is_empty()
+        || capability.create_slots.is_empty()
+        || handoff.allowed_mutations.len() != 2
+        || !handoff.allowed_mutations.iter().any(|value| value == "replace_exact")
+        || !handoff.allowed_mutations.iter().any(|value| value == "create_file")
+    {
+        return Err("additive_capability_invalid");
+    }
+
+    let handoff_files = handoff
+        .files
+        .iter()
+        .filter_map(|row| safe_rel(&row.file))
+        .collect::<BTreeSet<_>>();
+
+    for slot in &capability.existing_slots {
+        let Some(file) = safe_rel(&slot.file) else {
+            return Err("additive_existing_slot_invalid");
+        };
+        if slot.slot.is_empty()
+            || slot.sha256.len() != 64
+            || !slot.sha256.chars().all(|c| c.is_ascii_hexdigit())
+            || slot.evidence_lines.is_empty()
+            || !slot.allowed_operations.iter().any(|op| op == "replace_exact")
+            || !handoff_files.contains(&file)
+        {
+            return Err("additive_existing_slot_invalid");
+        }
+    }
+
+    for slot in &capability.create_slots {
+        let Some(source) = safe_rel(&slot.source_file) else {
+            return Err("additive_create_slot_invalid");
+        };
+        let Some(root) = safe_rel(&slot.root) else {
+            return Err("additive_create_slot_invalid");
+        };
+        if slot.slot.is_empty()
+            || slot.source_sha256.len() != 64
+            || !slot.source_sha256.chars().all(|c| c.is_ascii_hexdigit())
+            || slot.allowed_extensions.is_empty()
+            || slot.max_depth == 0
+            || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
+            || !slot.allowed_operations.iter().any(|op| op == "create_file")
+            || !handoff_files.contains(&source)
+            || Path::new(&source).parent().and_then(normalize_rel).as_deref() != Some(root.as_str())
+        {
+            return Err("additive_create_slot_invalid");
+        }
+    }
+    Ok(())
 }
 
 fn nearest_evidence_distance(line: usize, evidence: &[usize]) -> Option<usize> {
@@ -455,6 +622,7 @@ fn compile_replace_body(
         before,
         after,
         confinement: None,
+        base: None,
     }))
 }
 
@@ -514,6 +682,7 @@ fn compile_replace_expr(
         before,
         after,
         confinement: None,
+        base: None,
     }))
 }
 
@@ -754,6 +923,7 @@ fn compile_replace_node(
             end_byte: slice_range.end,
             envelope: envelope.to_string(),
         }),
+        base: None,
     }))
 }
 
@@ -1322,6 +1492,7 @@ fn compile_python_import_binding(
         before: binding.witness.clone(),
         after: import_after,
         confinement: None,
+        base: None,
     }];
 
     /*
@@ -1429,6 +1600,7 @@ fn compile_python_import_binding(
                 before,
                 after,
                 confinement: None,
+                base: None,
             });
         }
     }
@@ -1789,6 +1961,7 @@ fn compile_rename(
                 before,
                 after,
                 confinement: None,
+                base: None,
             });
         }
     }
@@ -1836,6 +2009,128 @@ fn compile_rename(
     Ok(edits)
 }
 
+fn compile_additive_replace(
+    file: &AllowedFile,
+    mutation: &Mutation,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let before = mutation.before.as_deref().ok_or("mutation_contract_invalid")?;
+    let replacement = mutation.replacement.as_deref().ok_or("mutation_contract_invalid")?;
+    if before.is_empty()
+        || before.len() > ADDITIVE_MAX_REPLACE_BYTES
+        || replacement.len() > ADDITIVE_MAX_REPLACE_BYTES
+        || before.contains('\0')
+        || replacement.contains('\0')
+        || before == replacement
+    {
+        return Err("mutation_contract_invalid");
+    }
+    if count_exact(&file.source, before) != 1 {
+        return Err("edit_precondition_not_unique");
+    }
+    let byte = file.source.find(before).ok_or("edit_precondition_missing")?;
+    let line = line_for_byte(&file.source, byte);
+    let Some(distance) = nearest_evidence_distance(line, &file.evidence_lines) else {
+        return Err("evidence_anchor_missing");
+    };
+    if distance > MAX_EVIDENCE_DISTANCE_LINES {
+        return Err("evidence_anchor_too_far");
+    }
+    let after_source = file.source.replacen(before, replacement, 1);
+    let validity = validate_candidate(&file.path, &after_source);
+    if let Some(reason) = validity.failure_reason() {
+        return Err(reason);
+    }
+    Ok(Some(Edit {
+        file: file.rel.clone(),
+        kind: "replace_exact".to_string(),
+        before: before.to_string(),
+        after: replacement.to_string(),
+        confinement: None,
+        base: None,
+    }))
+}
+
+fn compile_additive_create(
+    root: &Path,
+    handoff: &ScoutHandoff,
+    mutation: &Mutation,
+) -> std::result::Result<Option<Edit>, &'static str> {
+    let content = mutation.content.as_deref().ok_or("mutation_contract_invalid")?;
+    if content.is_empty() || content.len() > ADDITIVE_MAX_CREATE_BYTES || content.contains('\0') {
+        return Err("mutation_contract_invalid");
+    }
+    let rel = safe_rel(&mutation.file).ok_or("mutation_file_invalid")?;
+    let capability = handoff.additive_capability.as_ref().ok_or("additive_capability_invalid")?;
+    let slot = capability
+        .create_slots
+        .iter()
+        .find(|slot| additive_create_slot_allows(slot, &rel))
+        .ok_or("mutation_not_authorized_by_handoff")?;
+    let target = root.join(&rel);
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Err("create_target_exists"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err("create_target_state_unavailable"),
+    }
+    let parent = target.parent().ok_or("create_parent_invalid")?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|_| "create_parent_unavailable")?;
+    let create_root = safe_rel(&slot.root).ok_or("additive_create_slot_invalid")?;
+    let canonical_create_root =
+        fs::canonicalize(root.join(create_root)).map_err(|_| "create_root_unavailable")?;
+    if canonical_parent != canonical_create_root && !canonical_parent.starts_with(&canonical_create_root) {
+        return Err("create_parent_escape");
+    }
+    let validity = validate_candidate(&target, content);
+    if let Some(reason) = validity.failure_reason() {
+        return Err(reason);
+    }
+    Ok(Some(Edit {
+        file: rel,
+        kind: "create_file".to_string(),
+        before: String::new(),
+        after: content.to_string(),
+        confinement: None,
+        base: None,
+    }))
+}
+
+
+fn sha256_source(source: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn seal_edit_base_states(
+    edits: &mut [Edit],
+    allowed: &BTreeMap<String, AllowedFile>,
+) -> std::result::Result<(), &'static str> {
+    for edit in edits {
+        let rel = safe_rel(&edit.file).ok_or("base_precondition_file_invalid")?;
+
+        if edit.kind == "create_file" {
+            edit.base = Some(BasePrecondition {
+                protocol: BASE_STATE_PROTOCOL.to_string(),
+                state: "absent".to_string(),
+                sha256: None,
+            });
+            continue;
+        }
+
+        let file = allowed
+            .get(&rel)
+            .ok_or("base_precondition_source_missing")?;
+
+        edit.base = Some(BasePrecondition {
+            protocol: BASE_STATE_PROTOCOL.to_string(),
+            state: "existing_regular_file".to_string(),
+            sha256: Some(sha256_source(&file.source)),
+        });
+    }
+
+    Ok(())
+}
+
 fn compile(request: &Request) -> Result<Response> {
     if request.mutation_protocol != MUTATION_PROTOCOL {
         return Ok(Response::rejected(
@@ -1870,6 +2165,28 @@ fn compile(request: &Request) -> Result<Response> {
     }
     if let Err(reason) = validate_handoff_capability(&handoff) {
         return Ok(Response::rejected(request, reason, None));
+    }
+
+    let additive_scope =
+        handoff.scope_mode.as_deref() == Some("additive_mutation_capability");
+    if !additive_scope && request.mutations.len() > LEGACY_MAX_MUTATIONS {
+        return Ok(Response::rejected(request, "mutation_count_invalid", None));
+    }
+
+    if additive_scope {
+        let mut plan_bytes = 0usize;
+        for mutation in &request.mutations {
+            let payload = match mutation.kind.as_str() {
+                "replace_exact" => mutation.before.as_ref().map(String::len).unwrap_or(0)
+                    .saturating_add(mutation.replacement.as_ref().map(String::len).unwrap_or(0)),
+                "create_file" => mutation.content.as_ref().map(String::len).unwrap_or(0),
+                _ => 0,
+            };
+            plan_bytes = plan_bytes.saturating_add(payload);
+        }
+        if plan_bytes > ADDITIVE_MAX_PLAN_BYTES {
+            return Ok(Response::rejected(request, "additive_plan_byte_budget", None));
+        }
     }
 
     let mut allowed = BTreeMap::<String, AllowedFile>::new();
@@ -1919,6 +2236,7 @@ fn compile(request: &Request) -> Result<Response> {
         if mutation.symbol.is_empty()
             || mutation.symbol.len() > 256
             || mutation.symbol.contains('\0')
+            || (additive_scope && mutation.symbol != "<additive>")
         {
             return Ok(Response::rejected(
                 request,
@@ -1933,13 +2251,14 @@ fn compile(request: &Request) -> Result<Response> {
                 Some(idx),
             ));
         };
-        let Some(file) = allowed.get(&rel) else {
+        let file = allowed.get(&rel);
+        if mutation.kind != "create_file" && file.is_none() {
             return Ok(Response::rejected(
                 request,
                 "file_outside_handoff",
                 Some(idx),
             ));
-        };
+        }
         let key = serde_json::to_string(mutation).context("cannot canonicalize mutation")?;
         if !seen_mutations.insert(key) {
             dropped_duplicates += 1;
@@ -1947,23 +2266,36 @@ fn compile(request: &Request) -> Result<Response> {
         }
 
         let compiled = match mutation.kind.as_str() {
-            "replace_body" => match compile_replace_body(file, mutation) {
+            "replace_body" => match compile_replace_body(file.expect("validated existing file"), mutation) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
-            "replace_node" => match compile_replace_node(file, mutation, idx) {
+            "replace_node" => match compile_replace_node(file.expect("validated existing file"), mutation, idx) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
-            "replace_expr" => match compile_replace_expr(file, mutation) {
+            "replace_expr" => match compile_replace_expr(file.expect("validated existing file"), mutation) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
-            "rename_symbol" => match compile_rename(&root, &allowed, file, mutation) {
+            "rename_symbol" => match compile_rename(&root, &allowed, file.expect("validated existing file"), mutation) {
                 Ok(values) => values,
+                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+            },
+            "replace_exact" => match compile_additive_replace(
+                file.expect("validated existing file"),
+                mutation,
+            ) {
+                Ok(Some(edit)) => vec![edit],
+                Ok(None) => Vec::new(),
+                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+            },
+            "create_file" => match compile_additive_create(&root, &handoff, mutation) {
+                Ok(Some(edit)) => vec![edit],
+                Ok(None) => Vec::new(),
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
             _ => {
@@ -1997,13 +2329,18 @@ fn compile(request: &Request) -> Result<Response> {
 
     edits.sort();
     edits.dedup();
+    if let Err(reason) = seal_edit_base_states(&mut edits, &allowed) {
+        return Ok(Response::rejected(request, reason, None));
+    }
     if edits.is_empty() {
         let mut response = Response::rejected(request, "no_effect_plan", None);
         response.dropped_noops = dropped_noops;
         response.dropped_duplicates = dropped_duplicates;
         return Ok(response);
     }
-    if edits.len() > MAX_LOWERED_EDITS {
+    let edit_limit =
+        if additive_scope { MAX_LOWERED_EDITS } else { LEGACY_MAX_LOWERED_EDITS };
+    if edits.len() > edit_limit {
         return Ok(Response::rejected(
             request,
             "lowered_edit_budget_exceeded",
@@ -2014,7 +2351,8 @@ fn compile(request: &Request) -> Result<Response> {
         .iter()
         .map(|edit| edit.file.clone())
         .collect::<BTreeSet<_>>();
-    if changed_files.len() > MAX_CHANGED_FILES {
+    let changed_file_limit = if additive_scope { MAX_CHANGED_FILES } else { LEGACY_MAX_CHANGED_FILES };
+    if changed_files.len() > changed_file_limit {
         return Ok(Response::rejected(
             request,
             "changed_file_budget_exceeded",
@@ -2137,6 +2475,7 @@ mod tests {
             replacement: None,
             new_name: Some(new_name.to_string()),
             scope: Some("handoff".to_string()),
+            content: None,
         }
     }
 

@@ -335,6 +335,35 @@ export function compileTaskAnchors(
   }
 
   /*
+   * Explicit constant-like identifiers.
+   * Observation only: no graph/localization/mutation authority by itself.
+   */
+  const constantIdentifierPattern =
+    /\b[A-Z][A-Z0-9_]{2,79}\b/gu
+
+  for (
+    const match of
+    taskText.matchAll(
+      constantIdentifierPattern,
+    )
+  ) {
+    pushAnchor(
+      anchors,
+      seen,
+      {
+        kind:
+          "constant_identifier",
+
+        value:
+          match[0],
+
+        index:
+          match.index,
+      },
+    )
+  }
+
+  /*
    * Artifact extension is useful task telemetry,
    * but deliberately has no graph seed authority.
    */

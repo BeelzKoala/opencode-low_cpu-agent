@@ -14,9 +14,60 @@ import tempfile
 import time
 from typing import Any
 
+from v228_e27_timeout_contract import (
+    finalize_timeout_result,
+    observe_harness_timeout,
+    resolve_harness_timeout_contract,
+    timeout_contract_result_fields,
+)
+
 
 PROTOCOL = "real-task-benchmark-v1"
 MAX_CAPTURE_CHARS = 20_000
+
+
+TIME_SEMANTICS_PROTOCOL = "time-semantics-v1"
+
+
+def normalize_time_semantics(result: dict[str, Any]) -> dict[str, Any]:
+    # Classification-only: grants no cancellation, scheduling, mutation,
+    # verification, or backend-reuse authority.
+    result.setdefault("time_semantics_protocol", TIME_SEMANTICS_PROTOCOL)
+    result.setdefault(
+        "governor_task_window_semantics",
+        "admission_guardrail",
+    )
+    result.setdefault("product_task_sla_enforced", False)
+    result.setdefault("product_task_sla_ms", None)
+    result.setdefault("product_watchdog_mode", "observation_only")
+    result.setdefault("production_hard_lease_promoted", False)
+    result.setdefault("benchmark_deadline_authority", "benchmark_only")
+
+    timed_out = result.get("cli_timed_out") is True
+    result["benchmark_deadline_exceeded"] = timed_out
+
+    if (
+        timed_out
+        and result.get("model_call_status") == "inflight_at_harness_timeout"
+    ):
+        # Observation ended while inference remained in flight. This does not
+        # prove a product implementation bug, backend stall, successful
+        # transport cancellation, or compute quiescence.
+        result.update({
+            "result": "SAFE_FAIL",
+            "failure_class": "environment_bug",
+            "failure_class_confidence": "unresolved",
+            "reason": "benchmark_observation_timeout_model_inflight",
+            "timeout_failure_class": "environment_bug",
+            "timeout_failure_reason":
+                "benchmark_observation_timeout_model_inflight",
+            "product_failure_proven": False,
+            "backend_liveness_status": "unresolved_model_inflight",
+            "transport_cancel_proven": False,
+            "compute_quiescence_proven": False,
+        })
+
+    return result
 
 
 def run(
@@ -307,6 +358,22 @@ def changed_stats(worktree: Path) -> tuple[int, int]:
 
         lines += add + delete
 
+    untracked = git(worktree, "ls-files", "--others", "--exclude-standard")
+    if untracked["rc"] == 0:
+        for raw in untracked["stdout"].splitlines():
+            rel = raw.strip()
+            if not rel:
+                continue
+            candidate = worktree / rel
+            if not candidate.is_file():
+                continue
+            files += 1
+            try:
+                data = candidate.read_bytes()
+                lines += data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+            except OSError:
+                pass
+
     return files, lines
 
 
@@ -339,6 +406,13 @@ def extract_failure_reason(
     if searches:
         output = tool_output(searches[-1])
 
+        if "SEARCH_STOP" in output:
+            marker = "reason="
+            pos = output.find(marker)
+            if pos >= 0:
+                return output[pos + len(marker):].split()[0]
+            return "search_stop"
+
         if "SEARCH_NO_PROGRESS" in output:
             return "scout_no_progress"
 
@@ -362,6 +436,20 @@ def extract_failure_reason(
     return "no_candidate"
 
 
+def safe_fail_class(reason: str, *, searches: bool, timed_out: bool) -> str:
+    if reason in {
+        "mutation_capability_unavailable",
+        "mutation_target_ambiguous",
+        "scout_evidence_exhausted",
+    }:
+        return "architecture_bug"
+
+    if not searches and timed_out:
+        return "environment_bug"
+
+    return "implementation_bug"
+
+
 def run_agent(
     opencode: Path,
     worktree: Path,
@@ -370,18 +458,12 @@ def run_agent(
     stdout_path: Path,
     stderr_path: Path,
 ) -> dict[str, Any]:
-    full_prompt = (
-        "Use only search and execute_patch. "
-        "Do not use shell or direct filesystem mutation tools. "
-        "Treat the following as a developer task; determine localization, "
-        "affected scope and mutation yourself. "
-        "Do not ask for filenames, symbols or mutation kinds. "
-        "Use at most the bounded repair allowed by the tool. "
-        "When PATCH_READY or PATCH_STOP is returned, stop.\n\n"
-        f"TASK:\n{prompt}"
-    )
+    # Benchmark authority is the immutable fixture task itself.
+    # Runtime/tool controls must not contaminate Task-derived IR.
+    full_prompt = prompt
 
     started = time.monotonic()
+    started_at_ms = time.time_ns() // 1_000_000
 
     with stdout_path.open("w", encoding="utf-8") as stdout, \
          stderr_path.open("w", encoding="utf-8") as stderr:
@@ -424,10 +506,14 @@ def run_agent(
 
             rc = 124
 
+    ended_at_ms = time.time_ns() // 1_000_000
+
     return {
         "rc": rc,
         "timed_out": timed_out,
         "elapsed_s": round(time.monotonic() - started, 3),
+        "started_at_ms": started_at_ms,
+        "ended_at_ms": ended_at_ms,
     }
 
 
@@ -556,6 +642,8 @@ def run_task(
     }
 
     worktree: Path | None = None
+    agent: dict[str, Any] = {}
+    timeout_observation: dict[str, Any] = {}
 
     try:
         if not (repo / ".git").exists():
@@ -632,17 +720,24 @@ def run_task(
                     "reason": f"setup_failed:{index}",
                     "setup": setup_results,
                 })
-                return result
+                return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         require_clean_tracked(worktree)
 
         stdout_path = artifact_dir / "agent.stdout.jsonl"
         stderr_path = artifact_dir / "agent.stderr"
 
-        timeout_s = task.get(
+        requested_timeout_s = task.get(
             "timeout_s",
             defaults.get("timeout_s", 180),
         )
+        timeout_contract = resolve_harness_timeout_contract(
+            task=task,
+            defaults=defaults,
+            requested_timeout_s=requested_timeout_s,
+        )
+        timeout_s = timeout_contract["effective_timeout_s"]
+        result.update(timeout_contract_result_fields(timeout_contract))
 
         agent = run_agent(
             opencode,
@@ -655,11 +750,42 @@ def run_task(
 
         rows = load_json_lines(stdout_path)
         searches = tool_records(rows, "search")
-        patches = tool_records(rows, "execute_patch")
+        mutation_tools = (
+            "execute_patch",
+            "execute_replace_node",
+            "execute_rename_symbol",
+            "execute_additive_plan",
+        )
+        patches = [
+            row
+            for tool_name in mutation_tools
+            for row in tool_records(rows, tool_name)
+        ]
+        patches.sort(
+            key=lambda row: rows.index(row)
+            if row in rows
+            else len(rows)
+        )
 
         cpu_trace_rows = load_json_lines(
             worktree / ".opencode" / "cpu-agent-trace.jsonl"
         )
+        timeout_observation = observe_harness_timeout(
+            contract=timeout_contract,
+            cpu_trace_rows=cpu_trace_rows,
+            agent=agent,
+        )
+        result.update(timeout_observation)
+        if (
+            timeout_observation.get("governor_budget_contract_status")
+            == "drift"
+        ):
+            result.update({
+                "result": "HARNESS_FAIL",
+                "failure_class": "benchmark_bug",
+                "reason": "governor_budget_contract_drift",
+            })
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
         dispatch_calls = [
             row.get("model_call")
             for row in cpu_trace_rows
@@ -694,10 +820,16 @@ def run_task(
             "cli_rc": agent["rc"],
             "cli_timed_out": agent["timed_out"],
             "wall_s": agent["elapsed_s"],
+            "cli_started_at_ms": agent["started_at_ms"],
+            "cli_ended_at_ms": agent["ended_at_ms"],
             "model_calls": model_calls,
             "model_dispatches": model_dispatches,
             "search_calls": len(searches),
             "execute_patch_calls": len(patches),
+            "mutation_calls": len(patches),
+            "execute_additive_plan_calls": len(
+                tool_records(rows, "execute_additive_plan")
+            ),
             "files_considered": files_considered,
             "setup": setup_results,
         })
@@ -735,7 +867,7 @@ def run_task(
                     "failure_class": "telemetry_bug",
                     "reason": "project_root_unattested",
                 })
-                return result
+                return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
             if any(root != expected_root for root in declared_roots):
                 result.update({
@@ -743,23 +875,24 @@ def run_task(
                     "failure_class": "environment_bug",
                     "reason": "project_root_mismatch",
                 })
-                return result
+                return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         if not patches:
+            failure_reason = extract_failure_reason(
+                searches,
+                patches,
+                agent["timed_out"],
+            )
             result.update({
                 "result": "SAFE_FAIL",
-                "failure_class": (
-                    "environment_bug"
-                    if not searches and agent["timed_out"]
-                    else "implementation_bug"
+                "failure_class": safe_fail_class(
+                    failure_reason,
+                    searches=bool(searches),
+                    timed_out=agent["timed_out"],
                 ),
-                "reason": extract_failure_reason(
-                    searches,
-                    patches,
-                    agent["timed_out"],
-                ),
+                "reason": failure_reason,
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         patch_row = patches[-1]
         patch_output = tool_output(patch_row)
@@ -802,7 +935,7 @@ def run_task(
                     agent["timed_out"],
                 ),
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         if trace and trace.get("proof_disposition") != "pass":
             result.update({
@@ -810,7 +943,7 @@ def run_task(
                 "failure_class": "architecture_bug",
                 "reason": "patch_ready_without_passing_proofs",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         patch_path = candidate_patch_path(
             worktree,
@@ -824,7 +957,7 @@ def run_task(
                 "failure_class": "telemetry_bug",
                 "reason": "candidate_patch_unavailable",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         candidate_copy = artifact_dir / "candidate.diff"
         shutil.copy2(patch_path, candidate_copy)
@@ -844,7 +977,7 @@ def run_task(
                 "failure_class": "implementation_bug",
                 "reason": "candidate_not_replayable",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         replay = git(
             worktree,
@@ -858,7 +991,7 @@ def run_task(
                 "failure_class": "implementation_bug",
                 "reason": "candidate_apply_failed",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         diff_check = git(worktree, "diff", "--check")
 
@@ -868,7 +1001,7 @@ def run_task(
                 "failure_class": "implementation_bug",
                 "reason": "candidate_diff_check_failed",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         changed_files, changed_lines = changed_stats(worktree)
 
@@ -883,7 +1016,7 @@ def run_task(
                 "failure_class": "architecture_bug",
                 "reason": budget_reason,
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         checks = task.get("checks")
 
@@ -893,7 +1026,7 @@ def run_task(
                 "failure_class": "benchmark_bug",
                 "reason": "no_acceptance_checks",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         checks_ok, check_results = execute_checks(
             worktree,
@@ -910,7 +1043,7 @@ def run_task(
                 "failure_class": "architecture_bug",
                 "reason": "task_acceptance_failed",
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         # The original repository may already be dirty. The invariant is
         # transactional: the agent must leave its tracked state exactly as it
@@ -925,7 +1058,7 @@ def run_task(
                 "base_state_before": base_state_before,
                 "base_state_after": base_state_after,
             })
-            return result
+            return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
         result.update({
             "result": "VERIFIED",
@@ -933,7 +1066,7 @@ def run_task(
             "reason": None,
         })
 
-        return result
+        return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
     except Exception as exc:
         result.update({
@@ -941,9 +1074,11 @@ def run_task(
             "failure_class": "benchmark_bug",
             "reason": str(exc),
         })
-        return result
+        return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
     finally:
+        normalize_time_semantics(result)
+
         if worktree is not None and worktree.exists():
             preserve_agent_artifacts(worktree, artifact_dir)
 
@@ -1052,6 +1187,37 @@ def main() -> int:
             json.dumps(row, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+        # R3A-R2: deterministic post-run cost reduction. This is shadow
+        # telemetry only; reducer failure must never change the task result.
+        reducer = Path(__file__).with_name("runtime-cost-reducer-v2.mjs")
+        reducer_stdout = task_dir / "runtime-cost-reducer.stdout"
+        reducer_stderr = task_dir / "runtime-cost-reducer.stderr"
+
+        try:
+            reduced = subprocess.run(
+                ["node", str(reducer), str(task_dir)],
+                cwd=Path(__file__).resolve().parents[2],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            reducer_stdout.write_text(
+                reduced.stdout[-MAX_CAPTURE_CHARS:],
+                encoding="utf-8",
+            )
+            reducer_stderr.write_text(
+                reduced.stderr[-MAX_CAPTURE_CHARS:],
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            reducer_stderr.write_text(
+                f"runtime cost reducer unavailable: {exc}\n",
+                encoding="utf-8",
+            )
 
     counts = {
         name: sum(1 for row in results if row.get("result") == name)
