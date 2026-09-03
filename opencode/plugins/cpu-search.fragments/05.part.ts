@@ -605,6 +605,17 @@ async function subscribeEvents(ctx) {
       const root = await rootFromSession(ctx, sessionID, state)
       if (!root) continue
 
+      try {
+        await observePublicEventTelemetry({
+          root,
+          event,
+          sessionID,
+          turnID: state.turnID,
+        })
+      } catch {
+        // Observation only. Public event telemetry must not affect execution.
+      }
+
       // Primary usage source in beta-17728: a step-finish message part.
       // Also accept the flattened CLI/public event shape observed under
       // `opencode2 run --format json` so telemetry survives API drift.

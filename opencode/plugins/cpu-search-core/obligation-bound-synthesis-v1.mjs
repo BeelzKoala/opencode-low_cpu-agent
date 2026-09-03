@@ -558,19 +558,57 @@ export function renderObligationBoundSynthesisContract(
   if (contract.ok !== true) return ""
 
   const lines = [
-    `SYNTHESIS_TRANSACTION protocol=${OBLIGATION_BOUND_SYNTHESIS_PROTOCOL} ` +
+    `MODEL_TOOL_ABI protocol=semantic-content-ir-v1 shape=contents[id,content] physical_lowering=closed-additive-mutation-abi-v3\nSYNTHESIS_TRANSACTION protocol=${OBLIGATION_BOUND_SYNTHESIS_PROTOCOL} ` +
       `sha256=${contract.contract_sha256} content_only=true all_required=true`,
   ]
   for (const row of contract.operations) {
     lines.push(
       `REQUIRED_OPERATION id=${row.id} obligation=${row.obligation} ` +
         `slot=${row.slot} operation=${row.kind} ` +
-        `payload=${row.payload_fields.join(",")}`,
+        `payload=${row.kind === "python_declaration" ? "content{kind=python_units,units[]}" : row.kind === "replacement" ? "content{kind=text,mode=before|after|replace,text} preimage=compiler_owned" : "content{kind=text,mode=create,text} create_path=compiler_owned"}`,
     )
   }
+  // Compatibility markers remain additive until every consumer has migrated.
+  // Do not repurpose or remove the frozen content-only authority token.
   lines.push(
     `SUPPORT_IMPORTS slot=${contract.support_import_slot} optional=true ` +
       "support_only=true target=model_forbidden",
+  )
+  lines.push(
+    `PYTHON_SEMANTIC_SHELL slot=${contract.support_import_slot} ` +
+      "mode=typed_units protocol=python-unit-shell-v2 " +
+      "imports=model_forbidden dependencies=model_forbidden " +
+      "module_bootstrap=model_forbidden existing_symbols=model_forbidden " +
+      "existing_routes=model_forbidden",
+  )
+  lines.push(
+    "PYTHON_UNIT_SHELL protocol=python-unit-shell-v2 " +
+      "kinds=function,async_function,class,assignment " +
+      "shape=content{kind=python_units,units[]} " +
+      "functions=suite[ruff_validated_statement_chunk] classes=members[typed_member] " +
+      "outer_indent=compiler_owned raw_body=model_forbidden " +
+      "imports=zero_authority_hints globals=model_forbidden nonlocals=model_forbidden",
+  )
+  lines.push(
+    "NON_PYTHON_CONTENT protocol=semantic-text-v2 " +
+      "shape=content{kind=text,mode,text} modes=before,after,replace,create " +
+      "preimage=compiler_owned create_path=compiler_owned placeholders=model_forbidden " +
+      "resource_ref=resource://op_N",
+  )
+  lines.push(
+    "SEMANTIC_CANONICALIZER protocol=semantic-canonicalizer-v1 " +
+      "parser=ruff_python_parser authority=monotonic_reducer " +
+      "wrapper=exact_unwrap static_imports=zero_authority_hints " +
+      "dynamic_imports=fail_closed ambiguity=fail_closed",
+  )
+  lines.push(
+    "PYTHON_BINDING_LINKER existing_source=true repo_import_index=true " +
+      "stdlib=true declared_dependencies=true unknown=fail_closed " +
+      "aliases=compiler_canonicalized parser=ruff_python_parser",
+  )
+  lines.push(
+    "PROVENANCE agent=koalik protocol=koalik-provenance-v1 " +
+      "marker=compiler_generated timestamp=ledger_only model_authority=false",
   )
   if (contract.constraints.length > 0) {
     lines.push(
@@ -579,8 +617,325 @@ export function renderObligationBoundSynthesisContract(
         .join(" ")}`,
     )
   }
+  // Frozen producer/consumer compatibility marker. New authority detail is
+  // emitted separately so old context projectors remain valid during migration.
   lines.push(
-    "MODEL_AUTHORITY content_only=true slot=false operation=false file=false scope=false",
+    "MODEL_AUTHORITY content_only=true slot=false operation=false " +
+      "file=false scope=false",
+  )
+  lines.push(
+    "MODEL_AUTHORITY_V2 semantic_suite=true python_units=true new_symbols=true " +
+      "new_routes=true imports=false dependencies=false module_bootstrap=false " +
+      "existing_symbols=false existing_routes=false provenance=false " +
+      "slot=false operation=false file=false scope=false preimage=false " +
+      "create_path=false",
   )
   return lines.join("\n")
+}
+
+export const MUTATION_CONTEXT_PROJECTION_PROTOCOL =
+  "mutation-context-projection-v1"
+export const MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS = 2
+
+function mutationContextBytes(value) {
+  return Buffer.byteLength(typeof value === "string" ? value : "", "utf8")
+}
+
+function mutationContextToken(line, key) {
+  const prefix = `${key}=`
+  return line
+    .trim()
+    .split(/\s+/u)
+    .find((token) => token.startsWith(prefix)) ?? null
+}
+
+function compactAdditiveCapabilityForMutation(content) {
+  const lines = typeof content === "string" ? content.split(/\r?\n/u) : []
+  const projected = []
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+
+    if (line.startsWith("Use execute_additive_plan only.")) {
+      continue
+    }
+
+    if (line.startsWith("ADDITIVE_CAPABILITY ")) {
+      projected.push(
+        [
+          "ADDITIVE_CAPABILITY",
+          mutationContextToken(line, "protocol"),
+          mutationContextToken(line, "sha256"),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      )
+      continue
+    }
+
+    if (line.startsWith("MUTATION_ABI ")) {
+      const protocol = mutationContextToken(line, "protocol")
+      projected.push(
+        [
+          "MUTATION_ABI",
+          protocol,
+          "content_fields=python_imports,python_declarations,replacements,creations",
+        ]
+          .filter(Boolean)
+          .join(" "),
+      )
+      continue
+    }
+
+    if (line.startsWith("slot=existing:")) {
+      projected.push(
+        [
+          mutationContextToken(line, "slot"),
+          mutationContextToken(line, "ops"),
+          mutationContextToken(line, "op"),
+          mutationContextToken(line, "file"),
+          mutationContextToken(line, "roles"),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      )
+      continue
+    }
+
+    if (line.startsWith("slot=create:")) {
+      projected.push(
+        [
+          mutationContextToken(line, "slot"),
+          mutationContextToken(line, "op"),
+          mutationContextToken(line, "relative_path_only"),
+          mutationContextToken(line, "sealed_root_prefix"),
+          mutationContextToken(line, "extensions"),
+          mutationContextToken(line, "max_depth"),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      )
+      continue
+    }
+
+    if (
+      line.startsWith("budgets ") ||
+      line.startsWith("REQUIRED_MUTATION_COVERAGE ")
+    ) {
+      projected.push(line)
+      continue
+    }
+
+    // Unknown capability lines are retained. Projection is an optimization
+    // boundary, never an authority-dropping parser.
+    projected.push(rawLine)
+  }
+
+  return projected.filter(Boolean).join("\n")
+}
+
+function projectSealedMutationContext(content) {
+  const source = typeof content === "string" ? content.trim() : ""
+  if (!source) {
+    return {
+      ok: false,
+      reason: "mutation_context_empty",
+      content: source,
+      sections: 0,
+      projected_sections: 0,
+    }
+  }
+
+  const sections = source.split(/\n\s*\n(?=SEALED_CONTEXT\s)/u)
+  const rendered = []
+  let projectedSections = 0
+
+  for (const section of sections) {
+    const lines = section.split(/\r?\n/u)
+    const header = lines[0]?.trim() ?? ""
+
+    if (!header.startsWith("SEALED_CONTEXT ")) {
+      rendered.push(section)
+      continue
+    }
+
+    const anchorsToken = mutationContextToken(header, "anchors")
+    const anchors = (anchorsToken?.slice("anchors=".length) ?? "")
+      .split(",")
+      .map((value) => Number.parseInt(value, 10))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+    const numbered = lines
+      .slice(1)
+      .map((line) => {
+        const match = /^\s*(\d+)\s*\|\s?(.*)$/u.exec(line)
+        if (!match) return null
+        return {
+          number: Number.parseInt(match[1], 10),
+          line,
+        }
+      })
+      .filter(Boolean)
+
+    if (anchors.length === 0 || numbered.length === 0) {
+      // Missing structural anchors means "do not optimize this section".
+      rendered.push(section)
+      continue
+    }
+
+    const kept = numbered.filter((row) =>
+      anchors.some(
+        (anchor) =>
+          Math.abs(row.number - anchor) <=
+          MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+      ),
+    )
+
+    const everyAnchorWitnessed = anchors.every((anchor) =>
+      kept.some(
+        (row) =>
+          Math.abs(row.number - anchor) <=
+          MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+      ),
+    )
+
+    if (!everyAnchorWitnessed || kept.length === 0) {
+      rendered.push(section)
+      continue
+    }
+
+    const compactHeader = [
+      "SEALED_CONTEXT",
+      mutationContextToken(header, "file"),
+      mutationContextToken(header, "roles"),
+      anchorsToken,
+    ]
+      .filter(Boolean)
+      .join(" ")
+
+    rendered.push([compactHeader, ...kept.map((row) => row.line)].join("\n"))
+    projectedSections += 1
+  }
+
+  return {
+    ok: true,
+    reason:
+      projectedSections > 0
+        ? "anchor_local_projection"
+        : "projection_not_applicable",
+    content: rendered.join("\n\n"),
+    sections: sections.length,
+    projected_sections: projectedSections,
+  }
+}
+
+export function projectObligationBoundMutationContext({
+  capabilityText,
+  synthesisText,
+  contextText,
+}) {
+  const capability =
+    typeof capabilityText === "string" ? capabilityText.trim() : ""
+  const synthesis =
+    typeof synthesisText === "string" ? synthesisText.trim() : ""
+  const context =
+    typeof contextText === "string" ? contextText.trim() : ""
+
+  const sourceContent = [capability, synthesis, context]
+    .filter(Boolean)
+    .join("\n\n")
+  const sourceBytes = mutationContextBytes(sourceContent)
+
+  if (
+    !capability.includes("REQUIRED_MUTATION_COVERAGE ") ||
+    !synthesis.includes(
+      `SYNTHESIS_TRANSACTION protocol=${OBLIGATION_BOUND_SYNTHESIS_PROTOCOL}`,
+    ) ||
+    !synthesis.includes("REQUIRED_OPERATION ") ||
+    !(
+      synthesis.includes("MODEL_AUTHORITY content_only=true") ||
+      synthesis.includes("MODEL_AUTHORITY_V2 semantic_body=true")
+    ) ||
+    !context.includes("SEALED_CONTEXT ")
+  ) {
+    return {
+      ok: false,
+      protocol: MUTATION_CONTEXT_PROJECTION_PROTOCOL,
+      reason: "projection_contract_incomplete",
+      content: sourceContent,
+      source_bytes: sourceBytes,
+      projected_bytes: sourceBytes,
+      reduction_bytes: 0,
+      projected_sections: 0,
+      anchor_radius: MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+      projection_sha256: null,
+      mutation_authority: false,
+    }
+  }
+
+  const compactCapability =
+    compactAdditiveCapabilityForMutation(capability)
+  const projectedContext = projectSealedMutationContext(context)
+
+  if (projectedContext.ok !== true) {
+    return {
+      ok: false,
+      protocol: MUTATION_CONTEXT_PROJECTION_PROTOCOL,
+      reason: projectedContext.reason,
+      content: sourceContent,
+      source_bytes: sourceBytes,
+      projected_bytes: sourceBytes,
+      reduction_bytes: 0,
+      projected_sections: 0,
+      anchor_radius: MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+      projection_sha256: null,
+      mutation_authority: false,
+    }
+  }
+
+  const content = [
+    `MUTATION_CONTENT_ENVELOPE protocol=${MUTATION_CONTEXT_PROJECTION_PROTOCOL} ` +
+      "minimal_complete=true explanations=false optional_changes=false",
+    compactCapability,
+    synthesis,
+    projectedContext.content,
+    "CONTENT_POLICY smallest_complete_implementation=true " +
+      "reuse_existing_patterns=true no_explanation=true",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+
+  const projectedBytes = mutationContextBytes(content)
+
+  // Compression is never allowed to enlarge the model-facing contract.
+  if (projectedBytes >= sourceBytes) {
+    return {
+      ok: true,
+      protocol: MUTATION_CONTEXT_PROJECTION_PROTOCOL,
+      reason: "projection_no_size_gain",
+      content: sourceContent,
+      source_bytes: sourceBytes,
+      projected_bytes: sourceBytes,
+      reduction_bytes: 0,
+      projected_sections: projectedContext.projected_sections,
+      anchor_radius: MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+      projection_sha256: stableSha(sourceContent),
+      mutation_authority: false,
+    }
+  }
+
+  return {
+    ok: true,
+    protocol: MUTATION_CONTEXT_PROJECTION_PROTOCOL,
+    reason: "projection_applied",
+    content,
+    source_bytes: sourceBytes,
+    projected_bytes: projectedBytes,
+    reduction_bytes: sourceBytes - projectedBytes,
+    projected_sections: projectedContext.projected_sections,
+    anchor_radius: MUTATION_CONTEXT_PROJECTION_ANCHOR_RADIUS,
+    projection_sha256: stableSha(content),
+    mutation_authority: false,
+  }
 }

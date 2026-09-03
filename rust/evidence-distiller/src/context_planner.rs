@@ -179,7 +179,12 @@ fn line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
-fn line_range(source: &str, starts: &[usize], start_line: usize, end_line: usize) -> Option<CandidateRange> {
+fn line_range(
+    source: &str,
+    starts: &[usize],
+    start_line: usize,
+    end_line: usize,
+) -> Option<CandidateRange> {
     if start_line == 0 || end_line < start_line || start_line > starts.len() {
         return None;
     }
@@ -190,7 +195,12 @@ fn line_range(source: &str, starts: &[usize], start_line: usize, end_line: usize
     } else {
         source.len()
     };
-    Some(CandidateRange { start_byte, end_byte, start_line, end_line })
+    Some(CandidateRange {
+        start_byte,
+        end_byte,
+        start_line,
+        end_line,
+    })
 }
 
 fn merge_ranges(mut ranges: Vec<CandidateRange>) -> Vec<CandidateRange> {
@@ -220,16 +230,26 @@ fn node_range(node: &SgNode<'_>) -> CandidateRange {
 }
 
 fn raw_bytes(ranges: &[CandidateRange]) -> usize {
-    ranges.iter().map(|r| r.end_byte.saturating_sub(r.start_byte)).sum()
+    ranges
+        .iter()
+        .map(|r| r.end_byte.saturating_sub(r.start_byte))
+        .sum()
 }
 
 fn covers_all(ranges: &[CandidateRange], evidence: &[usize]) -> bool {
     evidence.iter().all(|line| {
-        ranges.iter().any(|r| r.start_line <= *line && *line <= r.end_line)
+        ranges
+            .iter()
+            .any(|r| r.start_line <= *line && *line <= r.end_line)
     })
 }
 
-fn candidate(level: &'static str, structural: bool, ranges: Vec<CandidateRange>, evidence: &[usize]) -> Option<Candidate> {
+fn candidate(
+    level: &'static str,
+    structural: bool,
+    ranges: Vec<CandidateRange>,
+    evidence: &[usize],
+) -> Option<Candidate> {
     let ranges = merge_ranges(ranges);
     if ranges.is_empty() || !covers_all(&ranges, evidence) {
         return None;
@@ -243,7 +263,13 @@ fn candidate(level: &'static str, structural: bool, ranges: Vec<CandidateRange>,
     })
 }
 
-fn line_candidate(source: &str, starts: &[usize], evidence: &[usize], radius: usize, level: &'static str) -> Option<Candidate> {
+fn line_candidate(
+    source: &str,
+    starts: &[usize],
+    evidence: &[usize],
+    radius: usize,
+    level: &'static str,
+) -> Option<Candidate> {
     let total = starts.len().max(1);
     let ranges = evidence
         .iter()
@@ -256,7 +282,11 @@ fn line_candidate(source: &str, starts: &[usize], evidence: &[usize], radius: us
     candidate(level, false, ranges, evidence)
 }
 
-fn structural_candidate<'a>(root: &SgNode<'a>, evidence: &[usize], level: &'static str) -> Option<Candidate> {
+fn structural_candidate<'a>(
+    root: &SgNode<'a>,
+    evidence: &[usize],
+    level: &'static str,
+) -> Option<Candidate> {
     let mut ranges = Vec::new();
     for line in evidence {
         let node = deepest_named_node_on_line(root, line.saturating_sub(1))?;
@@ -298,7 +328,10 @@ fn plan_file(root: &Path, request: &FileRequest) -> Result<FilePlan> {
         .into_iter()
         .collect::<Vec<_>>();
     anyhow::ensure!(!evidence.is_empty(), "evidence lines are empty");
-    anyhow::ensure!(evidence.len() <= MAX_EVIDENCE_LINES, "too many evidence lines");
+    anyhow::ensure!(
+        evidence.len() <= MAX_EVIDENCE_LINES,
+        "too many evidence lines"
+    );
     evidence.sort_unstable();
 
     let candidate_path = canonical_candidate(root, &request.file)?;
@@ -308,12 +341,21 @@ fn plan_file(root: &Path, request: &FileRequest) -> Result<FilePlan> {
     let source = fs::read_to_string(&candidate_path)
         .with_context(|| format!("cannot read {} as UTF-8", request.file))?;
     let starts = line_starts(&source);
-    anyhow::ensure!(evidence.iter().all(|line| *line <= starts.len().max(1)), "evidence line out of range");
+    anyhow::ensure!(
+        evidence.iter().all(|line| *line <= starts.len().max(1)),
+        "evidence line out of range"
+    );
 
     let mut candidates = Vec::new();
-    if let Some(c) = line_candidate(&source, &starts, &evidence, 0, "anchor") { candidates.push(c); }
-    if let Some(c) = line_candidate(&source, &starts, &evidence, 1, "window1") { candidates.push(c); }
-    if let Some(c) = line_candidate(&source, &starts, &evidence, 2, "window2") { candidates.push(c); }
+    if let Some(c) = line_candidate(&source, &starts, &evidence, 0, "anchor") {
+        candidates.push(c);
+    }
+    if let Some(c) = line_candidate(&source, &starts, &evidence, 1, "window1") {
+        candidates.push(c);
+    }
+    if let Some(c) = line_candidate(&source, &starts, &evidence, 2, "window2") {
+        candidates.push(c);
+    }
 
     let mut language = None;
     let mut parse_status = "unsupported";
@@ -328,8 +370,12 @@ fn plan_file(root: &Path, request: &FileRequest) -> Result<FilePlan> {
             parse_status = "parse_error";
         } else {
             parse_status = "parsed";
-            if let Some(c) = structural_candidate(&ast_root, &evidence, "statement") { candidates.push(c); }
-            if let Some(c) = structural_candidate(&ast_root, &evidence, "owner") { candidates.push(c); }
+            if let Some(c) = structural_candidate(&ast_root, &evidence, "statement") {
+                candidates.push(c);
+            }
+            if let Some(c) = structural_candidate(&ast_root, &evidence, "owner") {
+                candidates.push(c);
+            }
         }
     }
 
@@ -345,9 +391,14 @@ fn plan_file(root: &Path, request: &FileRequest) -> Result<FilePlan> {
 fn main() -> Result<()> {
     let started = Instant::now();
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).context("failed to read stdin")?;
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("failed to read stdin")?;
     let request: Request = serde_json::from_str(&input).context("invalid request JSON")?;
-    anyhow::ensure!(request.protocol == REQUEST_PROTOCOL, "request protocol mismatch");
+    anyhow::ensure!(
+        request.protocol == REQUEST_PROTOCOL,
+        "request protocol mismatch"
+    );
     anyhow::ensure!(!request.files.is_empty(), "files are empty");
     anyhow::ensure!(request.files.len() <= MAX_FILES, "too many files");
 
@@ -359,7 +410,11 @@ fn main() -> Result<()> {
     let mut fallback_files = 0usize;
     for file in &request.files {
         let plan = plan_file(&project_root, file)?;
-        if plan.parse_status == "parsed" { parsed_files += 1; } else { fallback_files += 1; }
+        if plan.parse_status == "parsed" {
+            parsed_files += 1;
+        } else {
+            fallback_files += 1;
+        }
         files.push(plan);
     }
     files.sort_by(|a, b| a.file.cmp(&b.file));
@@ -386,7 +441,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root() -> PathBuf {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!("context-planner-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         root
@@ -397,14 +455,22 @@ mod tests {
         let root = temp_root();
         let source = "from x import y\n\n@bp.get('/export')\ndef export():\n    value = y()\n    return value\n";
         fs::write(root.join("sample.py"), source).unwrap();
-        let plan = plan_file(&root, &FileRequest {
-            file: "sample.py".into(), evidence_lines: vec![3, 4, 5], critical: true,
-        }).unwrap();
+        let plan = plan_file(
+            &root,
+            &FileRequest {
+                file: "sample.py".into(),
+                evidence_lines: vec![3, 4, 5],
+                critical: true,
+            },
+        )
+        .unwrap();
         assert_eq!(plan.parse_status, "parsed");
         assert!(plan.candidates.iter().any(|c| c.level == "anchor"));
         assert!(plan.candidates.iter().any(|c| c.level == "statement"));
         assert!(plan.candidates.iter().any(|c| c.level == "owner"));
-        for c in &plan.candidates { assert!(covers_all(&c.ranges, &[3,4,5])); }
+        for c in &plan.candidates {
+            assert!(covers_all(&c.ranges, &[3, 4, 5]));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -412,9 +478,15 @@ mod tests {
     fn unsupported_language_keeps_bounded_line_fallbacks() {
         let root = temp_root();
         fs::write(root.join("sample.unknown"), "a\nb\nc\nd\n").unwrap();
-        let plan = plan_file(&root, &FileRequest {
-            file: "sample.unknown".into(), evidence_lines: vec![2], critical: true,
-        }).unwrap();
+        let plan = plan_file(
+            &root,
+            &FileRequest {
+                file: "sample.unknown".into(),
+                evidence_lines: vec![2],
+                critical: true,
+            },
+        )
+        .unwrap();
         assert_eq!(plan.parse_status, "unsupported");
         assert!(plan.candidates.iter().any(|c| c.level == "anchor"));
         assert!(plan.candidates.iter().any(|c| c.level == "window1"));

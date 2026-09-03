@@ -88,12 +88,27 @@ for anchor in (
     "deriveCompletionSafeFail({",
     "claimCompletionSafeFail(",
     'kind: "completion_safe_fail_commit"',
-    "const terminalCommitResult = completionAuthorized",
+    "const terminalCommitResult = terminalAuthorized",
     '? deriveTerminalCommit({',
     'completion_authorizer_not_applicable',
     'completion_authorizer_unavailable',
     'completion_authorizer_abstain',
     'completion_certificate_invalid',
+):
+    assert anchor in permission_block, anchor
+
+# v2.30/E3.2 extends terminal permission without weakening the original
+# native CompletionAuthorizer path. Legacy rename still requires
+# completionAuthorized; additive_surface may independently terminalize only
+# through deterministic task-proof authority. Neither authority => SAFE_FAIL.
+for anchor in (
+    "const taskProofTerminalAuthorized =",
+    "const terminalAuthorized =",
+    "completionAuthorized ||",
+    "taskProofTerminalAuthorized",
+    "if (!terminalAuthorized)",
+    "TASK_PROOF_TERMINAL_POLICY",
+    "COMPLETION_AUTHORIZER_POLICY",
 ):
     assert anchor in permission_block, anchor
 
@@ -300,9 +315,9 @@ for anchor in (
     assert anchor in harness, anchor
 
 print("PASS terminal gate precedes model-call accounting")
-print("PASS native CompletionAuthorizer is the only TerminalCommit permission")
-print("PASS ABSTAIN/unavailable/invalid certificate withholds terminal optimization")
-print("PASS denied completion produces bounded safe-fail before another model dispatch")
+print("PASS native CompletionAuthorizer remains terminal permission for legacy path")
+print("PASS native ABSTAIN/unavailable/invalid certificate cannot terminalize legacy path")
+print("PASS absence of any terminal authority produces bounded safe-fail before another model dispatch")
 print("PASS TerminalCommit actuator remains completion-semantics-free")
 print("PASS turn reset cannot erase terminal proof")
 print("PASS Compiler/Executor/Verifier authority unchanged")

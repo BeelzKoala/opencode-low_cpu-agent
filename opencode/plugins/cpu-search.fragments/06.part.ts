@@ -10,6 +10,51 @@ export default {
 
     const unsubscribeEvents = await subscribeEvents(ctx)
 
+    // C7-R4: one server-side mutation capability per model dispatch.
+    const mutationExecutionPermitOptions = (
+      state,
+      requestedTool,
+    ) => ({
+      turnID: state?.turnID ?? null,
+      dispatchGeneration:
+        state?.modelCalls ?? null,
+      selectedTool:
+        nextActionForExecutionState(state),
+      requestedTool,
+      editCapsuleSha256:
+        state?.editCapsuleHash ??
+        state?.editCapsuleSha256 ??
+        null,
+    })
+
+    const mutationPermitStop = (permit) => ({
+      content:
+        `PATCH_STOP reason=${permit?.reason ?? "mutation_execution_permit_invalid"} ` +
+        "action=report_blocked",
+      metadata: {
+        protocol:
+          permit?.protocol ??
+          EXECUTION_PERMIT_PROTOCOL,
+        action: "stop",
+        reason:
+          permit?.reason ??
+          "mutation_execution_permit_invalid",
+        failure_layer: "execution_permit",
+        execution_permit_dispatch_generation:
+          permit?.dispatch_generation ?? null,
+        execution_permit_selected_tool:
+          permit?.selected_tool ?? null,
+        execution_permit_requested_tool:
+          permit?.requested_tool ?? null,
+        execution_permit_edit_capsule_sha256:
+          permit?.edit_capsule_sha256 ?? null,
+        execution_permit_claims:
+          permit?.claims ?? null,
+        execution_permit_max_claims: 1,
+        mutation_authority: false,
+      },
+    })
+
     const executeCapabilityMutationCore = async (
       rawInput,
       toolContext,
@@ -35,6 +80,58 @@ export default {
             ? toolContext.sessionID
             : null
         const state = getSessionState(sessionID)
+          // C7-R4 EXECUTION PERMIT: common mutation core.
+          // Additive semantic input claims before materialization. ActionCommit
+          // keeps its existing deterministic single-flight authority.
+          const executionPermit =
+            dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN
+              ? {
+                  ok: true,
+                  protocol:
+                    EXECUTION_PERMIT_PROTOCOL,
+                  reason:
+                    "action_commit_single_flight_authority",
+                  dispatch_generation:
+                    state?.modelCalls ?? null,
+                  selected_tool: toolName,
+                  requested_tool: toolName,
+                  edit_capsule_sha256:
+                    state?.editCapsuleHash ??
+                    state?.editCapsuleSha256 ??
+                    null,
+                  claims: 1,
+                  max_claims: 1,
+                  mutation_authority: false,
+                }
+              : forcedKind === "additive_surface"
+                ? validateClaimedMutationExecutionPermit(
+                    state,
+                    mutationExecutionPermitOptions(
+                      state,
+                      toolName,
+                    ),
+                  )
+                : claimMutationExecutionPermit(
+                    state,
+                    mutationExecutionPermitOptions(
+                      state,
+                      toolName,
+                    ),
+                  )
+
+          if (executionPermit.ok !== true) {
+            if (state) {
+              applyExecutionEvent(
+                state,
+                "fatal",
+                executionPermit.reason,
+              )
+            }
+            return mutationPermitStop(
+              executionPermit,
+            )
+          }
+
         const root = await rootForTool(ctx, toolContext, sessionID, state)
         const observedModelLatencyMs =
           observeModelLatencyAtToolBoundary(state)
@@ -203,30 +300,38 @@ export default {
           "scope",
         ].find((field) => mutationFieldPresent(rawInput, field))
 
-        const obligationBoundRequest =
-          forcedKind === "additive_surface" && !forbiddenRawAuthorityField
-            ? materializeObligationBoundAdditiveRequest({
-                capability: state.additiveMutationCapability,
-                taskRequirements: state.taskRequirements,
-                request: rawInput,
-              })
-            : null
-
         const shape = forbiddenRawAuthorityField
           ? mutationShapeFailure(
               forcedKind,
               `action_tool_forbids_${forbiddenRawAuthorityField}`,
             )
           : forcedKind === "additive_surface"
-            ? obligationBoundRequest?.ok === true
-              ? validateAdditiveMutationRequest(obligationBoundRequest.request)
-              : mutationShapeFailure(
-                  forcedKind,
-                  obligationBoundRequest?.detail ??
-                    obligationBoundRequest?.reason ??
-                    "obligation_bound_request_invalid",
-                )
+            // R7-R6-B: `kind` is orchestration metadata, not part of the
+            // exact physical additive ABI. The source-slot/semantic frontend
+            // already materialized a sealed physical request before this core.
+            ? validateAdditiveMutationRequest(rawInput)
             : validateMutationShape(input)
+
+        const contractDetail =
+          (
+            typeof shape?.detail === "string" &&
+            shape.detail.length > 0
+          )
+            ? shape.detail
+            : (
+                typeof shape?.reason === "string" &&
+                shape.reason.length > 0
+              )
+              ? shape.reason
+              : "mutation_contract_invalid"
+
+        const contractSignature =
+          (
+            typeof shape?.signature === "string" &&
+            shape.signature.length > 0
+          )
+            ? shape.signature
+            : `${forcedKind}:${contractDetail}`
 
         // Tool-schema/transport violations are not semantic patch attempts.
         // With action-specific top-level required fields these should be
@@ -234,17 +339,31 @@ export default {
         // fail closed without consuming the one semantic repair.
         if (shape.ok !== true) {
           state.contractFailures += 1
-          const repeated = state.contractFailureSignatures.has(shape.signature)
-          state.contractFailureSignatures.add(shape.signature)
-          applyExecutionEvent(state, "fatal", "tool_contract_violation")
+          const repeated =
+            state.contractFailureSignatures.has(
+              contractSignature,
+            )
+          state.contractFailureSignatures.add(
+            contractSignature,
+          )
+          applyExecutionEvent(
+            state,
+            "fatal",
+            "tool_contract_violation",
+          )
 
           await trace({
             admitted: false,
             failure_layer: "tool_contract",
             reason: "tool_contract_violation",
-            contract_detail: shape.detail,
-            contract_signature: shape.signature,
-            repeated_contract_failure: repeated,
+            contract_reason:
+              shape?.reason ?? null,
+            contract_detail:
+              contractDetail,
+            contract_signature:
+              contractSignature,
+            repeated_contract_failure:
+              repeated,
             action: "stop",
             compiler_run: false,
             executor_run: false,
@@ -253,14 +372,24 @@ export default {
           return {
             content:
               `PATCH_STOP reason=tool_contract_violation ` +
-              `detail=${shape.detail} semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
-              `contract_failures=${state.contractFailures} action=report_blocked`,
+              `detail=${contractDetail} ` +
+              `semantic_attempts=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN} ` +
+              `contract_failures=${state.contractFailures} ` +
+              "action=report_blocked",
             metadata: {
-              protocol: EXECUTION_LOOP_PROTOCOL,
+              protocol:
+                EXECUTION_LOOP_PROTOCOL,
               action: "stop",
-              reason: "tool_contract_violation",
-              detail: shape.detail,
-              failure_layer: "tool_contract",
+              reason:
+                "tool_contract_violation",
+              contract_reason:
+                shape?.reason ?? null,
+              detail:
+                contractDetail,
+              contract_signature:
+                contractSignature,
+              failure_layer:
+                "tool_contract",
               semantic_attempt_consumed: false,
               compiler_run: false,
               executor_run: false,
@@ -305,12 +434,40 @@ export default {
         ) {
           const repairAuthorityOk =
             state.additiveRepairLock?.tool === toolName &&
-            additiveRepairAuthorityMatches({
-              hint: state.additiveRepairLock,
-              capability: state.additiveMutationCapability,
-              executionContextSha256:
-                state.executionContextCapsuleSha256,
-            })
+            (
+              additiveRepairAuthorityMatches({
+                hint: state.additiveRepairLock,
+                capability:
+                  state.additiveMutationCapability,
+                executionContextSha256:
+                  state.executionContextCapsuleSha256,
+              }) ||
+              fileFamilyRepairAuthorityMatches({
+                hint: state.additiveRepairLock,
+                capability:
+                  state.additiveMutationCapability,
+                executionContextSha256:
+                  state.executionContextCapsuleSha256,
+              }) ||
+              pythonSemanticRepairAuthorityMatches({
+                hint: state.additiveRepairLock,
+                capability:
+                  state.additiveMutationCapability,
+                executionContextSha256:
+                  state.executionContextCapsuleSha256,
+              }) ||
+              // R7-R3 source-slot repair authority: only an attested
+              // byte-preserving source cache may narrow a repair dispatch.
+              sourceSlotRepairAuthorityMatches({
+                hint: state.additiveRepairLock,
+                capability:
+                  state.additiveMutationCapability,
+                executionContextSha256:
+                  state.executionContextCapsuleSha256,
+                binding:
+                  state.activeSourceSlotContract?.binding ?? null,
+              })
+            )
 
           if (!repairAuthorityOk) {
             state.additiveRepairLock = null
@@ -391,7 +548,7 @@ export default {
                 const plan = await materializeAdditiveMutationPlan({
                   root,
                   capability: state.additiveMutationCapability,
-                  request: obligationBoundRequest.request,
+                  request: rawInput,
                 })
                 if (plan.ok === true) {
                   return {
@@ -403,7 +560,7 @@ export default {
                 const repairHint = buildAdditiveRepairHint({
                   failure: plan,
                   capability: state.additiveMutationCapability,
-                  request: obligationBoundRequest.request,
+                  request: rawInput,
                   executionContextSha256:
                     state.executionContextCapsuleSha256,
                   previousRepairHint:
@@ -700,7 +857,13 @@ export default {
         if (compilerResponse?.ok !== true) {
           const reason = typeof compilerResponse?.reason === "string" ? compilerResponse.reason : "compiler_rejected"
           const needsRescout = PATCH_COMPILER_RESCOUT_REASONS.has(reason)
+          const deterministicCapacityStop =
+            deterministicCapacityFailureIsTerminal(
+              reason,
+              dispatchOrigin,
+            )
           const canRetry =
+            !deterministicCapacityStop &&
             PATCH_COMPILER_RETRY_REASONS.has(reason) &&
             state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
           const action = needsRescout ? "rescout" : canRetry ? "retry" : "stop"
@@ -829,6 +992,233 @@ export default {
               metadata: { protocol: EXECUTION_LOOP_PROTOCOL, action: "stop", reason: "proof_obligation_failed", proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL, failed_proofs: proofAssessment.failed },
             }
           }
+          let taskProofPlan = null
+          let taskProofAssessment = null
+          let taskProofElapsedMs = 0
+
+          if (forcedKind === "additive_surface") {
+            taskProofPlan =
+              compileTaskProofObligations(
+                state?.taskRequirements,
+              )
+
+            if (taskProofPlan?.ok !== true) {
+              const reason =
+                `task_proof_compile_${taskProofPlan?.reason ?? "failed"}`
+
+              applyExecutionEvent(
+                state,
+                "fatal",
+                reason,
+              )
+
+              await trace({
+                admitted: false,
+                reason,
+                action: "stop",
+                task_proof_compiler_protocol:
+                  TASK_PROOF_COMPILER_PROTOCOL,
+                task_proof_compile_detail:
+                  taskProofPlan?.detail ?? null,
+                plan_signature: signature,
+                compiler_elapsed_ms:
+                  compiled.elapsedMs,
+                executor_elapsed_ms:
+                  result.elapsedMs,
+                verifier_elapsed_ms:
+                  verified.elapsedMs,
+              })
+
+              return {
+                content:
+                  `PATCH_STOP reason=${reason} action=report_blocked`,
+                metadata: {
+                  protocol:
+                    EXECUTION_LOOP_PROTOCOL,
+                  action: "stop",
+                  reason,
+                },
+              }
+            }
+
+            const taskProofResult =
+              await runTaskProofEvaluator(
+                root,
+                {
+                  root,
+                  patch:
+                    response?.patch ?? "",
+                  changed_files:
+                    compilerResponse
+                      ?.changed_files ?? [],
+                  mutations,
+                  structural_verifier:
+                    verificationResponse,
+                  obligations:
+                    taskProofPlan.obligations,
+                },
+              )
+
+            taskProofElapsedMs =
+              taskProofResult?.elapsedMs ?? 0
+
+            if (taskProofResult?.ok !== true) {
+              const reason =
+                `task_proof_transport_${taskProofResult?.reason ?? "failed"}`
+
+              applyExecutionEvent(
+                state,
+                "fatal",
+                reason,
+              )
+
+              await trace({
+                admitted: false,
+                reason,
+                action: "stop",
+                task_proof_compiler_protocol:
+                  TASK_PROOF_COMPILER_PROTOCOL,
+                task_proof_evaluator_protocol:
+                  TASK_PROOF_EVALUATOR_PROTOCOL,
+                plan_signature: signature,
+                compiler_elapsed_ms:
+                  compiled.elapsedMs,
+                executor_elapsed_ms:
+                  result.elapsedMs,
+                verifier_elapsed_ms:
+                  verified.elapsedMs,
+                task_proof_elapsed_ms:
+                  taskProofElapsedMs,
+              })
+
+              return {
+                content:
+                  `PATCH_STOP reason=${reason} action=report_blocked`,
+                metadata: {
+                  protocol:
+                    EXECUTION_LOOP_PROTOCOL,
+                  action: "stop",
+                  reason,
+                },
+              }
+            }
+
+            taskProofAssessment =
+              taskProofResult.response
+
+            if (!taskProofPasses(taskProofAssessment)) {
+              const failedTaskProofs =
+                Array.isArray(
+                  taskProofAssessment?.checks,
+                )
+                  ? taskProofAssessment.checks
+                      .filter(
+                        (item) =>
+                          item?.pass !== true,
+                      )
+                      .slice(0, 8)
+                  : []
+
+              const canRepair =
+                state.mutationAttempts <
+                MAX_PATCH_ATTEMPTS_PER_TURN
+
+              if (canRepair) {
+                applyExecutionEvent(
+                  state,
+                  "verification_repair",
+                  "task_proof_failed",
+                  {
+                    reason:
+                      "task_proof_failed",
+                    failed:
+                      failedTaskProofs,
+                  },
+                )
+
+                await trace({
+                  admitted: false,
+                  reason:
+                    "task_proof_failed",
+                  action: "repair",
+                  failed_task_proofs:
+                    failedTaskProofs,
+                  task_proof_compiler_protocol:
+                    TASK_PROOF_COMPILER_PROTOCOL,
+                  task_proof_evaluator_protocol:
+                    TASK_PROOF_EVALUATOR_PROTOCOL,
+                  plan_signature: signature,
+                  compiler_elapsed_ms:
+                    compiled.elapsedMs,
+                  executor_elapsed_ms:
+                    result.elapsedMs,
+                  verifier_elapsed_ms:
+                    verified.elapsedMs,
+                  task_proof_elapsed_ms:
+                    taskProofElapsedMs,
+                })
+
+                return {
+                  content:
+                    `PATCH_REPAIR reason=task_proof_failed ` +
+                    `failed=${JSON.stringify(failedTaskProofs)} ` +
+                    `attempt=${state.mutationAttempts}/${MAX_PATCH_ATTEMPTS_PER_TURN}`,
+                  metadata: {
+                    protocol:
+                      EXECUTION_LOOP_PROTOCOL,
+                    action: "repair",
+                    reason:
+                      "task_proof_failed",
+                    failed_task_proofs:
+                      failedTaskProofs,
+                  },
+                }
+              }
+
+              applyExecutionEvent(
+                state,
+                "fatal",
+                "task_proof_failed",
+              )
+
+              await trace({
+                admitted: false,
+                reason:
+                  "task_proof_failed",
+                action: "stop",
+                failed_task_proofs:
+                  failedTaskProofs,
+                task_proof_compiler_protocol:
+                  TASK_PROOF_COMPILER_PROTOCOL,
+                task_proof_evaluator_protocol:
+                  TASK_PROOF_EVALUATOR_PROTOCOL,
+                plan_signature: signature,
+                compiler_elapsed_ms:
+                  compiled.elapsedMs,
+                executor_elapsed_ms:
+                  result.elapsedMs,
+                verifier_elapsed_ms:
+                  verified.elapsedMs,
+                task_proof_elapsed_ms:
+                  taskProofElapsedMs,
+              })
+
+              return {
+                content:
+                  "PATCH_STOP reason=task_proof_failed action=report_blocked",
+                metadata: {
+                  protocol:
+                    EXECUTION_LOOP_PROTOCOL,
+                  action: "stop",
+                  reason:
+                    "task_proof_failed",
+                  failed_task_proofs:
+                    failedTaskProofs,
+                },
+              }
+            }
+          }
+
           const persisted = await writePatchReceipt(
             root,
             sessionID,
@@ -838,6 +1228,7 @@ export default {
             verificationResponse,
             proofAssessment,
             { origin: dispatchOrigin, actionCommit },
+            taskProofAssessment,
           )
           if (!persisted) {
             applyExecutionEvent(state, "fatal", "receipt_write_failed")
@@ -870,9 +1261,25 @@ export default {
             completionAuthorizationPermitsTerminal(
               completionAuthorization,
             )
+
+          const taskProofTerminalAuthorized =
+            forcedKind === "additive_surface" &&
+            taskProofPasses(
+              taskProofAssessment,
+            )
+
+          const terminalAuthorized =
+            completionAuthorized ||
+            taskProofTerminalAuthorized
+
+          const terminalPolicy =
+            taskProofTerminalAuthorized
+              ? TASK_PROOF_TERMINAL_POLICY
+              : COMPLETION_AUTHORIZER_POLICY
+
           let completionSafeFail = null
           let completionSafeFailClaim = null
-          if (!completionAuthorized) {
+          if (!terminalAuthorized) {
             const completionSafeFailResult = deriveCompletionSafeFail({
               state,
               persisted,
@@ -913,11 +1320,13 @@ export default {
             }
           }
 
-          const terminalCommitResult = completionAuthorized
+          const terminalCommitResult = terminalAuthorized
             ? deriveTerminalCommit({
                 state,
                 persisted,
                 proofAssessment,
+                terminalPolicy,
+                taskProofAssessment,
               })
             : {
                 ok: false,
@@ -1006,6 +1415,18 @@ export default {
               "terminal_permission",
             completion_authorizer_permits_terminal:
               completionAuthorized,
+            task_proof_terminal_authorized:
+              taskProofTerminalAuthorized,
+            terminal_policy:
+              terminalPolicy,
+            task_proof_protocol:
+              taskProofAssessment?.protocol ?? null,
+            task_proof_checks_total:
+              taskProofAssessment?.checks_total ?? 0,
+            task_proof_checks_failed:
+              taskProofAssessment?.checks_failed ?? 0,
+            task_proof_elapsed_ms:
+              taskProofElapsedMs,
             completion_authorizer_applicable:
               completionAuthorization.applicable,
             completion_authorizer_transport_ok:
@@ -1063,6 +1484,24 @@ export default {
               mutation_protocol: PATCH_MUTATION_PROTOCOL,
                 patch_tool_protocol: PATCH_TOOL_PROTOCOL,
               mutation_dispatch_origin: dispatchOrigin,
+              execution_permit_protocol:
+                executionPermit?.protocol ??
+                EXECUTION_PERMIT_PROTOCOL,
+              execution_permit_reason:
+                executionPermit?.reason ?? null,
+              execution_permit_dispatch_generation:
+                executionPermit?.dispatch_generation ??
+                null,
+              execution_permit_selected_tool:
+                executionPermit?.selected_tool ?? null,
+              execution_permit_requested_tool:
+                executionPermit?.requested_tool ?? null,
+              execution_permit_edit_capsule_sha256:
+                executionPermit?.edit_capsule_sha256 ??
+                null,
+              execution_permit_claims:
+                executionPermit?.claims ?? null,
+              execution_permit_max_claims: 1,
               action_commit_protocol: actionCommit?.protocol ?? null,
               action_commit_sha256: actionCommit?.commit_sha256 ?? null,
               semantic_mutations: compilerResponse?.mutations_effective ?? 0,
@@ -1076,7 +1515,13 @@ export default {
         }
 
         const reason = typeof response?.reason === "string" ? response.reason : "executor_rejected"
+        const deterministicCapacityStop =
+          deterministicCapacityFailureIsTerminal(
+            reason,
+            dispatchOrigin,
+          )
         const canRetry =
+          !deterministicCapacityStop &&
           PATCH_RETRY_REASONS.has(reason) &&
           state.mutationAttempts < MAX_PATCH_ATTEMPTS_PER_TURN
         const needsRescout = PATCH_RESCOUT_REASONS.has(reason)

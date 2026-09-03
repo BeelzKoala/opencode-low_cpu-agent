@@ -13,6 +13,9 @@ import {
   renderExecutionContractWithCoverage,
   runStructuralContextPlanner,
 } from "./execution-context-planner-v1.mjs"
+import {
+  renderTypedCounterexampleForModel,
+} from "./typed-counterexample-v1.mjs"
 
 export const MODEL_CONTEXT_COMPILER_PROTOCOL =
   "evidence-preserving-model-context-compiler-v1"
@@ -78,6 +81,76 @@ export function resolveModelContextCompilerMode(value) {
     return value
   }
   return "shadow"
+}
+
+export function resolveModelContextCompilerPolicy(
+  value,
+  {
+    boundExecutionContextRequired = false,
+  } = {},
+) {
+  const configuredMode =
+    resolveModelContextCompilerMode(value)
+  const configuredExplicit =
+    value === "off" ||
+    value === "shadow" ||
+    value === "active"
+
+  if (boundExecutionContextRequired !== true) {
+    return Object.freeze({
+      protocol: "execution-context-compiler-policy-v1",
+      configured_mode: configuredMode,
+      configured_explicit: configuredExplicit,
+      effective_mode: configuredMode,
+      bound_execution_context_required: false,
+      promoted: false,
+      blocked: false,
+      reason: "configured_mode_retained",
+      mutation_authority: false,
+    })
+  }
+
+  if (configuredMode === "off") {
+    return Object.freeze({
+      protocol: "execution-context-compiler-policy-v1",
+      configured_mode: configuredMode,
+      configured_explicit: configuredExplicit,
+      effective_mode: "off",
+      bound_execution_context_required: true,
+      promoted: false,
+      blocked: true,
+      reason:
+        "execution_context_compiler_disabled_for_bound_mutation",
+      mutation_authority: false,
+    })
+  }
+
+  if (configuredMode === "active") {
+    return Object.freeze({
+      protocol: "execution-context-compiler-policy-v1",
+      configured_mode: configuredMode,
+      configured_explicit: configuredExplicit,
+      effective_mode: "active",
+      bound_execution_context_required: true,
+      promoted: false,
+      blocked: false,
+      reason: "bound_mutation_active_mode_retained",
+      mutation_authority: false,
+    })
+  }
+
+  return Object.freeze({
+    protocol: "execution-context-compiler-policy-v1",
+    configured_mode: configuredMode,
+    configured_explicit: configuredExplicit,
+    effective_mode: "active",
+    bound_execution_context_required: true,
+    promoted: true,
+    blocked: false,
+    reason:
+      "bound_mutation_requires_active_execution_context",
+    mutation_authority: false,
+  })
 }
 
 export function resolveModelContextBudgetBytes(value) {
@@ -662,10 +735,79 @@ function slotFileMap(contract) {
   return bySlot
 }
 
-function compactFailureDelta(repairHint, targets) {
-  const parts = [`FAIL reason=${repairHint?.reason ?? "additive_plan_invalid"}`]
+export function sourceSlotRepairTargets(contract, repairHint) {
+  if (repairHint?.protocol !== "source-slot-repair-cache-v1") return null
+  if (
+    repairHint?.repairable !== true ||
+    typeof repairHint?.cache_sha256 !== "string" ||
+    !SHA256_RE.test(repairHint.cache_sha256)
+  ) {
+    return Object.freeze({
+      ok: false,
+      reason: "source_slot_repair_authority_shape_invalid",
+    })
+  }
+  const bySlot = slotFileMap(contract)
+  const failedSlots = array(repairHint?.failed_slots)
+  const failedKeys = array(repairHint?.failed_source_keys)
+  const hashes = repairHint?.accepted_source_hashes
+  if (
+    failedSlots.length < 1 ||
+    failedSlots.length > 8 ||
+    new Set(failedSlots).size !== failedSlots.length ||
+    failedSlots.some((slot) => typeof slot !== "string" || !bySlot.has(slot)) ||
+    failedKeys.length < 1 ||
+    failedKeys.length > 8 ||
+    new Set(failedKeys).size !== failedKeys.length ||
+    failedKeys.some((key) => typeof key !== "string" || key.length < 1) ||
+    !hashes ||
+    typeof hashes !== "object" ||
+    Array.isArray(hashes) ||
+    Object.entries(hashes).some(([key, digest]) =>
+      !key || typeof digest !== "string" || !SHA256_RE.test(digest)
+    ) ||
+    typeof repairHint?.failure_reason !== "string" ||
+    repairHint.failure_reason.length < 1
+  ) {
+    return Object.freeze({
+      ok: false,
+      reason: "source_slot_repair_target_invalid",
+    })
+  }
+  return Object.freeze({
+    ok: true,
+    slots: Object.freeze([...failedSlots].sort()),
+    reason: "source_slot_causal_failed_set",
+    observation_only: false,
+  })
+}
+
+export function compactFailureDelta(repairHint, targets) {
+  const sourceSlot = repairHint?.protocol === "source-slot-repair-cache-v1"
+  const parts = [
+    `FAIL reason=${sourceSlot
+      ? repairHint?.failure_reason ?? repairHint?.reason ?? "source_slot_invalid"
+      : repairHint?.reason ?? repairHint?.failure_reason ?? "additive_plan_invalid"}`,
+  ]
   if (Number.isSafeInteger(repairHint?.operation_index)) parts.push(`operation_index=${repairHint.operation_index}`)
   if (typeof repairHint?.field === "string" && repairHint.field.length > 0) parts.push(`field=${repairHint.field}`)
+  if (sourceSlot) {
+    const keys = array(repairHint?.failed_source_keys)
+      .filter((value) => typeof value === "string")
+      .sort()
+    if (keys.length > 0) parts.push(`source_keys=${keys.join(",")}`)
+    const hashes = Object.entries(repairHint?.accepted_source_hashes ?? {})
+      .filter(([key, digest]) =>
+        key &&
+        typeof digest === "string" &&
+        SHA256_RE.test(digest)
+      )
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, digest]) => `${key}:${digest}`)
+    if (hashes.length > 0) {
+      parts.push(`accepted_source_sha256=${hashes.join(",")}`)
+    }
+  }
   const diagnostics = repairHint?.failure_diagnostics ?? {}
   for (const field of ["missing_roles", "missing_slots", "missing_obligations"]) {
     const values = array(diagnostics?.[field])
@@ -678,6 +820,11 @@ function compactFailureDelta(repairHint, targets) {
     parts.push(`repair_focus_slots=${targets.slots.join(",")}`)
     parts.push(`repair_focus_reason=${targets.reason}`)
   }
+  const typedCounterexample =
+    renderTypedCounterexampleForModel(
+      repairHint?.typed_counterexample,
+    )
+  if (typedCounterexample) parts.push(typedCounterexample)
   return parts.join(" ")
 }
 
@@ -714,7 +861,22 @@ async function buildLegacyRepairExecutionProjection({
   }
 
   const contract = projectAdditiveExecutionContract(capability)
-  const targets = repairTargetSlots({ contract, hint: repairHint })
+  const sourceSlotTargets =
+    sourceSlotRepairTargets(contract, repairHint)
+  if (sourceSlotTargets?.ok === false) {
+    return Object.freeze({
+      ok: false,
+      protocol: "repair-execution-context-projection-v1",
+      reason: sourceSlotTargets.reason,
+      max_bytes: budget,
+      source_capsule_sha256: capsule.capsule_sha256,
+      target_slots: Object.freeze([]),
+      target_files: Object.freeze([]),
+    })
+  }
+  const targets = sourceSlotTargets?.ok === true
+    ? sourceSlotTargets
+    : repairTargetSlots({ contract, hint: repairHint })
   const bySlot = slotFileMap(contract)
   const targetFiles = [...new Set(targets.slots.map((slot) => bySlot.get(slot)).filter(Boolean))].sort()
   const delta = compactFailureDelta(repairHint, targets)

@@ -1,0 +1,76 @@
+{
+  "protocol": "python-unit-contract-v1",
+  "version": 1,
+  "max_units": 8,
+  "identifier_pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+  "fields": {
+    "name": {
+      "type": "identifier",
+      "max_length": 256
+    },
+    "parameters": {
+      "type": "string",
+      "max_length": 4096
+    },
+    "returns": {
+      "type": "string",
+      "max_length": 4096
+    },
+    "decorators": {
+      "type": "string_array",
+      "max_items": 16,
+      "item_min_length": 1,
+      "item_max_length": 4096
+    },
+    "suite": {
+      "type": "string_array",
+      "min_items": 1,
+      "max_items": 64,
+      "item_min_length": 1,
+      "item_max_length": 65536
+    },
+    "bases": {
+      "type": "string_array",
+      "max_items": 16,
+      "item_min_length": 1,
+      "item_max_length": 4096
+    },
+    "annotation": {
+      "type": "string",
+      "max_length": 4096
+    },
+    "value": {
+      "type": "string",
+      "min_length": 1,
+      "max_length": 65536
+    },
+    "members": {
+      "type": "unit_array",
+      "context": "member",
+      "min_items": 1,
+      "max_items": 32
+    }
+  },
+  "kinds": {
+    "function": {
+      "contexts": ["top", "member"],
+      "required": ["kind", "name", "suite"],
+      "optional": ["parameters", "returns", "decorators"]
+    },
+    "async_function": {
+      "contexts": ["top", "member"],
+      "required": ["kind", "name", "suite"],
+      "optional": ["parameters", "returns", "decorators"]
+    },
+    "assignment": {
+      "contexts": ["top", "member"],
+      "required": ["kind", "name", "value"],
+      "optional": ["annotation"]
+    },
+    "class": {
+      "contexts": ["top"],
+      "required": ["kind", "name", "members"],
+      "optional": ["bases", "decorators"]
+    }
+  }
+}

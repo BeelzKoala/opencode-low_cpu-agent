@@ -1,0 +1,32 @@
+{
+  "authority": "deterministic_fixture_only",
+  "expected": {
+    "initial_python_representation": "typed_python_units",
+    "legacy_default_lane_preserved": true,
+    "legacy_string_hash_preserved": true,
+    "model_calls": 0,
+    "raw_initial_python_allowed": false,
+    "repair_python_representation": "typed_python_units",
+    "typed_sibling_cache_supported": true
+  },
+  "initial_request": {
+    "sources": {
+      "navigation_integration": "<li>Report</li>\n",
+      "server_surface": {
+        "units": [
+          {
+            "kind": "function",
+            "name": "report",
+            "parameters": "",
+            "suite": [
+              "return 1"
+            ]
+          }
+        ]
+      },
+      "ui_surface": "<html><body>Report</body></html>\n"
+    }
+  },
+  "mutation_authority": false,
+  "protocol": "r21-typed-first-action-stage-lock-v1"
+}

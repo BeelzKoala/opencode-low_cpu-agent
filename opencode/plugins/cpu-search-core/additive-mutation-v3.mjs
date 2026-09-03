@@ -11,6 +11,8 @@ export * from "./additive-mutation-v2.mjs"
 
 export const ADDITIVE_MUTATION_ABI_PROTOCOL =
   "closed-additive-mutation-abi-v3"
+export const ADDITIVE_SEMANTIC_LOWERING_PROTOCOL =
+  "additive-semantic-lowering-authority-v1"
 
 const DOTTED_IDENTIFIER_RE =
   /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/u
@@ -376,6 +378,149 @@ function indexedFailure(reason, index, field = null) {
 
 function isPythonTarget(target) {
   return typeof target?.file === "string" && /\.(?:py|pyi)$/u.test(target.file)
+}
+
+function semanticLoweringFailure(reason, extra = {}) {
+  return Object.freeze({
+    ok: false,
+    protocol: ADDITIVE_SEMANTIC_LOWERING_PROTOCOL,
+    reason,
+    ...extra,
+    supports_python_imports: false,
+    mutation_authority: false,
+    authority_expansion: false,
+    model_authority_expansion: false,
+  })
+}
+
+export function proveAdditiveSemanticLoweringAuthority({
+  capability,
+  operation,
+} = {}) {
+  if (
+    capability?.ready !== true ||
+    capability?.mutation_authority !== true
+  ) {
+    return semanticLoweringFailure(
+      "semantic_lowering_capability_not_authorized",
+    )
+  }
+
+  const semanticOperation =
+    typeof operation?.kind === "string"
+      ? operation.kind
+      : null
+  const slot =
+    typeof operation?.slot === "string"
+      ? operation.slot
+      : null
+
+  if (!semanticOperation || !slot) {
+    return semanticLoweringFailure(
+      "semantic_lowering_operation_invalid",
+      {
+        semantic_operation: semanticOperation,
+        slot,
+      },
+    )
+  }
+
+  const collection =
+    semanticOperation === "creation"
+      ? capability?.create_slots
+      : capability?.existing_slots
+
+  const candidates = array(collection)
+    .filter((row) => row?.slot === slot)
+
+  if (candidates.length !== 1) {
+    return semanticLoweringFailure(
+      "semantic_lowering_slot_unresolved",
+      {
+        semantic_operation: semanticOperation,
+        slot,
+        slot_matches: candidates.length,
+      },
+    )
+  }
+
+  const target = candidates[0]
+  let physicalOperation = null
+  let loweringProtocol = null
+  let supportsPythonImports = false
+
+  if (semanticOperation === "python_declaration") {
+    if (!isPythonTarget(target)) {
+      return semanticLoweringFailure(
+        "semantic_lowering_python_target_invalid",
+        {
+          semantic_operation: semanticOperation,
+          slot,
+        },
+      )
+    }
+    physicalOperation = "replace_exact"
+    loweringProtocol = PYTHON_ADDITIVE_COMPILER_PROTOCOL
+    supportsPythonImports = true
+  } else if (semanticOperation === "replacement") {
+    if (isPythonTarget(target)) {
+      return semanticLoweringFailure(
+        "semantic_lowering_python_replacement_forbidden",
+        {
+          semantic_operation: semanticOperation,
+          slot,
+        },
+      )
+    }
+    physicalOperation = "replace_exact"
+    loweringProtocol = "identity"
+  } else if (semanticOperation === "creation") {
+    physicalOperation = "create_file"
+    loweringProtocol = "identity"
+  } else {
+    return semanticLoweringFailure(
+      "semantic_lowering_operation_unsupported",
+      {
+        semantic_operation: semanticOperation,
+        slot,
+      },
+    )
+  }
+
+  const allowed = array(target?.allowed_operations)
+  if (!allowed.includes(physicalOperation)) {
+    return semanticLoweringFailure(
+      "semantic_lowering_physical_authority_missing",
+      {
+        semantic_operation: semanticOperation,
+        physical_operation: physicalOperation,
+        lowering_protocol: loweringProtocol,
+        slot,
+        capability_sha256:
+          capability?.capability_sha256 ?? null,
+        authority_sha256:
+          capability?.authority_sha256 ?? null,
+      },
+    )
+  }
+
+  return Object.freeze({
+    ok: true,
+    protocol: ADDITIVE_SEMANTIC_LOWERING_PROTOCOL,
+    reason: "semantic_lowering_authority_proven",
+    semantic_operation: semanticOperation,
+    physical_operation: physicalOperation,
+    lowering_protocol: loweringProtocol,
+    slot,
+    supports_python_imports: supportsPythonImports,
+    capability_sha256:
+      capability?.capability_sha256 ?? null,
+    authority_sha256:
+      capability?.authority_sha256 ?? null,
+    mutation_authority: false,
+    authority_expansion: false,
+    model_authority_expansion: false,
+  })
 }
 
 function closedSlotIds(rows, prefix, predicate = () => true) {

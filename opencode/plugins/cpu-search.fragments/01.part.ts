@@ -1381,6 +1381,205 @@ async function attestLocalMutationCandidateSet(
   }
 }
 
+
+const FATAL_SAFE_FAIL_PROTOCOL = "fatal-safe-fail-v1"
+const FATAL_SAFE_FAIL_OUTCOME = "SAFE_FAIL"
+
+function fatalSafeFailSha256(payload) {
+  return createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex")
+}
+
+function deriveFatalSafeFail(state, reason = null) {
+  if (!state) {
+    return {
+      ok: false,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_state_unavailable",
+    }
+  }
+
+  const taskIdentityAvailable =
+    state.taskContextLatched === true &&
+    typeof state.taskTurnID === "string" &&
+    state.taskTurnID.length > 0 &&
+    typeof state.taskTextSha256 === "string" &&
+    /^[0-9a-f]{64}$/iu.test(state.taskTextSha256)
+
+  const turnIdentityAvailable =
+    typeof state.turnID === "string" &&
+    state.turnID.length > 0
+
+  if (!taskIdentityAvailable && !turnIdentityAvailable) {
+    return {
+      ok: false,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_identity_unavailable",
+    }
+  }
+
+  const identityMode =
+    taskIdentityAvailable
+      ? "task_hash"
+      : "turn_only"
+
+  const payload = {
+    protocol: FATAL_SAFE_FAIL_PROTOCOL,
+    outcome: FATAL_SAFE_FAIL_OUTCOME,
+    identity_mode: identityMode,
+    user_turn_id:
+      taskIdentityAvailable
+        ? state.taskTurnID
+        : state.turnID,
+    task_sha256:
+      taskIdentityAvailable
+        ? state.taskTextSha256.toLowerCase()
+        : null,
+    replayable:
+      taskIdentityAvailable,
+    reason:
+      typeof reason === "string" && reason.length > 0
+        ? reason
+        : "fatal",
+    execution_event: "fatal",
+  }
+
+  return {
+    ok: true,
+    protocol: FATAL_SAFE_FAIL_PROTOCOL,
+    commit: Object.freeze({
+      ...payload,
+      commit_sha256: fatalSafeFailSha256(payload),
+    }),
+  }
+}
+
+function claimFatalSafeFail(state, commit) {
+  if (
+    !state ||
+    commit?.protocol !== FATAL_SAFE_FAIL_PROTOCOL ||
+    commit?.outcome !== FATAL_SAFE_FAIL_OUTCOME ||
+    typeof commit?.commit_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/iu.test(commit.commit_sha256)
+  ) {
+    return {
+      ok: false,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_commit_invalid",
+    }
+  }
+
+  if (!state.fatalSafeFail) {
+    state.fatalSafeFail = commit
+    state.fatalSafeFailSha256 = commit.commit_sha256
+    state.fatalSafeFailClaims += 1
+
+    return {
+      ok: true,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      duplicate: false,
+    }
+  }
+
+  if (
+    state.fatalSafeFailSha256 === commit.commit_sha256 &&
+    state.fatalSafeFail.commit_sha256 === commit.commit_sha256
+  ) {
+    return {
+      ok: true,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      duplicate: true,
+    }
+  }
+
+  return {
+    ok: false,
+    protocol: FATAL_SAFE_FAIL_PROTOCOL,
+    reason: "fatal_safe_fail_conflict",
+  }
+}
+
+function clearFatalSafeFailState(state) {
+  if (!state) return
+
+  state.fatalSafeFail = null
+  state.fatalSafeFailSha256 = null
+  state.fatalSafeFailClaims = 0
+  state.fatalSafeFailShortCircuitAttemptedSha256 = null
+  state.fatalSafeFailShortCircuitRequests = 0
+  state.fatalSafeFailShortCircuits = 0
+  state.fatalSafeFailShortCircuitFailures = 0
+}
+
+function fatalSafeFailMatchesState(commit, state) {
+  if (
+    commit?.protocol !== FATAL_SAFE_FAIL_PROTOCOL ||
+    commit?.outcome !== FATAL_SAFE_FAIL_OUTCOME
+  ) {
+    return {
+      ok: false,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_commit_invalid",
+    }
+  }
+
+  if (commit.identity_mode === "task_hash") {
+    if (
+      state?.taskContextLatched !== true ||
+      commit.user_turn_id !== state.taskTurnID
+    ) {
+      return {
+        ok: false,
+        protocol: FATAL_SAFE_FAIL_PROTOCOL,
+        reason: "fatal_safe_fail_task_turn_changed",
+      }
+    }
+
+    if (
+      typeof state.taskTextSha256 !== "string" ||
+      commit.task_sha256 !== state.taskTextSha256.toLowerCase()
+    ) {
+      return {
+        ok: false,
+        protocol: FATAL_SAFE_FAIL_PROTOCOL,
+        reason: "fatal_safe_fail_task_text_drift",
+      }
+    }
+
+    return {
+      ok: true,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_task_match",
+    }
+  }
+
+  if (commit.identity_mode === "turn_only") {
+    if (
+      typeof state?.turnID !== "string" ||
+      commit.user_turn_id !== state.turnID
+    ) {
+      return {
+        ok: false,
+        protocol: FATAL_SAFE_FAIL_PROTOCOL,
+        reason: "fatal_safe_fail_turn_changed",
+      }
+    }
+
+    return {
+      ok: true,
+      protocol: FATAL_SAFE_FAIL_PROTOCOL,
+      reason: "fatal_safe_fail_turn_match",
+    }
+  }
+
+  return {
+    ok: false,
+    protocol: FATAL_SAFE_FAIL_PROTOCOL,
+    reason: "fatal_safe_fail_identity_mode_invalid",
+  }
+}
+
 const sessionStates = new Map()
 
 function dropSessionState(sessionID) {
@@ -1452,6 +1651,9 @@ function getSessionState(sessionID) {
       boundMutationTarget: null,
       mutationAttempts: 0,
       repairAttempts: 0,
+      sourceCounterexampleFailures: 0,
+      sourceRepairDispatches: 0,
+      sourceCounterexampleLedger: [],
       compilerRuns: 0,
       patchAttempts: 0,
       executorRuns: 0,
@@ -1461,6 +1663,8 @@ function getSessionState(sessionID) {
       contractFailures: 0,
       activeMutationTool: null,
       additiveRepairLock: null,
+      activeSourceSlotContract: null,
+      sourceSlotRepairCache: null,
       taskContextProtocol: TASK_CONTEXT_PROTOCOL,
       taskContextAdapterProtocol: TASK_CONTEXT_ADAPTER_PROTOCOL,
       taskContextLatched: false,
@@ -1491,6 +1695,13 @@ function getSessionState(sessionID) {
       completionSafeFailShortCircuitRequests: 0,
       completionSafeFailShortCircuits: 0,
       completionSafeFailShortCircuitFailures: 0,
+      fatalSafeFail: null,
+      fatalSafeFailSha256: null,
+      fatalSafeFailClaims: 0,
+      fatalSafeFailShortCircuitAttemptedSha256: null,
+      fatalSafeFailShortCircuitRequests: 0,
+      fatalSafeFailShortCircuits: 0,
+      fatalSafeFailShortCircuitFailures: 0,
       mutationIntent: "unknown",
       mutationIntentReason: "unresolved",
       visibleToolSchemaSha256: null,
@@ -1517,6 +1728,15 @@ function getSessionState(sessionID) {
       modelLatencySamples: 0,
       modelLatencyMaxMs: 0,
       modelLatencyProfile: initialLatencyProfile(),
+      governorWorkProfile: initialGovernorWorkProfile(),
+      lastGovernorDispatchWorkBytes: null,
+      lastGovernorDispatchInputBytes: null,
+      lastGovernorInferenceLeaseMs: null,
+      lastGovernorLeaseSource: null,
+      lastGoalDirectedDecision: null,
+      executionControlSelectedAction: null,
+      executionControlTaskDeadlineAtMs: null,
+      executionControlHardDeadlineInterrupts: 0,
       governorTaskStartedAt: now,
       governorPhaseStartedAt: now,
       governorPhase: phaseForExecutionState(EXEC_STATE_LOCATE),
@@ -1564,6 +1784,9 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.boundMutationTarget = null
   state.mutationAttempts = 0
   state.repairAttempts = 0
+  state.sourceCounterexampleFailures = 0
+  state.sourceRepairDispatches = 0
+  state.sourceCounterexampleLedger = []
   state.compilerRuns = 0
   state.patchAttempts = 0
   state.executorRuns = 0
@@ -1573,6 +1796,8 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.contractFailures = 0
   state.activeMutationTool = null
   state.additiveRepairLock = null
+  state.activeSourceSlotContract = null
+  state.sourceSlotRepairCache = null
   state.taskContextProtocol = TASK_CONTEXT_PROTOCOL
   state.taskContextAdapterProtocol = TASK_CONTEXT_ADAPTER_PROTOCOL
   state.taskContextLatched = false
@@ -1618,6 +1843,15 @@ function resetTurnState(state, turnID, startedAt = nowMs()) {
   state.modelLatencySamples = 0
   state.modelLatencyMaxMs = 0
   state.modelLatencyProfile = initialLatencyProfile()
+  state.governorWorkProfile = initialGovernorWorkProfile()
+  state.lastGovernorDispatchWorkBytes = null
+  state.lastGovernorDispatchInputBytes = null
+  state.lastGovernorInferenceLeaseMs = null
+  state.lastGovernorLeaseSource = null
+  state.lastGoalDirectedDecision = null
+  state.executionControlSelectedAction = null
+  state.executionControlTaskDeadlineAtMs = null
+  state.executionControlHardDeadlineInterrupts = 0
   state.governorTaskStartedAt = startedAt
   state.governorPhaseStartedAt = startedAt
   state.governorPhase = phaseForExecutionState(EXEC_STATE_LOCATE)
@@ -1667,6 +1901,21 @@ function observeModelLatencyAtToolBoundary(state, observedAt = nowMs()) {
   state.modelLatencySamples = (state.modelLatencySamples ?? 0) + 1
   state.modelLatencyMaxMs = Math.max(state.modelLatencyMaxMs ?? 0, elapsed)
   state.modelLatencyProfile = observeLatency(state.modelLatencyProfile, elapsed)
+
+  if (Number.isFinite(state.lastGovernorDispatchWorkBytes)) {
+    state.governorWorkProfile = observeGovernorWork(
+      state.governorWorkProfile,
+      {
+        elapsedMs: elapsed,
+        workBytes: state.lastGovernorDispatchWorkBytes,
+      },
+    )
+  }
+
+  state.lastGovernorDispatchWorkBytes = null
+  state.lastGovernorDispatchInputBytes = null
+  state.lastGovernorInferenceLeaseMs = null
+  state.lastGovernorLeaseSource = null
   return elapsed
 }
 
@@ -1800,6 +2049,23 @@ function applyExecutionEvent(state, event, reason, details = null) {
   state.executionState = next
   state.executionReason = reason ?? event
   state.executionEvent = event
+
+  if (event === "fatal") {
+    const derivedFatal = deriveFatalSafeFail(
+      state,
+      state.executionReason,
+    )
+
+    if (derivedFatal.ok === true) {
+      const claim = claimFatalSafeFail(
+        state,
+        derivedFatal.commit,
+      )
+      if (claim.ok !== true) {
+        state.executionReason = claim.reason
+      }
+    }
+  }
 
   if (previousPhase !== nextPhase) {
     state.governorPhase = nextPhase

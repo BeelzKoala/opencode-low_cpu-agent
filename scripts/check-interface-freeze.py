@@ -8,6 +8,7 @@ CORE_PROTOCOL_SOURCES = (
     "execution-readiness-v1.mjs",
     "additive-mutation-v1.mjs",
     "obligation-bound-synthesis-v1.mjs",
+    "task-proof-obligations-v1.mjs",
     "additive-mutation-v2.mjs",
     "additive-mutation-v3.mjs",
     "python-additive-compiler-v1.mjs",
@@ -72,7 +73,7 @@ assert SPEC["protocols"]["obligation_bound_synthesis"] == \
 assert SPEC["protocols"]["time_semantics"] == "time-semantics-v1"
 assert SPEC["protocols"]["additive_repair_hint"] == "additive-repair-hint-v1"
 assert SPEC["budgets"]["additive_semantic_repair_attempts"] == 1
-assert SPEC["model_tools"]["execute_additive_plan"]["required"] == ["python_imports", "python_declarations", "replacements", "creations"]
+assert SPEC["model_tools"]["execute_additive_plan"]["required"] == ["contents"]
 assert "operations: {" in SPEC["model_tools"]["execute_additive_plan"]["forbidden_markers"]
 assert 'required: ["operations"]' in SPEC["model_tools"]["execute_additive_plan"]["forbidden_markers"]
 assert '"closed-additive-mutation-abi-v1"' in INTERFACE_SOURCES

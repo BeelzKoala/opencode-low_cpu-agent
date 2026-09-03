@@ -1,7 +1,18 @@
+import {
+  PHYSICAL_INFERENCE_LEASE_PROTOCOL,
+  createPhysicalInferenceLeaseController,
+} from "./cpu-search-core/physical-inference-lease-v1.mjs"
+import { deriveGovernorPhysicalLease } from "./cpu-search-core/governor-physical-lease-v1.mjs"
+import {
+  mirrorProjectTraceTelemetry,
+  observePublicEventTelemetry,
+  stopAllTelemetrySamplers,
+} from "./cpu-search-core/telemetry-plane-v1.mjs"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { appendFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 import {
   DETERMINISTIC_SCOUT_ENTRY_PROTOCOL,
@@ -15,6 +26,7 @@ import {
   compileAdditiveExecutionCapsule,
   resolveModelContextBudgetBytes,
   resolveModelContextCompilerMode,
+  resolveModelContextCompilerPolicy,
   resolveRepairContextBudgetBytes,
   snapshotCompiledExecutionCapsule,
 } from "./cpu-search-core/model-context-compiler-v1.mjs"
@@ -29,6 +41,10 @@ import {
   compileTaskRequirements,
   unresolvedTaskRequirements,
 } from "./cpu-search-core/task-requirements-v1.mjs"
+import {
+  TASK_PROOF_COMPILER_PROTOCOL,
+  compileTaskProofObligations,
+} from "./cpu-search-core/task-proof-obligations-v1.mjs"
 import {
   classifyEvidenceAuthority,
 } from "./cpu-search-core/evidence-authority-v1.mjs"
@@ -130,10 +146,73 @@ import {
 } from "./cpu-search-core/additive-mutation-v3.mjs"
 import {
   OBLIGATION_BOUND_SYNTHESIS_PROTOCOL,
-  bindObligationBoundToolSchema,
-  materializeObligationBoundAdditiveRequest,
+  deriveObligationBoundSynthesisContract,
+  projectObligationBoundMutationContext,
   renderObligationBoundSynthesisContract,
 } from "./cpu-search-core/obligation-bound-synthesis-v1.mjs"
+import {
+  SEMANTIC_CONTENT_IR_PROTOCOL,
+  bindSemanticContentToolSchemaToCapability,
+  materializeSemanticAdditiveRequest,
+} from "./cpu-search-core/semantic-content-ir-v1.mjs"
+import {
+  buildFileFamilyRepairHint,
+  fileFamilyRepairAuthorityMatches,
+} from "./cpu-search-core/file-family-contract-v1.mjs"
+import {
+  buildPythonSemanticRepairHint,
+  pythonSemanticFailureIsRepairable,
+  pythonSemanticRepairAuthorityMatches,
+} from "./cpu-search-core/python-semantic-repair-v1.mjs"
+import {
+  SEMANTIC_OBLIGATION_BRIDGE_PROTOCOL,
+  bindSemanticObligationContract,
+  validateSemanticObligationRequest,
+} from "./cpu-search-core/semantic-obligation-bridge-v1.mjs"
+import {
+  SOURCE_SLOT_COMPILER_PROTOCOL,
+  SOURCE_SLOT_REPAIR_PROTOCOL,
+  bindSourceSlotToolSchema,
+  buildSourceSlotRepairCache,
+  rehydrateSourceSlotRequest,
+  sourceSlotRepairAuthorityMatches,
+  sourceSlotTypedStructuralRepairAuthorityMatches,
+} from "./cpu-search-core/source-slot-compiler-v1.mjs"
+import {
+  MODEL_VIEW_COMPILER_PROTOCOL,
+  compileSourceSlotModelView,
+  modelViewFailureIsNonRepairable,
+  modelViewOwnsFinalModelAbi,
+  normalizeSourceSlotModelViewRequest,
+  projectModelViewControlContext,
+} from "./cpu-search-core/model-view-compiler-v1.mjs"
+
+import {
+  ATOMIC_MODEL_VIEW_PROTOCOL,
+  RESIDUAL_MODEL_VIEW_PROTOCOL,
+  accumulateAtomicModelViewRequest,
+  atomicModelViewRuntimeEnabled,
+  compileAtomicModelViewProjection,
+  residualModelViewRuntimeEnabled,
+} from "./cpu-search-core/atomic-model-view-v1.mjs"
+import {
+  PYTHON_DEPENDENCY_EVIDENCE_PROTOCOL,
+  REPAIR_WITNESS_CLOSURE_PROTOCOL,
+  compileRepairWitnessClosure,
+  inspectPythonDependencyEvidence,
+} from "./cpu-search-core/repair-witness-closure-v1.mjs"
+import {
+  deriveSourceSlotCounterexample,
+  deriveSemanticSourceCounterexample,
+  deriveExistingRouteSourceCounterexample,
+  deriveExistingSymbolSourceCounterexample,
+  decideSourceCounterexampleRepairAdmission,
+  prepareCounterexampleToolResult,
+} from "./cpu-search-core/typed-counterexample-v1.mjs"
+import {
+  CANDIDATE_OBLIGATION_LEDGER_PROTOCOL,
+  deriveCandidateObligationLedger,
+} from "./cpu-search-core/candidate-obligation-ledger-v1.mjs"
 import {
   GOVERNOR_LATENCY_PROTOCOL,
   TIME_SEMANTICS_PROTOCOL,
@@ -149,6 +228,41 @@ import {
   phaseForExecutionState,
   resolveGovernorAdmission,
 } from "./cpu-search-core/governor-latency-v1.mjs"
+import {
+  GOVERNOR_WORK_PROTOCOL,
+  adaptiveGovernorWindows,
+  deriveGovernorInferenceLease,
+  estimateGovernorDispatchWork,
+  initialGovernorWorkProfile,
+  observeGovernorWork,
+} from "./cpu-search-core/governor-work-v2.mjs"
+import {
+  GOAL_DIRECTED_GOVERNOR_PROTOCOL,
+  decideGoalDirectedCompute,
+} from "./cpu-search-core/goal-directed-governor-v1.mjs"
+import {
+  wrapBoundedMutationLanguage,
+} from "./cpu-search-core/bounded-mutation-inference-v1.mjs"
+import {
+  QUALIFIED_COMPUTE_PROTOCOL,
+  deriveQualifiedComputePlan,
+} from "./cpu-search-core/qualified-compute-v1.mjs"
+
+import {
+  EXECUTION_CONTROL_PROTOCOL,
+  assertDeterministicFrontier,
+  wrapExecutionControlledLanguage,
+} from "./cpu-search-core/execution-control-kernel-v1.mjs"
+
+import {
+  rewriteNativeOpenAICompatibleMutationRequest,
+} from "./cpu-search-core/native-openai-compatible-mutation-wire-v1.mjs"
+
+import {
+  EXECUTION_PERMIT_PROTOCOL,
+  claimMutationExecutionPermit,
+  validateClaimedMutationExecutionPermit,
+} from "./cpu-search-core/execution-permit-v1.mjs"
 
 import {
   mergeTaskRoleEvidence,
@@ -177,6 +291,198 @@ import {
   deriveTerminalCommit,
   terminalCommitMatchesTask,
 } from "./cpu-search-core/terminal-commit-v1.mjs"
+
+import {
+  MUTATION_PHASE_COMPILER_PROTOCOL,
+  STRUCTURED_MUTATION_CONTROL_PROTOCOL,
+  compileMutationPhaseContext as compileMutationPhaseContextBase,
+  projectMutationToolSchemas,
+} from "./cpu-search-core/mutation-phase-compiler-v1.mjs"
+
+import {
+  MODEL_ABI_COMPILER_PROTOCOL,
+  compileModelFacingToolSchemas,
+} from "./cpu-search-core/model-abi-compiler-v1.mjs"
+
+import {
+  CONTROL_CONTEXT_LAYER_PROTOCOL,
+  compileControlContextLayer,
+} from "./cpu-search-core/control-context-layer-v1.mjs"
+
+import {
+  deriveCausalDispatchContract,
+} from "./cpu-search-core/causal-dispatch-contract-v1.mjs"
+
+
+function structuredMutationControlRequiredForState(
+  state,
+  selectedAction,
+) {
+  if (
+    selectedAction !==
+      EXECUTE_ADDITIVE_PLAN_TOOL
+  ) {
+    return false
+  }
+
+  return (
+    state?.executionContextSelectedSource ===
+      "compiled_execution_capsule" ||
+    state?.executionContextSelectedSource ===
+      "persisted_execution_capsule_repair_projection"
+  )
+}
+
+function buildStructuredMutationControlEnvelope(
+  state,
+  selectedAction,
+) {
+  if (
+    !structuredMutationControlRequiredForState(
+      state,
+      selectedAction,
+    )
+  ) {
+    return null
+  }
+
+  if (
+    state?.executionState !==
+      EXEC_STATE_MUTATE &&
+    state?.executionState !==
+      EXEC_STATE_REPAIR
+  ) {
+    return null
+  }
+
+  const active =
+    state?.activeSemanticMutationContract
+  const contract =
+    active?.contract
+  const attestation =
+    active?.attestation
+
+  if (
+    active?.protocol !==
+      SEMANTIC_OBLIGATION_BRIDGE_PROTOCOL ||
+    contract?.ok !== true ||
+    typeof contract.contract_sha256 !==
+      "string" ||
+    !/^[0-9a-f]{64}$/u.test(
+      contract.contract_sha256,
+    ) ||
+    attestation?.protocol !==
+      SEMANTIC_OBLIGATION_BRIDGE_PROTOCOL ||
+    attestation.contract_sha256 !==
+      contract.contract_sha256 ||
+    typeof attestation
+      .attestation_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(
+      attestation.attestation_sha256,
+    ) ||
+    typeof attestation
+      .capability_fingerprint_sha256 !==
+      "string" ||
+    !/^[0-9a-f]{64}$/u.test(
+      attestation
+        .capability_fingerprint_sha256,
+    )
+  ) {
+    return null
+  }
+
+  if (
+    typeof state
+      .executionContextCapsuleSha256 !==
+      "string" ||
+    !/^[0-9a-f]{64}$/u.test(
+      state.executionContextCapsuleSha256,
+    ) ||
+    typeof state
+      .executionContextContractSha256 !==
+      "string" ||
+    !/^[0-9a-f]{64}$/u.test(
+      state.executionContextContractSha256,
+    )
+  ) {
+    return null
+  }
+
+  const dispatchContract =
+    deriveCausalDispatchContract({
+      semanticContract: contract,
+      semanticAttestation: attestation,
+      sourceSlotBinding:
+        state?.activeSourceSlotContract
+          ?.binding ?? null,
+      executionState:
+        state.executionState,
+      selectedAction,
+      selectedSource:
+        state.executionContextSelectedSource,
+      executionContextCapsuleSha256:
+        state.executionContextCapsuleSha256,
+      executionContractSha256:
+        state.executionContextContractSha256,
+    })
+
+  if (dispatchContract.ok !== true) {
+    return null
+  }
+
+  const requiredOperations =
+    dispatchContract.required_operations
+
+  return Object.freeze({
+    protocol:
+      STRUCTURED_MUTATION_CONTROL_PROTOCOL,
+    authority:
+      "deterministic_runtime_state",
+    execution_state:
+      state.executionState,
+    selected_action:
+      selectedAction,
+    selected_source:
+      state.executionContextSelectedSource,
+    execution_context_capsule_sha256:
+      state.executionContextCapsuleSha256,
+    execution_contract_sha256:
+      state.executionContextContractSha256,
+    semantic_contract_sha256:
+      contract.contract_sha256,
+    semantic_attestation_sha256:
+      attestation.attestation_sha256,
+    capability_fingerprint_sha256:
+      attestation
+        .capability_fingerprint_sha256,
+    required_operations:
+      Object.freeze(requiredOperations),
+  })
+}
+
+function compileMutationPhaseContext(
+  request,
+) {
+  const base =
+    compileMutationPhaseContextBase(
+      request,
+    )
+
+  const controlled =
+    compileControlContextLayer(
+      base,
+    )
+
+  return projectModelViewControlContext(
+    controlled,
+    request?.modelView ?? null,
+  )
+}
+
+
+
+const physicalInferenceLeaseController =
+  createPhysicalInferenceLeaseController()
 
 const MAX_QUERIES = 4
 const LINE_HIT_CAP_PER_QUERY = 1000
@@ -371,6 +677,10 @@ const INVARIANT_VERIFIER_MAX_STDOUT_BYTES = 256 * 1024
 // ordinary agent loop may continue.
 const COMPLETION_AUTHORIZER_TIMEOUT_MS = 500
 const COMPLETION_AUTHORIZER_MAX_STDOUT_BYTES = 64 * 1024
+const TASK_PROOF_EVALUATOR_PROTOCOL = "task-proof-evaluator-v1"
+const TASK_PROOF_TERMINAL_POLICY = "additive-task-proof-v1"
+const TASK_PROOF_EVALUATOR_TIMEOUT_MS = 5_000
+const TASK_PROOF_EVALUATOR_MAX_STDOUT_BYTES = 256 * 1024
 const MAX_PATCH_ATTEMPTS_PER_TURN = 2
 
 // v2.16-B: deterministic runtime identity.
@@ -915,6 +1225,11 @@ async function writeProjectTrace(root, fileName, record) {
     const dir = path.join(root, ".opencode")
     await mkdir(dir, { recursive: true })
     await appendFile(path.join(dir, fileName), JSON.stringify(record) + "\n", "utf8")
+    await mirrorProjectTraceTelemetry(
+      root,
+      fileName,
+      record,
+    )
   } catch {
     // Telemetry is best-effort and must never break the agent.
   }

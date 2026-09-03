@@ -32,6 +32,9 @@ quick() {
   node benchmarks/runtime/v2.28-e2.7-a-repair-truth-plane.mjs
   node benchmarks/runtime/v2.28-e2.7-b-repair-convergence.mjs
   node benchmarks/runtime/v2.28-e2.8-obligation-bound-synthesis.mjs
+  node benchmarks/runtime/v2.30-e3.0-task-proof-obligations.mjs
+  python3 benchmarks/runtime/v2.30-e3.1-task-proof-evaluator.py
+  node benchmarks/runtime/v2.30-e3.2-task-proof-terminal.mjs
   python3 benchmarks/runtime/v2.28-e2.9-time-semantics.py
   python3 benchmarks/runtime/v2.28-e2.7-c-timeout-contract.py
   python3 benchmarks/runtime/v2.28-model-viability-gate.py
@@ -87,6 +90,7 @@ python3 benchmarks/runtime/v2.28-inference-viability-ladder-gate.py
   node --check opencode/plugins/cpu-search.ts
   node --check opencode/plugins/cpu-search-core/task-action-v1.mjs
   node --check opencode/plugins/cpu-search-core/task-requirements-v1.mjs
+  node --check opencode/plugins/cpu-search-core/task-proof-obligations-v1.mjs
   node --check opencode/plugins/cpu-search-core/evidence-authority-v1.mjs
   node --check opencode/plugins/cpu-search-core/localization-decision-v1.mjs
   node --check opencode/plugins/cpu-search-core/repo-capability-v1.mjs

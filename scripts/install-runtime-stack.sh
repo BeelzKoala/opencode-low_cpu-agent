@@ -9,6 +9,9 @@ RELEASE="$CRATE/target/release"
 DEST="${OPENCODE_RUNTIME_DIR:-$HOME/.local/libexec/opencode-cpu-agent}"
 PARENT="$(dirname "$DEST")"
 RUNTIME_MANIFEST=".runtime-stack-v1.json"
+DJLINT_VERSION="1.44.2"
+DJLINT_WRAPPER="opencode-djlint"
+DJLINT_SITE=".djlint-site"
 
 COMPONENTS=(
   opencode-evidence-distiller
@@ -39,6 +42,63 @@ build_stack() {
     --bin opencode-completion-authorizer \
     --bin opencode-sealed-edit-site \
     --bin opencode-sealed-slice-store
+}
+
+djlint_version_ok() {
+  local root="$1" output
+
+  [[ -x "$root/$DJLINT_WRAPPER" ]] || return 1
+
+  output="$("$root/$DJLINT_WRAPPER" --version 2>/dev/null)" || return 1
+  [[ "$output" == *"$DJLINT_VERSION"* ]]
+}
+
+prepare_djlint() {
+  local root="$1"
+
+  if djlint_version_ok "$root"; then
+    echo "PASS djlint_runtime_cached version=$DJLINT_VERSION"
+    return 0
+  fi
+
+  rm -rf "$root/$DJLINT_SITE" "$root/$DJLINT_WRAPPER"
+  mkdir -p "$root/$DJLINT_SITE"
+
+  python3 -m pip install \
+    --disable-pip-version-check \
+    --no-input \
+    --target "$root/$DJLINT_SITE" \
+    "djlint==$DJLINT_VERSION"
+
+  cat >"$root/$DJLINT_WRAPPER" <<'DJLINT_WRAPPER_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="$ROOT/.djlint-site"
+exec python3 -m djlint "$@"
+DJLINT_WRAPPER_EOF
+
+  chmod 0755 "$root/$DJLINT_WRAPPER"
+
+  djlint_version_ok "$root" || {
+    echo "FAIL djlint_runtime_version expected=$DJLINT_VERSION" >&2
+    return 1
+  }
+
+  echo "PASS djlint_runtime_prepared version=$DJLINT_VERSION"
+}
+
+verify_djlint() {
+  local root="$1"
+
+  if ! djlint_version_ok "$root"; then
+    echo "FAIL djlint_runtime_invalid expected=$DJLINT_VERSION root=$root" >&2
+    return 1
+  fi
+
+  echo "PASS djlint_runtime version=$DJLINT_VERSION wrapper=$root/$DJLINT_WRAPPER"
 }
 
 write_manifest() {
@@ -144,6 +204,7 @@ print(
     f"git_head={manifest.get('git_head')}"
 )
 PY
+  verify_djlint "$root"
 }
 
 install_stack() {
@@ -164,6 +225,7 @@ install_stack() {
     install -m 0755 "$RELEASE/$name" "$stage/$name"
   done
 
+  prepare_djlint "$stage"
   write_manifest "$stage"
   verify_stack "$stage"
 

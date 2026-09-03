@@ -1,8 +1,8 @@
-use opencode_evidence_distiller::crypto_hash::sha256_file;
 use anyhow::{Context, Result};
 use ast_grep_core::{Pattern, matcher::MatcherExt};
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 use opencode_evidence_distiller::candidate_hygiene::audit_candidate_hygiene;
+use opencode_evidence_distiller::crypto_hash::sha256_file;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,6 +36,9 @@ const MAX_AFTER_BYTES: usize = 32 * 1024;
 const MAX_CHECK_BYTES: usize = 4 * 1024;
 const MAX_PATCH_BYTES: usize = 64 * 1024;
 const MAX_EVIDENCE_DISTANCE_LINES: usize = 96;
+const DJLINT_TEMPLATE_HYGIENE_PROTOCOL: &str = "djlint-template-hygiene-v1";
+const DJLINT_RUNTIME_WRAPPER: &str = "opencode-djlint";
+const MAX_DJLINT_DIAGNOSTIC_CHARS: usize = 1200;
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -59,7 +62,6 @@ struct SliceConfinement {
     end_byte: usize,
     envelope: String,
 }
-
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct BasePrecondition {
@@ -553,7 +555,9 @@ fn git_patch(root: &Path, files: &[String], created: &BTreeSet<String>) -> Resul
     if !created.is_empty() {
         let mut add = Command::new("git");
         add.current_dir(root).args(["add", "-N", "--"]);
-        for file in created { add.arg(file); }
+        for file in created {
+            add.arg(file);
+        }
         let output = add.output().context("cannot stage intent-to-add")?;
         anyhow::ensure!(output.status.success(), "git add -N failed");
     }
@@ -567,12 +571,13 @@ fn git_patch(root: &Path, files: &[String], created: &BTreeSet<String>) -> Resul
         "--unified=3",
         "--",
     ]);
-    for file in files { cmd.arg(file); }
+    for file in files {
+        cmd.arg(file);
+    }
     let output = cmd.output().context("cannot produce worktree diff")?;
     anyhow::ensure!(output.status.success(), "git diff failed");
     String::from_utf8(output.stdout).context("git diff output is not UTF-8")
 }
-
 
 fn changed_line_count(patch: &str) -> usize {
     patch
@@ -614,7 +619,11 @@ fn load_handoff(root: &Path, raw: &str) -> Result<ScoutHandoff> {
 
 fn extension_with_dot(rel: &str) -> Option<String> {
     let ext = Path::new(rel).extension()?.to_str()?;
-    if ext.is_empty() { None } else { Some(format!(".{ext}").to_ascii_lowercase()) }
+    if ext.is_empty() {
+        None
+    } else {
+        Some(format!(".{ext}").to_ascii_lowercase())
+    }
 }
 
 fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
@@ -625,15 +634,25 @@ fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
     {
         return false;
     }
-    let Some(root) = safe_rel(&slot.root) else { return false; };
-    let Some(file) = safe_rel(rel) else { return false; };
+    let Some(root) = safe_rel(&slot.root) else {
+        return false;
+    };
+    let Some(file) = safe_rel(rel) else {
+        return false;
+    };
     let prefix = format!("{root}/");
-    let Some(local) = file.strip_prefix(&prefix) else { return false; };
+    let Some(local) = file.strip_prefix(&prefix) else {
+        return false;
+    };
     if local.is_empty() || local.split('/').count() > slot.max_depth {
         return false;
     }
-    let Some(ext) = extension_with_dot(&file) else { return false; };
-    slot.allowed_extensions.iter().any(|value| value.eq_ignore_ascii_case(&ext))
+    let Some(ext) = extension_with_dot(&file) else {
+        return false;
+    };
+    slot.allowed_extensions
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(&ext))
 }
 
 fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
@@ -647,27 +666,47 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
         || capability.existing_slots.len() > MAX_CHANGED_FILES.saturating_sub(1)
         || capability.create_slots.is_empty()
         || capability.create_slots.len() > 2
-        || !handoff.allowed_mutations.iter().any(|value| value == "replace_exact")
-        || !handoff.allowed_mutations.iter().any(|value| value == "create_file")
+        || !handoff
+            .allowed_mutations
+            .iter()
+            .any(|value| value == "replace_exact")
+        || !handoff
+            .allowed_mutations
+            .iter()
+            .any(|value| value == "create_file")
     {
         return Err("additive_capability_invalid");
     }
 
-    let files = handoff.files.iter().filter_map(|row| {
-        safe_rel(&row.file).map(|rel| (rel, row))
-    }).collect::<BTreeMap<_, _>>();
+    let files = handoff
+        .files
+        .iter()
+        .filter_map(|row| safe_rel(&row.file).map(|rel| (rel, row)))
+        .collect::<BTreeMap<_, _>>();
 
     for slot in &capability.existing_slots {
-        let Some(rel) = safe_rel(&slot.file) else { return Err("additive_existing_slot_invalid"); };
-        let Some(row) = files.get(&rel) else { return Err("additive_existing_slot_invalid"); };
+        let Some(rel) = safe_rel(&slot.file) else {
+            return Err("additive_existing_slot_invalid");
+        };
+        let Some(row) = files.get(&rel) else {
+            return Err("additive_existing_slot_invalid");
+        };
         if slot.slot.is_empty()
             || slot.sha256.len() != 64
             || !slot.sha256.chars().all(|c| c.is_ascii_hexdigit())
-            || !slot.allowed_operations.iter().any(|op| op == "replace_exact")
+            || !slot
+                .allowed_operations
+                .iter()
+                .any(|op| op == "replace_exact")
             || row.fingerprint.kind != "sha256"
             || !row.fingerprint.strong
             || row.fingerprint.evidence_fresh != Some(true)
-            || row.fingerprint.sha256.as_deref().map(|v| v.eq_ignore_ascii_case(&slot.sha256)) != Some(true)
+            || row
+                .fingerprint
+                .sha256
+                .as_deref()
+                .map(|v| v.eq_ignore_ascii_case(&slot.sha256))
+                != Some(true)
             || slot.evidence_lines.is_empty()
         {
             return Err("additive_existing_slot_invalid");
@@ -675,9 +714,15 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
     }
 
     for slot in &capability.create_slots {
-        let Some(source) = safe_rel(&slot.source_file) else { return Err("additive_create_slot_invalid"); };
-        let Some(root) = safe_rel(&slot.root) else { return Err("additive_create_slot_invalid"); };
-        let Some(row) = files.get(&source) else { return Err("additive_create_slot_invalid"); };
+        let Some(source) = safe_rel(&slot.source_file) else {
+            return Err("additive_create_slot_invalid");
+        };
+        let Some(root) = safe_rel(&slot.root) else {
+            return Err("additive_create_slot_invalid");
+        };
+        let Some(row) = files.get(&source) else {
+            return Err("additive_create_slot_invalid");
+        };
         if slot.slot.is_empty()
             || slot.source_sha256.len() != 64
             || !slot.source_sha256.chars().all(|c| c.is_ascii_hexdigit())
@@ -685,11 +730,20 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
             || slot.max_depth == 0
             || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
             || !slot.allowed_operations.iter().any(|op| op == "create_file")
-            || Path::new(&source).parent().and_then(normalize_rel).as_deref() != Some(root.as_str())
+            || Path::new(&source)
+                .parent()
+                .and_then(normalize_rel)
+                .as_deref()
+                != Some(root.as_str())
             || row.fingerprint.kind != "sha256"
             || !row.fingerprint.strong
             || row.fingerprint.evidence_fresh != Some(true)
-            || row.fingerprint.sha256.as_deref().map(|v| v.eq_ignore_ascii_case(&slot.source_sha256)) != Some(true)
+            || row
+                .fingerprint
+                .sha256
+                .as_deref()
+                .map(|v| v.eq_ignore_ascii_case(&slot.source_sha256))
+                != Some(true)
         {
             return Err("additive_create_slot_invalid");
         }
@@ -707,7 +761,11 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
             let Some(target_file) = safe_rel(&capability.target.file) else {
                 return Err("local_capability_invalid");
             };
-            let Some(handoff_file) = handoff.files.first().and_then(|value| safe_rel(&value.file)) else {
+            let Some(handoff_file) = handoff
+                .files
+                .first()
+                .and_then(|value| safe_rel(&value.file))
+            else {
                 return Err("local_capability_invalid");
             };
             if handoff.capability_protocol.as_deref() != Some(LOCAL_CAPABILITY_PROTOCOL)
@@ -728,30 +786,37 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
     }
 }
 
-
-fn handoff_allows_edit(
-    handoff: &ScoutHandoff,
-    rel: &str,
-    edit: &Edit,
-) -> bool {
+fn handoff_allows_edit(handoff: &ScoutHandoff, rel: &str, edit: &Edit) -> bool {
     match handoff.scope_mode.as_deref() {
         Some("local_mutation_capability") => {
-            let Some(capability) = handoff.capability.as_ref() else { return false; };
-            let Some(confinement) = edit.confinement.as_ref() else { return false; };
+            let Some(capability) = handoff.capability.as_ref() else {
+                return false;
+            };
+            let Some(confinement) = edit.confinement.as_ref() else {
+                return false;
+            };
             edit.kind == "replace_slice"
                 && safe_rel(&capability.target.file).as_deref() == Some(rel)
                 && confinement.owner_symbol == capability.target.symbol_name
         }
         Some("additive_mutation_capability") => {
-            let Some(capability) = handoff.additive_capability.as_ref() else { return false; };
+            let Some(capability) = handoff.additive_capability.as_ref() else {
+                return false;
+            };
             if edit.kind == "replace_exact" && edit.confinement.is_none() {
                 return capability.existing_slots.iter().any(|slot| {
                     safe_rel(&slot.file).as_deref() == Some(rel)
-                        && slot.allowed_operations.iter().any(|op| op == "replace_exact")
+                        && slot
+                            .allowed_operations
+                            .iter()
+                            .any(|op| op == "replace_exact")
                 });
             }
             if edit.kind == "create_file" && edit.confinement.is_none() {
-                return capability.create_slots.iter().any(|slot| additive_create_slot_allows(slot, rel));
+                return capability
+                    .create_slots
+                    .iter()
+                    .any(|slot| additive_create_slot_allows(slot, rel));
             }
             false
         }
@@ -760,24 +825,25 @@ fn handoff_allows_edit(
     }
 }
 
-
-fn safe_new_file_for_handoff(
-    root: &Path,
-    handoff: &ScoutHandoff,
-    rel: &str,
-) -> Option<PathBuf> {
+fn safe_new_file_for_handoff(root: &Path, handoff: &ScoutHandoff, rel: &str) -> Option<PathBuf> {
     let capability = handoff.additive_capability.as_ref()?;
-    let slot = capability.create_slots.iter().find(|slot| additive_create_slot_allows(slot, rel))?;
+    let slot = capability
+        .create_slots
+        .iter()
+        .find(|slot| additive_create_slot_allows(slot, rel))?;
     let safe = safe_rel(rel)?;
     let target = root.join(&safe);
-    if target.exists() { return None; }
+    if target.exists() {
+        return None;
+    }
     let parent = fs::canonicalize(target.parent()?).ok()?;
     let create_root_rel = safe_rel(&slot.root)?;
     let create_root = fs::canonicalize(root.join(create_root_rel)).ok()?;
-    if parent != create_root && !parent.starts_with(&create_root) { return None; }
+    if parent != create_root && !parent.starts_with(&create_root) {
+        return None;
+    }
     Some(target)
 }
-
 
 fn valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -877,10 +943,7 @@ fn validate_base_preconditions(
 
     for edit in edits {
         let rel = safe_rel(&edit.file).ok_or("base_precondition_file_invalid")?;
-        let base = edit
-            .base
-            .as_ref()
-            .ok_or("base_precondition_missing")?;
+        let base = edit.base.as_ref().ok_or("base_precondition_missing")?;
 
         if base.protocol != BASE_STATE_PROTOCOL {
             return Err("base_precondition_protocol_invalid");
@@ -933,10 +996,8 @@ fn validate_base_preconditions(
             return Err("base_precondition_handoff_mismatch");
         }
 
-        let path =
-            safe_existing_base_file(root, &rel).ok_or("base_path_state_mismatch")?;
-        let actual_sha =
-            sha256_file(&path).map_err(|_| "base_state_unreadable")?;
+        let path = safe_existing_base_file(root, &rel).ok_or("base_path_state_mismatch")?;
+        let actual_sha = sha256_file(&path).map_err(|_| "base_state_unreadable")?;
 
         if !actual_sha.eq_ignore_ascii_case(expected_sha) {
             return Err("base_state_stale");
@@ -956,15 +1017,257 @@ fn main_sources_unchanged(
         if created.contains(rel) {
             return path_is_absent_without_symlink(root, rel);
         }
-        let Some(handoff_file) = expected.get(rel) else { return false; };
-        let Some(expected_sha) = handoff_file.fingerprint.sha256.as_deref() else { return false; };
-        let Some(path) = safe_existing_file(root, rel) else { return false; };
+        let Some(handoff_file) = expected.get(rel) else {
+            return false;
+        };
+        let Some(expected_sha) = handoff_file.fingerprint.sha256.as_deref() else {
+            return false;
+        };
+        let Some(path) = safe_existing_file(root, rel) else {
+            return false;
+        };
         sha256_file(&path)
             .map(|actual| actual.eq_ignore_ascii_case(expected_sha))
             .unwrap_or(false)
     })
 }
 
+#[derive(Debug, Serialize)]
+struct DjlintTemplateHygiene {
+    protocol: &'static str,
+    applied: bool,
+    files: Vec<String>,
+    profiles: BTreeMap<String, Vec<String>>,
+}
+
+fn djlint_profile(path: &Path, source: &str) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+
+    match extension.as_str() {
+        "jinja" | "jinja2" | "j2" => Some("jinja"),
+        "html" | "htm" => {
+            if source.contains("{% load ")
+                || source.contains("{% static ")
+                || source.contains("{% csrf_token")
+            {
+                Some("django")
+            } else if source.contains("{%") || source.contains("{{") || source.contains("{#") {
+                Some("jinja")
+            } else {
+                Some("html")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn djlint_binary() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("OPENCODE_DJLINT") {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+
+    if let Some(value) = env::var_os("OPENCODE_RUNTIME_DIR") {
+        let root = PathBuf::from(value);
+        if !root.as_os_str().is_empty() {
+            return Some(root.join(DJLINT_RUNTIME_WRAPPER));
+        }
+    }
+
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("libexec")
+            .join("opencode-cpu-agent")
+            .join(DJLINT_RUNTIME_WRAPPER)
+    })
+}
+
+fn bounded_djlint_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\0', "\\0")
+        .chars()
+        .take(MAX_DJLINT_DIAGNOSTIC_CHARS)
+        .collect()
+}
+
+fn run_djlint_phase(
+    worktree: &Path,
+    binary: &Path,
+    profile: &str,
+    files: &[String],
+    phase: &str,
+) -> std::result::Result<(), String> {
+    let mut command = Command::new(binary);
+    command.current_dir(worktree);
+
+    for file in files {
+        command.arg(file);
+    }
+
+    command.arg(format!("--profile={profile}"));
+    command.arg(phase);
+    command.arg("--quiet");
+
+    let output = command.output().map_err(|error| {
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=djlint_unavailable protocol={} error={}",
+            DJLINT_TEMPLATE_HYGIENE_PROTOCOL, error
+        );
+        "djlint_unavailable".to_string()
+    })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "PATCH_EXECUTOR_DIAGNOSTIC kind=djlint_failed protocol={} phase={} profile={} exit_code={} stdout={} stderr={}",
+        DJLINT_TEMPLATE_HYGIENE_PROTOCOL,
+        phase,
+        profile,
+        output.status.code().unwrap_or(-1),
+        bounded_djlint_output(&output.stdout),
+        bounded_djlint_output(&output.stderr),
+    );
+
+    Err(match phase {
+        "--reformat" => "djlint_reformat_failed",
+        "--check" => "djlint_check_failed",
+        _ => "djlint_phase_invalid",
+    }
+    .to_string())
+}
+
+fn git_changed_paths(worktree: &Path) -> std::result::Result<BTreeSet<String>, String> {
+    let tracked = Command::new("git")
+        .current_dir(worktree)
+        .args(["diff", "--name-only", "--"])
+        .output()
+        .map_err(|_| "djlint_scope_check_failed".to_string())?;
+
+    if !tracked.status.success() {
+        return Err("djlint_scope_check_failed".to_string());
+    }
+
+    let untracked = Command::new("git")
+        .current_dir(worktree)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|_| "djlint_scope_check_failed".to_string())?;
+
+    if !untracked.status.success() {
+        return Err("djlint_scope_check_failed".to_string());
+    }
+
+    let mut paths = BTreeSet::new();
+
+    for raw in [tracked.stdout, untracked.stdout] {
+        let text =
+            std::str::from_utf8(&raw).map_err(|_| "djlint_scope_check_failed".to_string())?;
+
+        for line in text.lines() {
+            let Some(relative) = safe_rel(line.trim()) else {
+                return Err("djlint_scope_escape".to_string());
+            };
+            paths.insert(relative);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn bounded_djlint_template_hygiene(
+    worktree: &Path,
+    changed: &[String],
+) -> std::result::Result<DjlintTemplateHygiene, String> {
+    if changed.len() > MAX_CHANGED_FILES {
+        return Err("djlint_file_budget_exceeded".to_string());
+    }
+
+    let mut profiles = BTreeMap::<String, Vec<String>>::new();
+
+    for raw in changed {
+        let relative = safe_rel(raw).ok_or_else(|| "djlint_target_invalid".to_string())?;
+        let path = worktree.join(&relative);
+
+        if !path.is_file() {
+            return Err("djlint_target_unavailable".to_string());
+        }
+
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if !matches!(
+            extension.as_str(),
+            "html" | "htm" | "jinja" | "jinja2" | "j2"
+        ) {
+            continue;
+        }
+
+        let source =
+            fs::read_to_string(&path).map_err(|_| "djlint_target_not_utf8".to_string())?;
+        let profile =
+            djlint_profile(&path, &source).ok_or_else(|| "djlint_profile_unavailable".to_string())?;
+
+        profiles
+            .entry(profile.to_string())
+            .or_default()
+            .push(relative);
+    }
+
+    if profiles.is_empty() {
+        return Ok(DjlintTemplateHygiene {
+            protocol: DJLINT_TEMPLATE_HYGIENE_PROTOCOL,
+            applied: false,
+            files: Vec::new(),
+            profiles,
+        });
+    }
+
+    for files in profiles.values_mut() {
+        files.sort();
+        files.dedup();
+    }
+
+    let binary = djlint_binary().ok_or_else(|| "djlint_unavailable".to_string())?;
+
+    for (profile, files) in &profiles {
+        run_djlint_phase(worktree, &binary, profile, files, "--reformat")?;
+        run_djlint_phase(worktree, &binary, profile, files, "--check")?;
+    }
+
+    let allowed = changed.iter().cloned().collect::<BTreeSet<_>>();
+    let observed = git_changed_paths(worktree)?;
+
+    if observed.iter().any(|path| !allowed.contains(path)) {
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=djlint_scope_escape protocol={} allowed_files={} observed_files={}",
+            DJLINT_TEMPLATE_HYGIENE_PROTOCOL,
+            allowed.len(),
+            observed.len(),
+        );
+        return Err("djlint_scope_escape".to_string());
+    }
+
+    let mut files = profiles.values().flatten().cloned().collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+
+    Ok(DjlintTemplateHygiene {
+        protocol: DJLINT_TEMPLATE_HYGIENE_PROTOCOL,
+        applied: true,
+        files,
+        profiles,
+    })
+}
 
 struct GuardedResult {
     patch: String,
@@ -1000,8 +1303,13 @@ fn mutate_in_worktree(
             }
             continue;
         }
-        let handoff_file = allowed.get(rel).ok_or_else(|| "file_outside_handoff".to_string())?;
-        let expected = handoff_file.fingerprint.sha256.as_deref()
+        let handoff_file = allowed
+            .get(rel)
+            .ok_or_else(|| "file_outside_handoff".to_string())?;
+        let expected = handoff_file
+            .fingerprint
+            .sha256
+            .as_deref()
             .ok_or_else(|| "handoff_fingerprint_missing".to_string())?;
         let path = safe_existing_file(worktree, rel)
             .ok_or_else(|| "worktree_baseline_missing".to_string())?;
@@ -1012,7 +1320,9 @@ fn mutate_in_worktree(
     }
 
     for rel in changed {
-        let source = candidates.get(rel).ok_or_else(|| "candidate_missing".to_string())?;
+        let source = candidates
+            .get(rel)
+            .ok_or_else(|| "candidate_missing".to_string())?;
         let path = if created.contains(rel) {
             safe_new_file_for_handoff(worktree, handoff, rel)
                 .ok_or_else(|| "worktree_create_target_invalid".to_string())?
@@ -1021,6 +1331,19 @@ fn mutate_in_worktree(
                 .ok_or_else(|| "worktree_edit_file_unavailable".to_string())?
         };
         fs::write(&path, source.as_bytes()).map_err(|_| "worktree_write_failed".to_string())?;
+    }
+
+    let changed_vec: Vec<String> = changed.iter().cloned().collect();
+    let djlint_hygiene = bounded_djlint_template_hygiene(worktree, &changed_vec)?;
+
+    if djlint_hygiene.applied {
+        let diagnostic = serde_json::to_string(&djlint_hygiene).unwrap_or_else(|_| {
+            "{\"protocol\":\"djlint-template-hygiene-v1\",\"applied\":true}".to_string()
+        });
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=djlint_template_hygiene {}",
+            diagnostic
+        );
     }
 
     let mut syntax_checked = Vec::new();
@@ -1043,7 +1366,9 @@ fn mutate_in_worktree(
     for check in checks {
         let rel = safe_rel(&check.file).ok_or_else(|| "check_file_invalid".to_string())?;
         let path = worktree.join(&rel);
-        if !path.is_file() { return Err("check_file_unavailable".to_string()); }
+        if !path.is_file() {
+            return Err("check_file_unavailable".to_string());
+        }
         let source = fs::read_to_string(&path).map_err(|_| "check_file_not_utf8".to_string())?;
         match postcondition_holds(&check.kind, &source, &check.value) {
             Some(true) => checked += 1,
@@ -1052,29 +1377,47 @@ fn mutate_in_worktree(
         }
     }
 
-    let changed_vec: Vec<String> = changed.iter().cloned().collect();
     if !created.is_empty() {
         let mut add = Command::new("git");
         add.current_dir(worktree).args(["add", "-N", "--"]);
-        for file in created { add.arg(file); }
-        let output = add.output().map_err(|_| "git_intent_to_add_failed".to_string())?;
-        if !output.status.success() { return Err("git_intent_to_add_failed".to_string()); }
+        for file in created {
+            add.arg(file);
+        }
+        let output = add
+            .output()
+            .map_err(|_| "git_intent_to_add_failed".to_string())?;
+        if !output.status.success() {
+            return Err("git_intent_to_add_failed".to_string());
+        }
     }
     let hygiene = audit_candidate_hygiene(root, worktree, &changed_vec).map_err(|err| {
-        eprintln!("PATCH_EXECUTOR_DIAGNOSTIC kind=candidate_hygiene_error error={}", err);
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=candidate_hygiene_error error={}",
+            err
+        );
         "git_diff_check_failed".to_string()
     })?;
     if !hygiene.ok {
         let diagnostic = serde_json::to_string(&hygiene)
             .unwrap_or_else(|_| "{\"protocol\":\"candidate-hygiene-v1\",\"ok\":false}".to_string());
-        eprintln!("PATCH_EXECUTOR_DIAGNOSTIC kind=candidate_hygiene_failed {}", diagnostic);
+        eprintln!(
+            "PATCH_EXECUTOR_DIAGNOSTIC kind=candidate_hygiene_failed {}",
+            diagnostic
+        );
         return Err("git_diff_check_failed".to_string());
     }
-    let patch = git_patch(worktree, &changed_vec, created).map_err(|_| "git_diff_failed".to_string())?;
-    if patch.is_empty() { return Err("no_effect".to_string()); }
-    if patch.len() > MAX_PATCH_BYTES { return Err("patch_budget_exceeded".to_string()); }
+    let patch =
+        git_patch(worktree, &changed_vec, created).map_err(|_| "git_diff_failed".to_string())?;
+    if patch.is_empty() {
+        return Err("no_effect".to_string());
+    }
+    if patch.len() > MAX_PATCH_BYTES {
+        return Err("patch_budget_exceeded".to_string());
+    }
     let changed_lines = changed_line_count(&patch);
-    if changed_lines > max_changed_lines { return Err("changed_line_budget_exceeded".to_string()); }
+    if changed_lines > max_changed_lines {
+        return Err("changed_line_budget_exceeded".to_string());
+    }
     if !git_apply_check(root, &patch).map_err(|_| "git_apply_check_failed".to_string())? {
         return Err("git_apply_check_failed".to_string());
     }
@@ -1086,7 +1429,6 @@ fn mutate_in_worktree(
         postconditions_checked: checked,
     })
 }
-
 
 fn execute(request: &Request, started: Instant) -> Result<Response> {
     if request.mode != MODE {
@@ -1169,9 +1511,21 @@ fn execute(request: &Request, started: Instant) -> Result<Response> {
         return Ok(base);
     }
     let additive_scope = handoff.scope_mode.as_deref() == Some("additive_mutation_capability");
-    let edit_limit = if additive_scope { MAX_EDITS } else { LEGACY_MAX_EDITS };
-    let changed_file_limit = if additive_scope { MAX_CHANGED_FILES } else { LEGACY_MAX_CHANGED_FILES };
-    let changed_line_limit = if additive_scope { MAX_CHANGED_LINES } else { LEGACY_MAX_CHANGED_LINES };
+    let edit_limit = if additive_scope {
+        MAX_EDITS
+    } else {
+        LEGACY_MAX_EDITS
+    };
+    let changed_file_limit = if additive_scope {
+        MAX_CHANGED_FILES
+    } else {
+        LEGACY_MAX_CHANGED_FILES
+    };
+    let changed_line_limit = if additive_scope {
+        MAX_CHANGED_LINES
+    } else {
+        LEGACY_MAX_CHANGED_LINES
+    };
     if request.edits.len() > edit_limit {
         base.reason = Some("edit_count_invalid".to_string());
         return Ok(base);
@@ -1636,16 +1990,10 @@ mod r14c_base_state_tests {
         let root = temp_root("absent");
         fs::create_dir_all(root.join("templates")).unwrap();
 
-        assert!(path_is_absent_without_symlink(
-            &root,
-            "templates/new.html"
-        ));
+        assert!(path_is_absent_without_symlink(&root, "templates/new.html"));
 
         fs::write(root.join("templates/new.html"), b"x").unwrap();
-        assert!(!path_is_absent_without_symlink(
-            &root,
-            "templates/new.html"
-        ));
+        assert!(!path_is_absent_without_symlink(&root, "templates/new.html"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1662,10 +2010,7 @@ mod r14c_base_state_tests {
         assert!(!path_is_absent_without_symlink(&root, "broken"));
 
         symlink(root.join("real"), root.join("alias")).unwrap();
-        assert!(!path_is_absent_without_symlink(
-            &root,
-            "alias/new.txt"
-        ));
+        assert!(!path_is_absent_without_symlink(&root, "alias/new.txt"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1684,5 +2029,46 @@ mod r14c_base_state_tests {
         assert!(safe_existing_base_file(&root, "alias.py").is_none());
 
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod r20_djlint_template_hygiene_tests {
+    use super::*;
+
+    #[test]
+    fn djlint_profile_is_language_bounded() {
+        assert_eq!(
+            djlint_profile(Path::new("template.html"), "<div>plain</div>\n"),
+            Some("html")
+        );
+        assert_eq!(
+            djlint_profile(
+                Path::new("template.html"),
+                "{% if ok %}{{ value }}{% endif %}\n"
+            ),
+            Some("jinja")
+        );
+        assert_eq!(
+            djlint_profile(Path::new("template.html"), "{% load static %}\n"),
+            Some("django")
+        );
+        assert_eq!(
+            djlint_profile(Path::new("template.jinja2"), "{{ value }}\n"),
+            Some("jinja")
+        );
+        assert_eq!(
+            djlint_profile(Path::new("source.py"), "print('x')\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn djlint_runtime_wrapper_is_not_model_selected() {
+        assert_eq!(DJLINT_RUNTIME_WRAPPER, "opencode-djlint");
+        assert_eq!(
+            DJLINT_TEMPLATE_HYGIENE_PROTOCOL,
+            "djlint-template-hygiene-v1"
+        );
     }
 }

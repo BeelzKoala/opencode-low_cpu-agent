@@ -159,7 +159,6 @@ struct SliceConfinement {
     envelope: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct BasePrecondition {
     protocol: String,
@@ -345,7 +344,6 @@ fn validate_handoff_capability(handoff: &ScoutHandoff) -> std::result::Result<()
     }
 }
 
-
 fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool {
     match handoff.scope_mode.as_deref() {
         Some("local_mutation_capability") => {
@@ -365,7 +363,10 @@ fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool 
                 return false;
             };
             if mutation.symbol != "<additive>"
-                || !handoff.allowed_mutations.iter().any(|value| value == &mutation.kind)
+                || !handoff
+                    .allowed_mutations
+                    .iter()
+                    .any(|value| value == &mutation.kind)
             {
                 return false;
             }
@@ -375,11 +376,15 @@ fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool 
             match mutation.kind.as_str() {
                 "replace_exact" => capability.existing_slots.iter().any(|slot| {
                     safe_rel(&slot.file).as_deref() == Some(file.as_str())
-                        && slot.allowed_operations.iter().any(|op| op == "replace_exact")
+                        && slot
+                            .allowed_operations
+                            .iter()
+                            .any(|op| op == "replace_exact")
                 }),
-                "create_file" => capability.create_slots.iter().any(|slot| {
-                    additive_create_slot_allows(slot, &file)
-                }),
+                "create_file" => capability
+                    .create_slots
+                    .iter()
+                    .any(|slot| additive_create_slot_allows(slot, &file)),
                 _ => false,
             }
         }
@@ -388,10 +393,13 @@ fn handoff_allows_mutation(handoff: &ScoutHandoff, mutation: &Mutation) -> bool 
     }
 }
 
-
 fn extension_with_dot(rel: &str) -> Option<String> {
     let ext = Path::new(rel).extension()?.to_str()?;
-    if ext.is_empty() { None } else { Some(format!(".{ext}").to_lowercase()) }
+    if ext.is_empty() {
+        None
+    } else {
+        Some(format!(".{ext}").to_lowercase())
+    }
 }
 
 fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
@@ -402,15 +410,25 @@ fn additive_create_slot_allows(slot: &AdditiveCreateSlot, rel: &str) -> bool {
     {
         return false;
     }
-    let Some(root) = safe_rel(&slot.root) else { return false; };
-    let Some(file) = safe_rel(rel) else { return false; };
+    let Some(root) = safe_rel(&slot.root) else {
+        return false;
+    };
+    let Some(file) = safe_rel(rel) else {
+        return false;
+    };
     let prefix = format!("{root}/");
-    let Some(rest) = file.strip_prefix(&prefix) else { return false; };
+    let Some(rest) = file.strip_prefix(&prefix) else {
+        return false;
+    };
     if rest.is_empty() || rest.split('/').count() > slot.max_depth {
         return false;
     }
-    let Some(ext) = extension_with_dot(&file) else { return false; };
-    slot.allowed_extensions.iter().any(|allowed| allowed.to_lowercase() == ext)
+    let Some(ext) = extension_with_dot(&file) else {
+        return false;
+    };
+    slot.allowed_extensions
+        .iter()
+        .any(|allowed| allowed.to_lowercase() == ext)
 }
 
 fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), &'static str> {
@@ -423,8 +441,14 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
         || capability.existing_slots.is_empty()
         || capability.create_slots.is_empty()
         || handoff.allowed_mutations.len() != 2
-        || !handoff.allowed_mutations.iter().any(|value| value == "replace_exact")
-        || !handoff.allowed_mutations.iter().any(|value| value == "create_file")
+        || !handoff
+            .allowed_mutations
+            .iter()
+            .any(|value| value == "replace_exact")
+        || !handoff
+            .allowed_mutations
+            .iter()
+            .any(|value| value == "create_file")
     {
         return Err("additive_capability_invalid");
     }
@@ -443,7 +467,10 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
             || slot.sha256.len() != 64
             || !slot.sha256.chars().all(|c| c.is_ascii_hexdigit())
             || slot.evidence_lines.is_empty()
-            || !slot.allowed_operations.iter().any(|op| op == "replace_exact")
+            || !slot
+                .allowed_operations
+                .iter()
+                .any(|op| op == "replace_exact")
             || !handoff_files.contains(&file)
         {
             return Err("additive_existing_slot_invalid");
@@ -465,7 +492,11 @@ fn validate_additive_handoff(handoff: &ScoutHandoff) -> std::result::Result<(), 
             || slot.max_depth > ADDITIVE_MAX_CREATE_DEPTH
             || !slot.allowed_operations.iter().any(|op| op == "create_file")
             || !handoff_files.contains(&source)
-            || Path::new(&source).parent().and_then(normalize_rel).as_deref() != Some(root.as_str())
+            || Path::new(&source)
+                .parent()
+                .and_then(normalize_rel)
+                .as_deref()
+                != Some(root.as_str())
         {
             return Err("additive_create_slot_invalid");
         }
@@ -1001,16 +1032,12 @@ fn python_reflective_builtin_hazard(
         let function_name = function.text();
         let function_name = function_name.as_ref().trim();
 
-        if !matches!(
-            function_name,
-            "getattr" | "setattr" | "hasattr" | "delattr"
-        ) {
+        if !matches!(function_name, "getattr" | "setattr" | "hasattr" | "delattr") {
             continue;
         }
 
         if node.clone().dfs().any(|child| {
-            child.kind().as_ref() == "string_content"
-                && child.text().as_ref() == symbol
+            child.kind().as_ref() == "string_content" && child.text().as_ref() == symbol
         }) {
             return Ok(true);
         }
@@ -2013,8 +2040,14 @@ fn compile_additive_replace(
     file: &AllowedFile,
     mutation: &Mutation,
 ) -> std::result::Result<Option<Edit>, &'static str> {
-    let before = mutation.before.as_deref().ok_or("mutation_contract_invalid")?;
-    let replacement = mutation.replacement.as_deref().ok_or("mutation_contract_invalid")?;
+    let before = mutation
+        .before
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
+    let replacement = mutation
+        .replacement
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
     if before.is_empty()
         || before.len() > ADDITIVE_MAX_REPLACE_BYTES
         || replacement.len() > ADDITIVE_MAX_REPLACE_BYTES
@@ -2027,7 +2060,10 @@ fn compile_additive_replace(
     if count_exact(&file.source, before) != 1 {
         return Err("edit_precondition_not_unique");
     }
-    let byte = file.source.find(before).ok_or("edit_precondition_missing")?;
+    let byte = file
+        .source
+        .find(before)
+        .ok_or("edit_precondition_missing")?;
     let line = line_for_byte(&file.source, byte);
     let Some(distance) = nearest_evidence_distance(line, &file.evidence_lines) else {
         return Err("evidence_anchor_missing");
@@ -2055,12 +2091,18 @@ fn compile_additive_create(
     handoff: &ScoutHandoff,
     mutation: &Mutation,
 ) -> std::result::Result<Option<Edit>, &'static str> {
-    let content = mutation.content.as_deref().ok_or("mutation_contract_invalid")?;
+    let content = mutation
+        .content
+        .as_deref()
+        .ok_or("mutation_contract_invalid")?;
     if content.is_empty() || content.len() > ADDITIVE_MAX_CREATE_BYTES || content.contains('\0') {
         return Err("mutation_contract_invalid");
     }
     let rel = safe_rel(&mutation.file).ok_or("mutation_file_invalid")?;
-    let capability = handoff.additive_capability.as_ref().ok_or("additive_capability_invalid")?;
+    let capability = handoff
+        .additive_capability
+        .as_ref()
+        .ok_or("additive_capability_invalid")?;
     let slot = capability
         .create_slots
         .iter()
@@ -2077,7 +2119,9 @@ fn compile_additive_create(
     let create_root = safe_rel(&slot.root).ok_or("additive_create_slot_invalid")?;
     let canonical_create_root =
         fs::canonicalize(root.join(create_root)).map_err(|_| "create_root_unavailable")?;
-    if canonical_parent != canonical_create_root && !canonical_parent.starts_with(&canonical_create_root) {
+    if canonical_parent != canonical_create_root
+        && !canonical_parent.starts_with(&canonical_create_root)
+    {
         return Err("create_parent_escape");
     }
     let validity = validate_candidate(&target, content);
@@ -2093,7 +2137,6 @@ fn compile_additive_create(
         base: None,
     }))
 }
-
 
 fn sha256_source(source: &str) -> String {
     let mut hasher = Sha256::new();
@@ -2167,8 +2210,7 @@ fn compile(request: &Request) -> Result<Response> {
         return Ok(Response::rejected(request, reason, None));
     }
 
-    let additive_scope =
-        handoff.scope_mode.as_deref() == Some("additive_mutation_capability");
+    let additive_scope = handoff.scope_mode.as_deref() == Some("additive_mutation_capability");
     if !additive_scope && request.mutations.len() > LEGACY_MAX_MUTATIONS {
         return Ok(Response::rejected(request, "mutation_count_invalid", None));
     }
@@ -2177,7 +2219,11 @@ fn compile(request: &Request) -> Result<Response> {
         let mut plan_bytes = 0usize;
         for mutation in &request.mutations {
             let payload = match mutation.kind.as_str() {
-                "replace_exact" => mutation.before.as_ref().map(String::len).unwrap_or(0)
+                "replace_exact" => mutation
+                    .before
+                    .as_ref()
+                    .map(String::len)
+                    .unwrap_or(0)
                     .saturating_add(mutation.replacement.as_ref().map(String::len).unwrap_or(0)),
                 "create_file" => mutation.content.as_ref().map(String::len).unwrap_or(0),
                 _ => 0,
@@ -2185,7 +2231,11 @@ fn compile(request: &Request) -> Result<Response> {
             plan_bytes = plan_bytes.saturating_add(payload);
         }
         if plan_bytes > ADDITIVE_MAX_PLAN_BYTES {
-            return Ok(Response::rejected(request, "additive_plan_byte_budget", None));
+            return Ok(Response::rejected(
+                request,
+                "additive_plan_byte_budget",
+                None,
+            ));
         }
     }
 
@@ -2266,33 +2316,43 @@ fn compile(request: &Request) -> Result<Response> {
         }
 
         let compiled = match mutation.kind.as_str() {
-            "replace_body" => match compile_replace_body(file.expect("validated existing file"), mutation) {
-                Ok(Some(edit)) => vec![edit],
-                Ok(None) => Vec::new(),
-                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
-            },
-            "replace_node" => match compile_replace_node(file.expect("validated existing file"), mutation, idx) {
-                Ok(Some(edit)) => vec![edit],
-                Ok(None) => Vec::new(),
-                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
-            },
-            "replace_expr" => match compile_replace_expr(file.expect("validated existing file"), mutation) {
-                Ok(Some(edit)) => vec![edit],
-                Ok(None) => Vec::new(),
-                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
-            },
-            "rename_symbol" => match compile_rename(&root, &allowed, file.expect("validated existing file"), mutation) {
-                Ok(values) => values,
-                Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
-            },
-            "replace_exact" => match compile_additive_replace(
+            "replace_body" => {
+                match compile_replace_body(file.expect("validated existing file"), mutation) {
+                    Ok(Some(edit)) => vec![edit],
+                    Ok(None) => Vec::new(),
+                    Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+                }
+            }
+            "replace_node" => {
+                match compile_replace_node(file.expect("validated existing file"), mutation, idx) {
+                    Ok(Some(edit)) => vec![edit],
+                    Ok(None) => Vec::new(),
+                    Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+                }
+            }
+            "replace_expr" => {
+                match compile_replace_expr(file.expect("validated existing file"), mutation) {
+                    Ok(Some(edit)) => vec![edit],
+                    Ok(None) => Vec::new(),
+                    Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+                }
+            }
+            "rename_symbol" => match compile_rename(
+                &root,
+                &allowed,
                 file.expect("validated existing file"),
                 mutation,
             ) {
-                Ok(Some(edit)) => vec![edit],
-                Ok(None) => Vec::new(),
+                Ok(values) => values,
                 Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
             },
+            "replace_exact" => {
+                match compile_additive_replace(file.expect("validated existing file"), mutation) {
+                    Ok(Some(edit)) => vec![edit],
+                    Ok(None) => Vec::new(),
+                    Err(reason) => return Ok(Response::rejected(request, reason, Some(idx))),
+                }
+            }
             "create_file" => match compile_additive_create(&root, &handoff, mutation) {
                 Ok(Some(edit)) => vec![edit],
                 Ok(None) => Vec::new(),
@@ -2338,8 +2398,11 @@ fn compile(request: &Request) -> Result<Response> {
         response.dropped_duplicates = dropped_duplicates;
         return Ok(response);
     }
-    let edit_limit =
-        if additive_scope { MAX_LOWERED_EDITS } else { LEGACY_MAX_LOWERED_EDITS };
+    let edit_limit = if additive_scope {
+        MAX_LOWERED_EDITS
+    } else {
+        LEGACY_MAX_LOWERED_EDITS
+    };
     if edits.len() > edit_limit {
         return Ok(Response::rejected(
             request,
@@ -2351,7 +2414,11 @@ fn compile(request: &Request) -> Result<Response> {
         .iter()
         .map(|edit| edit.file.clone())
         .collect::<BTreeSet<_>>();
-    let changed_file_limit = if additive_scope { MAX_CHANGED_FILES } else { LEGACY_MAX_CHANGED_FILES };
+    let changed_file_limit = if additive_scope {
+        MAX_CHANGED_FILES
+    } else {
+        LEGACY_MAX_CHANGED_FILES
+    };
     if changed_files.len() > changed_file_limit {
         return Ok(Response::rejected(
             request,

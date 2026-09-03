@@ -28,24 +28,10 @@
         "required: [\"slot\", \"evidence_line\", \"content\"]"
       ],
       "required": [
-        "python_imports",
-        "python_declarations",
-        "replacements",
-        "creations"
+        "contents"
       ],
       "required_markers": [
-        "required: [\"python_imports\", \"python_declarations\", \"replacements\", \"creations\"]",
-        "required: [\"slot\", \"modules\", \"from_imports\"]",
-        "required: [\"module\", \"name\"]",
-        "required: [\"slot\", \"content\"]",
-        "required: [\"slot\", \"before\", \"replacement\"]",
-        "required: [\"slot\", \"relative_path\", \"content\"]",
-        "python_imports: {",
-        "python_declarations: {",
-        "from_imports: {",
-        "replacements: {",
-        "creations: {",
-        "relative_path: {"
+        "contents: {"
       ]
     },
     "execute_rename_symbol": {

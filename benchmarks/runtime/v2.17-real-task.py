@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -209,6 +210,20 @@ def tool_records(rows: list[dict[str, Any]], tool: str) -> list[dict[str, Any]]:
     return out
 
 
+def completed_tool_records(
+    rows: list[dict[str, Any]],
+    tool: str,
+) -> list[dict[str, Any]]:
+    # Terminal OpenCode tool completion is execution evidence.
+    out = []
+    for row in tool_records(rows, tool):
+        part = row.get("part") or {}
+        state = part.get("state") or {}
+        if isinstance(state, dict) and state.get("status") == "completed":
+            out.append(row)
+    return out
+
+
 def tool_metadata(row: dict[str, Any]) -> dict[str, Any]:
     part = row.get("part") or {}
     state = part.get("state") or {}
@@ -310,6 +325,8 @@ def preserve_agent_artifacts(worktree: Path, out: Path) -> None:
         "search-trace.jsonl",
         "executor-trace.jsonl",
         "cpu-agent-trace.jsonl",
+        "telemetry-v1.jsonl",
+        "koalik-stage-trace.jsonl",
     ):
         copy_if_exists(dot / name, out)
 
@@ -450,6 +467,437 @@ def safe_fail_class(reason: str, *, searches: bool, timed_out: bool) -> str:
     return "implementation_bug"
 
 
+
+ADAPTIVE_GOVERNOR_WORK_PROTOCOL = "governor-work-v2"
+ADAPTIVE_GOVERNOR_LEASE_GRACE_S = 30.0
+
+
+def _read_governor_lease_records(
+    trace_path: Path,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not trace_path.exists():
+        return offset, []
+
+    rows: list[dict[str, Any]] = []
+
+    try:
+        size = trace_path.stat().st_size
+        if offset > size:
+            offset = 0
+
+        with trace_path.open("r", encoding="utf-8") as handle:
+            handle.seek(offset)
+
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+
+                if line == "":
+                    return handle.tell(), rows
+
+                if not line.endswith("\n"):
+                    return line_start, rows
+
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if (
+                    isinstance(row, dict)
+                    and row.get("kind") == "model_dispatch"
+                    and row.get("governor_work_protocol")
+                    == ADAPTIVE_GOVERNOR_WORK_PROTOCOL
+                ):
+                    rows.append(row)
+    except OSError:
+        return offset, []
+
+
+KOALIK_STAGE_TELEMETRY_PROTOCOL = "koalik-stage-telemetry-v1"
+KOALIK_HEARTBEAT_INTERVAL_S = 30.0
+
+_koalik_stage_state: dict[str, dict[str, Any]] = {}
+
+
+def _read_koalik_trace_records(
+    trace_path: Path,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if offset < 0:
+        offset = 0
+
+    try:
+        size = trace_path.stat().st_size
+    except OSError:
+        return offset, []
+
+    # Worktree traces normally append only, but fail safely if
+    # the file was truncated/replaced.
+    if size < offset:
+        offset = 0
+
+    if size == offset:
+        return offset, []
+
+    try:
+        with trace_path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+    except OSError:
+        return offset, []
+
+    if not chunk:
+        return offset, []
+
+    # Never consume an incomplete JSONL record.
+    last_newline = chunk.rfind(b"\n")
+
+    if last_newline < 0:
+        return offset, []
+
+    complete = chunk[:last_newline + 1]
+    new_offset = offset + last_newline + 1
+
+    rows: list[dict[str, Any]] = []
+
+    for raw in complete.splitlines():
+        if not raw:
+            continue
+
+        try:
+            value = json.loads(
+                raw.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+        except Exception:
+            continue
+
+        if isinstance(value, dict):
+            rows.append(value)
+
+    return new_offset, rows
+
+
+def _koalik_poll_trace(
+    trace_path: Path,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    new_offset, rows = _read_koalik_trace_records(
+        trace_path,
+        offset,
+    )
+
+    _koalik_observe_trace(
+        trace_path,
+        rows,
+    )
+
+    return new_offset, rows
+
+
+def _koalik_stage_from_trace(
+    rows: list[dict[str, Any]],
+    current: str,
+) -> str:
+    stage = current
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        kind = row.get("kind")
+
+        if kind in {
+            "fatal_safe_fail_requested",
+            "fatal_safe_fail",
+        }:
+            stage = "SAFE_FAIL"
+            continue
+
+        if kind != "model_dispatch":
+            continue
+
+        execution_state = row.get("execution_state")
+        next_action = row.get("next_action")
+
+        if (
+            execution_state == "locate"
+            or next_action == "search"
+        ):
+            stage = "LOCATE_INFERENCE"
+            continue
+
+        if execution_state == "repair":
+            stage = "REPAIR_INFERENCE"
+            continue
+
+        if (
+            execution_state == "mutate"
+            or next_action
+            in {
+                "execute_patch",
+                "execute_additive_plan",
+                "execute_replace_node",
+                "execute_rename_symbol",
+            }
+        ):
+            stage = "MUTATION_INFERENCE"
+            continue
+
+        stage = "MODEL_INFERENCE"
+
+    return stage
+
+
+def _koalik_emit_stage_event(
+    trace_path: Path,
+    *,
+    kind: str,
+    stage: str,
+    previous_stage: str | None,
+    started: float,
+    stage_started: float,
+    trace_events: int,
+) -> None:
+    now = time.monotonic()
+
+    payload = {
+        "protocol": KOALIK_STAGE_TELEMETRY_PROTOCOL,
+        "kind": kind,
+        "stage": stage,
+        "previous_stage": previous_stage,
+        "elapsed_s": round(now - started, 3),
+        "stage_elapsed_s": round(now - stage_started, 3),
+        "trace_events": trace_events,
+    }
+
+    try:
+        telemetry_path = trace_path.with_name(
+            "koalik-stage-trace.jsonl"
+        )
+        with telemetry_path.open(
+            "a",
+            encoding="utf-8",
+        ) as fh:
+            fh.write(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError:
+        # Telemetry is observation-only and must never alter
+        # benchmark/product result semantics.
+        pass
+
+    try:
+        if kind == "transition":
+            print(
+                "KOALIK ПЕРЕХОД"
+                f" {previous_stage}->{stage}"
+                f" elapsed={payload['elapsed_s']}s"
+                f" trace_events={trace_events}",
+                flush=True,
+            )
+        else:
+            print(
+                "KOALIK HEARTBEAT"
+                f" stage={stage}"
+                f" elapsed={payload['elapsed_s']}s"
+                f" stage_elapsed={payload['stage_elapsed_s']}s"
+                f" trace_events={trace_events}",
+                flush=True,
+            )
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _koalik_observe_trace(
+    trace_path: Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    key = str(trace_path.resolve())
+    now = time.monotonic()
+
+    state = _koalik_stage_state.get(key)
+
+    if state is None:
+        state = {
+            "stage": "STARTUP",
+            "started": now,
+            "stage_started": now,
+            "next_heartbeat":
+                now + KOALIK_HEARTBEAT_INTERVAL_S,
+            "trace_events": 0,
+        }
+        _koalik_stage_state[key] = state
+
+    state["trace_events"] += len(rows)
+
+    previous = str(state["stage"])
+    observed = _koalik_stage_from_trace(
+        rows,
+        previous,
+    )
+
+    if observed != previous:
+        state["stage"] = observed
+        state["stage_started"] = now
+        state["next_heartbeat"] = (
+            now + KOALIK_HEARTBEAT_INTERVAL_S
+        )
+
+        _koalik_emit_stage_event(
+            trace_path,
+            kind="transition",
+            stage=observed,
+            previous_stage=previous,
+            started=float(state["started"]),
+            stage_started=float(state["stage_started"]),
+            trace_events=int(state["trace_events"]),
+        )
+        return
+
+    if now >= float(state["next_heartbeat"]):
+        _koalik_emit_stage_event(
+            trace_path,
+            kind="heartbeat",
+            stage=observed,
+            previous_stage=None,
+            started=float(state["started"]),
+            stage_started=float(state["stage_started"]),
+            trace_events=int(state["trace_events"]),
+        )
+
+        state["next_heartbeat"] = (
+            now + KOALIK_HEARTBEAT_INTERVAL_S
+        )
+
+
+
+def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        proc.terminate()
+
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+    proc.wait()
+
+
+def _wait_with_governor_leases(
+    proc: subprocess.Popen[Any],
+    worktree: Path,
+    started_monotonic: float,
+    started_epoch_ms: int,
+    initial_timeout_s: float,
+) -> dict[str, Any]:
+    trace_path = worktree / ".opencode" / "cpu-agent-trace.jsonl"
+    deadline = started_monotonic + initial_timeout_s
+    offset = 0
+    seen: set[tuple[Any, Any]] = set()
+    telemetry_offset = 0
+    leases_seen = 0
+    extensions = 0
+    max_lease_ms = 0
+    last_source = None
+
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            return {
+                "rc": rc,
+                "timed_out": False,
+                "adaptive_lease_seen": leases_seen > 0,
+                "adaptive_lease_records": leases_seen,
+                "adaptive_lease_extensions": extensions,
+                "adaptive_max_lease_ms": max_lease_ms,
+                "adaptive_last_lease_source": last_source,
+                "effective_timeout_s": max(
+                    initial_timeout_s,
+                    deadline - started_monotonic,
+                ),
+            }
+
+        offset, rows = _read_governor_lease_records(trace_path, offset)
+        telemetry_offset, _ = _koalik_poll_trace(
+            trace_path,
+            telemetry_offset,
+        )
+
+        for row in rows:
+            key = (row.get("ts"), row.get("model_call"))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            lease_ms = row.get("governor_inference_lease_ms")
+            dispatch_ts_ms = row.get("ts")
+
+            if (
+                not isinstance(lease_ms, (int, float))
+                or isinstance(lease_ms, bool)
+                or lease_ms <= 0
+                or not isinstance(dispatch_ts_ms, (int, float))
+                or isinstance(dispatch_ts_ms, bool)
+            ):
+                continue
+
+            leases_seen += 1
+            max_lease_ms = max(max_lease_ms, int(lease_ms))
+            last_source = row.get("governor_inference_lease_source")
+
+            dispatch_offset_s = max(
+                0.0,
+                (float(dispatch_ts_ms) - started_epoch_ms) / 1000.0,
+            )
+            candidate = (
+                started_monotonic
+                + dispatch_offset_s
+                + float(lease_ms) / 1000.0
+                + ADAPTIVE_GOVERNOR_LEASE_GRACE_S
+            )
+
+            if candidate > deadline:
+                deadline = candidate
+                extensions += 1
+
+        now = time.monotonic()
+        if now >= deadline:
+            _terminate_process_group(proc)
+            return {
+                "rc": 124,
+                "timed_out": True,
+                "adaptive_lease_seen": leases_seen > 0,
+                "adaptive_lease_records": leases_seen,
+                "adaptive_lease_extensions": extensions,
+                "adaptive_max_lease_ms": max_lease_ms,
+                "adaptive_last_lease_source": last_source,
+                "effective_timeout_s": max(
+                    initial_timeout_s,
+                    deadline - started_monotonic,
+                ),
+            }
+
+        time.sleep(min(0.25, max(0.01, deadline - now)))
+
+
 def run_agent(
     opencode: Path,
     worktree: Path,
@@ -490,21 +938,15 @@ def run_agent(
             start_new_session=True,
         )
 
-        timed_out = False
-
-        try:
-            rc = proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            proc.terminate()
-
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-            rc = 124
+        wait_result = _wait_with_governor_leases(
+            proc,
+            worktree,
+            started,
+            started_at_ms,
+            float(timeout_s),
+        )
+        rc = int(wait_result["rc"])
+        timed_out = bool(wait_result["timed_out"])
 
     ended_at_ms = time.time_ns() // 1_000_000
 
@@ -514,6 +956,18 @@ def run_agent(
         "elapsed_s": round(time.monotonic() - started, 3),
         "started_at_ms": started_at_ms,
         "ended_at_ms": ended_at_ms,
+        "adaptive_lease_seen":
+            bool(wait_result.get("adaptive_lease_seen")),
+        "adaptive_lease_records":
+            int(wait_result.get("adaptive_lease_records", 0)),
+        "adaptive_lease_extensions":
+            int(wait_result.get("adaptive_lease_extensions", 0)),
+        "adaptive_max_lease_ms":
+            int(wait_result.get("adaptive_max_lease_ms", 0)),
+        "adaptive_last_lease_source":
+            wait_result.get("adaptive_last_lease_source"),
+        "effective_timeout_s":
+            round(float(wait_result.get("effective_timeout_s", timeout_s)), 3),
     }
 
 
@@ -748,18 +1202,30 @@ def run_task(
             stderr_path,
         )
 
+        print(
+            "KOALIK ЭТАП stage=POST_AGENT_ANALYSIS"
+            f" elapsed={agent.get('elapsed_s')}s",
+            flush=True,
+        )
+
         rows = load_json_lines(stdout_path)
-        searches = tool_records(rows, "search")
+        search_proposals = tool_records(rows, "search")
+        searches = completed_tool_records(rows, "search")
         mutation_tools = (
             "execute_patch",
             "execute_replace_node",
             "execute_rename_symbol",
             "execute_additive_plan",
         )
-        patches = [
+        mutation_tool_proposals = [
             row
             for tool_name in mutation_tools
             for row in tool_records(rows, tool_name)
+        ]
+        patches = [
+            row
+            for tool_name in mutation_tools
+            for row in completed_tool_records(rows, tool_name)
         ]
         patches.sort(
             key=lambda row: rows.index(row)
@@ -822,12 +1288,29 @@ def run_task(
             "wall_s": agent["elapsed_s"],
             "cli_started_at_ms": agent["started_at_ms"],
             "cli_ended_at_ms": agent["ended_at_ms"],
+            "harness_adaptive_lease_seen":
+                agent.get("adaptive_lease_seen", False),
+            "harness_adaptive_lease_records":
+                agent.get("adaptive_lease_records", 0),
+            "harness_adaptive_lease_extensions":
+                agent.get("adaptive_lease_extensions", 0),
+            "harness_adaptive_max_lease_ms":
+                agent.get("adaptive_max_lease_ms", 0),
+            "harness_adaptive_last_lease_source":
+                agent.get("adaptive_last_lease_source"),
+            "harness_adaptive_effective_timeout_s":
+                agent.get("effective_timeout_s"),
             "model_calls": model_calls,
             "model_dispatches": model_dispatches,
             "search_calls": len(searches),
+            "search_proposals": len(search_proposals),
             "execute_patch_calls": len(patches),
             "mutation_calls": len(patches),
+            "mutation_tool_proposals": len(mutation_tool_proposals),
             "execute_additive_plan_calls": len(
+                completed_tool_records(rows, "execute_additive_plan")
+            ),
+            "execute_additive_plan_proposals": len(
                 tool_records(rows, "execute_additive_plan")
             ),
             "files_considered": files_considered,
@@ -1028,6 +1511,11 @@ def run_task(
             })
             return finalize_timeout_result(result=result, agent_timed_out=(agent.get("timed_out") is True), timeout_observation=timeout_observation)
 
+        print(
+            "KOALIK ЭТАП stage=ACCEPTANCE_VERIFY",
+            flush=True,
+        )
+
         checks_ok, check_results = execute_checks(
             worktree,
             checks,
@@ -1167,6 +1655,14 @@ def main() -> int:
             )
 
         results.append(row)
+
+        print(
+            "KOALIK RESULT"
+            f" task={row.get('task_id')}"
+            f" result={row.get('result')}"
+            f" reason={row.get('reason')}",
+            flush=True,
+        )
 
         print(
             "RESULT"

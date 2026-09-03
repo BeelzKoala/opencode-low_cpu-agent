@@ -252,7 +252,6 @@ struct DataProviderIdentityResponse {
     elapsed_ms: f64,
 }
 
-
 #[derive(Debug, Deserialize)]
 struct ModeRequest {
     root: String,
@@ -1864,7 +1863,6 @@ fn neighbors(request: &Request, root: &Path, path: &Path, started: Instant) -> R
     })
 }
 
-
 fn provider_constant_identity(raw: &str) -> Option<String> {
     if raw.len() < 3 || raw.len() > 80 {
         return None;
@@ -1931,9 +1929,8 @@ fn python_psycopg2_aliases(
         }
     }
 
-    let unsupported =
-        (stats.unsupported_alias > 0 || stats.unsupported_dynamic > 0)
-            && source.contains("psycopg2");
+    let unsupported = (stats.unsupported_alias > 0 || stats.unsupported_dynamic > 0)
+        && source.contains("psycopg2");
 
     (modules, connects, unsupported)
 }
@@ -2015,8 +2012,7 @@ fn extract_python_data_provider_candidates(
         "provider_parse_contains_error"
     );
 
-    let (modules, connects, unsupported) =
-        python_psycopg2_aliases(Path::new(rel), source);
+    let (modules, connects, unsupported) = python_psycopg2_aliases(Path::new(rel), source);
     anyhow::ensure!(!unsupported, "provider_import_syntax_unsupported");
     if modules.is_empty() && connects.is_empty() {
         return Ok(Vec::new());
@@ -2030,9 +2026,7 @@ fn extract_python_data_provider_candidates(
     let mut out = BTreeSet::new();
 
     for call in root.dfs() {
-        let Some(constructor) =
-            python_psycopg2_constructor(&call, &modules, &connects)
-        else {
+        let Some(constructor) = python_psycopg2_constructor(&call, &modules, &connects) else {
             continue;
         };
         if !python_call_has_identity_splat(&call, identity) {
@@ -2137,12 +2131,10 @@ fn bounded_provider_identity_files(
         return failure("provider_rg_stderr_unavailable", false);
     };
 
-    let stdout_reader = std::thread::spawn(move || {
-        read_child_limited(stdout, DATA_PROVIDER_RG_MAX_STDOUT_BYTES)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        read_child_limited(stderr, DATA_PROVIDER_RG_MAX_STDERR_BYTES)
-    });
+    let stdout_reader =
+        std::thread::spawn(move || read_child_limited(stdout, DATA_PROVIDER_RG_MAX_STDOUT_BYTES));
+    let stderr_reader =
+        std::thread::spawn(move || read_child_limited(stderr, DATA_PROVIDER_RG_MAX_STDERR_BYTES));
 
     let deadline = Instant::now() + Duration::from_millis(DATA_PROVIDER_RG_TIMEOUT_MS);
     let status = loop {
@@ -2159,10 +2151,8 @@ fn bounded_provider_identity_files(
         }
     };
 
-    let (stdout, stdout_limited) =
-        stdout_reader.join().unwrap_or_else(|_| (Vec::new(), true));
-    let (stderr, _) =
-        stderr_reader.join().unwrap_or_else(|_| (Vec::new(), true));
+    let (stdout, stdout_limited) = stdout_reader.join().unwrap_or_else(|_| (Vec::new(), true));
+    let (stderr, _) = stderr_reader.join().unwrap_or_else(|_| (Vec::new(), true));
 
     if status.is_none() {
         return failure("provider_rg_timeout", false);
@@ -2435,24 +2425,34 @@ fn edge_binding_is_current(
 }
 
 fn importer_has_unproven_member_use(root: &Path, edge: &EdgeRecord, symbol: &str) -> bool {
+    /*
+     * A named import with explicit BindingPairs is already structurally
+     * resolved:
+     *
+     *     from service import welcome
+     *
+     * If `symbol` is not one of those source bindings, this edge cannot carry
+     * that symbol. A same-spelled identifier elsewhere in the importer is
+     * unrelated and must not poison the closure.
+     *
+     * The conservative member-binding fallback is only needed for
+     * module/namespace imports, whose member access cannot currently be
+     * represented by BindingPair:
+     *
+     *     import service
+     *     service.price()
+     *
+     * Keep those fail-closed until a receiver/member validator exists.
+     */
+    if !edge.binding_pairs.is_empty() {
+        return false;
+    }
+
     let path = root.join(&edge.from);
     let Ok(source) = fs::read_to_string(&path) else {
         return true;
     };
 
-    /*
-     * An edge can point at the target module without directly importing the
-     * requested symbol:
-     *
-     *     import service
-     *     service.price()
-     *
-     * or a namespace import in JS/TS.
-     *
-     * Current binding_pairs cannot prove that member access. Do not silently
-     * call the closure complete. This is intentionally conservative until a
-     * receiver/member validator is added.
-     */
     source.contains(symbol)
 }
 
@@ -3039,8 +3039,7 @@ pub fn run_cli() -> Result<()> {
     match mode_request.mode.as_str() {
         "data_provider_identity" => {
             let request: DataProviderIdentityRequest =
-                serde_json::from_str(&input)
-                    .context("invalid data provider identity request")?;
+                serde_json::from_str(&input).context("invalid data provider identity request")?;
             let response = data_provider_identity(&request, &root, started)?;
             serde_json::to_writer(io::stdout(), &response)?;
         }
@@ -3338,12 +3337,8 @@ def primary():
 def reporting():
     return psycopg2.connect(**REPORTING_DB)
 "#;
-        let rows = extract_python_data_provider_candidates(
-            "database.py",
-            source,
-            "REPORTING_DB",
-        )
-        .unwrap();
+        let rows =
+            extract_python_data_provider_candidates("database.py", source, "REPORTING_DB").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "reporting");
         assert_eq!(rows[0].configuration_identity, "REPORTING_DB");
@@ -3357,13 +3352,11 @@ REPORTING_DB = {}
 def no():
     return serializer.connect(**REPORTING_DB)
 "#;
-        assert!(extract_python_data_provider_candidates(
-            "service.py",
-            source,
-            "REPORTING_DB",
-        )
-        .unwrap()
-        .is_empty());
+        assert!(
+            extract_python_data_provider_candidates("service.py", source, "REPORTING_DB",)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3374,12 +3367,8 @@ REPORTING_DB = {}
 def reporting():
     return pg.connect(**REPORTING_DB)
 "#;
-        let rows = extract_python_data_provider_candidates(
-            "database.py",
-            source,
-            "REPORTING_DB",
-        )
-        .unwrap();
+        let rows =
+            extract_python_data_provider_candidates("database.py", source, "REPORTING_DB").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "reporting");
     }
@@ -3392,12 +3381,8 @@ REPORTING_DB = {}
 def reporting():
     return db_connect(**REPORTING_DB)
 "#;
-        let rows = extract_python_data_provider_candidates(
-            "database.py",
-            source,
-            "REPORTING_DB",
-        )
-        .unwrap();
+        let rows =
+            extract_python_data_provider_candidates("database.py", source, "REPORTING_DB").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "reporting");
     }
@@ -3532,6 +3517,77 @@ def reporting():
 
         assert!(!closure.complete, "{closure:?}");
         assert_eq!(closure.reason.as_deref(), Some("closure_import_ambiguous"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symbol_closure_ignores_unrelated_named_member_edges() {
+        let root = closure_test_root("unrelated-named-member-edge");
+
+        fs::write(root.join("app.py"), "def greet():\n    return 1\n").unwrap();
+
+        fs::write(
+            root.join("service.py"),
+            "from app import greet\n\ndef welcome():\n    return greet()\n",
+        )
+        .unwrap();
+
+        /*
+         * This file carries `greet` directly from app.py and independently
+         * imports a different member (`welcome`) from service.py.
+         *
+         * While resolving the propagated state (service.py, greet), the
+         * service->test edge must not be treated as an unproven greet member
+         * merely because the importer also contains the spelling `greet`.
+         */
+        fs::write(
+            root.join("test_app.py"),
+            concat!(
+                "from app import greet\n",
+                "from service import welcome\n\n",
+                "def test_greet():\n",
+                "    assert greet() == 1\n\n",
+                "def test_welcome():\n",
+                "    assert welcome() == 1\n",
+            ),
+        )
+        .unwrap();
+
+        let closure = run_closure_test(&root, "app.py", "greet");
+
+        assert!(closure.ready, "{closure:?}");
+        assert!(closure.complete, "{closure:?}");
+        assert_eq!(closure.reason, None);
+
+        assert!(
+            closure.bindings.iter().any(|binding| {
+                binding.importer == "service.py"
+                    && binding.target == "app.py"
+                    && binding.source_symbol == "greet"
+                    && binding.local_symbol == "greet"
+                    && binding.propagates
+            }),
+            "{closure:?}"
+        );
+
+        assert!(
+            closure.bindings.iter().any(|binding| {
+                binding.importer == "test_app.py"
+                    && binding.target == "app.py"
+                    && binding.source_symbol == "greet"
+                    && binding.local_symbol == "greet"
+                    && binding.propagates
+            }),
+            "{closure:?}"
+        );
+
+        assert!(
+            !closure.bindings.iter().any(|binding| {
+                binding.target == "service.py" && binding.source_symbol == "greet"
+            }),
+            "{closure:?}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

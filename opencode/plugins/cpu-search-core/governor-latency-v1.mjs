@@ -3,7 +3,7 @@ export const TIME_SEMANTICS_PROTOCOL = "time-semantics-v1"
 export const GOVERNOR_TASK_WINDOW_SEMANTICS = "admission_guardrail"
 export const GOVERNOR_TASK_SLA_ENFORCED = false
 export const GOVERNOR_PRODUCT_WATCHDOG_MODE = "observation_only"
-export const GOVERNOR_PRODUCTION_HARD_LEASE_PROMOTED = false
+export const GOVERNOR_PRODUCTION_HARD_LEASE_PROMOTED = true
 const GOVERNOR_ADMISSION_POLICY = "task_window_phase_runtime_v1"
 export const GOVERNOR_PHASES = Object.freeze({
   LOCATE: "locate",

@@ -4,25 +4,57 @@ async function materializeCapabilityBoundMutation(
   state,
   input,
 ) {
-  const loaded = await readAuthorizedEditCapsule(root, state)
-  if (!loaded.ok) return { ...loaded, rescout: false }
+  // Operation-specific execution proof channel:
+  //
+  // replace_node:
+  //   full authorized EditCapsule contract
+  //
+  // rename_symbol:
+  //   content-addressed EditCapsule envelope +
+  //   first-class rename capability verified below
+  //
+  // Do not require replace-node candidate authority for a global rename.
+  const loaded =
+    input?.kind === "rename_symbol"
+      ? await readEditCapsuleEnvelope(root, state)
+      : await readAuthorizedEditCapsule(root, state)
 
-  const authorizedScopes = loaded.capsule.scopes.filter(
-    (scope) =>
-      scope?.context === "full" &&
-      scope?.mutation_authorized === true,
-  )
-  if (authorizedScopes.length !== 1) {
+  if (!loaded.ok) {
     return {
-      ok: false,
-      reason: "mutation_capability_invalid",
-      detail: `authorized_scope_count_${authorizedScopes.length}`,
+      ...loaded,
       rescout: false,
     }
   }
 
-  const primaryTarget = authorizedScopes[0]
-  const primaryCapability = state?.localMutationCapability ?? null
+  const authorizedScopes =
+    input?.kind === "rename_symbol"
+      ? []
+      : loaded.capsule.scopes.filter(
+          (scope) =>
+            scope?.context === "full" &&
+            scope?.mutation_authorized === true,
+        )
+
+  if (
+    input?.kind !== "rename_symbol" &&
+    authorizedScopes.length !== 1
+  ) {
+    return {
+      ok: false,
+      reason: "mutation_capability_invalid",
+      detail:
+        `authorized_scope_count_${authorizedScopes.length}`,
+      rescout: false,
+    }
+  }
+
+  const primaryTarget =
+    input?.kind === "rename_symbol"
+      ? null
+      : authorizedScopes[0]
+
+  const primaryCapability =
+    state?.localMutationCapability ?? null
 
   let target = null
   let capability = null
@@ -215,6 +247,24 @@ const PATCH_COMPILER_RETRY_REASONS = new Set([
   "mutation_replacement_invalid",
   "candidate_language_invalid",
 ])
+
+const DETERMINISTIC_CAPACITY_STOP_REASONS = new Set([
+  "rename_scope_too_large",
+  "lowered_edit_budget_exceeded",
+  "changed_file_budget_exceeded",
+  "changed_line_budget_exceeded",
+  "patch_budget_exceeded",
+])
+
+function deterministicCapacityFailureIsTerminal(
+  reason,
+  dispatchOrigin,
+) {
+  return (
+    dispatchOrigin === ACTION_COMMIT_DISPATCH_ORIGIN &&
+    DETERMINISTIC_CAPACITY_STOP_REASONS.has(reason)
+  )
+}
 
 const PATCH_COMPILER_RESCOUT_REASONS = new Set([
   "handoff_not_ready",
@@ -432,6 +482,54 @@ function runInvariantVerifier(root, request) {
   )
 }
 
+function taskProofEvaluatorBinary() {
+  const override =
+    process.env.OPENCODE_TASK_PROOF_EVALUATOR
+  if (
+    typeof override === "string" &&
+    override.length > 0
+  ) {
+    return override
+  }
+
+  return fileURLToPath(
+    new URL(
+      "./cpu-search-core/task-proof-evaluator-v1.py",
+      import.meta.url,
+    ),
+  )
+}
+
+function runTaskProofEvaluator(root, request) {
+  return runJsonBinary(
+    taskProofEvaluatorBinary(),
+    root,
+    request,
+    TASK_PROOF_EVALUATOR_PROTOCOL,
+    TASK_PROOF_EVALUATOR_TIMEOUT_MS,
+    TASK_PROOF_EVALUATOR_MAX_STDOUT_BYTES,
+  )
+}
+
+function taskProofPasses(value) {
+  return (
+    value?.protocol ===
+      TASK_PROOF_EVALUATOR_PROTOCOL &&
+    value?.ok === true &&
+    value?.verdict === "PASS" &&
+    Number.isInteger(value?.checks_total) &&
+    value.checks_total > 0 &&
+    value?.checks_passed ===
+      value.checks_total &&
+    value?.checks_failed === 0 &&
+    value?.baseline_clean_before === true &&
+    value?.baseline_clean_after === true &&
+    value?.proof_authority ===
+      "deterministic_candidate_analysis" &&
+    value?.mutation_authority === false
+  )
+}
+
 function runCompletionAuthorizer(root, request) {
   return runJsonBinary(
     completionAuthorizerBinary(),
@@ -541,7 +639,7 @@ async function observeCompletionAuthorization(
   return observation
 }
 
-async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment, dispatch = null) {
+async function writePatchReceipt(root, sessionID, state, executorResponse, compilerResponse, verificationResponse, proofAssessment, dispatch = null, taskProofAssessment = null) {
   const patch = typeof executorResponse?.patch === "string" ? executorResponse.patch : null
   if (!patch || !sessionID || !state?.turnID) return null
 
@@ -644,6 +742,10 @@ async function writePatchReceipt(root, sessionID, state, executorResponse, compi
       edit_capsule_sha256: state.editCapsuleHash,
       proof_obligation_protocol: PROOF_OBLIGATION_PROTOCOL,
       proof_assessment: proofAssessment,
+      task_proof_protocol:
+        taskProofAssessment?.protocol ?? null,
+      task_proof:
+        taskProofAssessment,
       verifier: verificationResponse,
     }
     const receiptBody = JSON.stringify(receipt, null, 2) + "\n"

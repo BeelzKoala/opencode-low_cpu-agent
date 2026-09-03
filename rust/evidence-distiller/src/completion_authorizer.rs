@@ -167,7 +167,10 @@ fn abstain(reason: &'static str) -> Response {
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -224,14 +227,54 @@ fn verifier_check_passes(verifier: &Value, kind: &str) -> bool {
 
 fn expected_obligations() -> Vec<ProofObligation> {
     vec![
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "changed_file_set".into(), check_kind: "changed_file_set".into(), disposition: "fatal".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "replay_exact".into(), check_kind: "replay_exact".into(), disposition: "fatal".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "ast_parse".into(), check_kind: "ast_parse".into(), disposition: "fatal".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "candidate_validity_barrier".into(), check_kind: "candidate_validity_barrier".into(), disposition: "fatal".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "top_level_conservation".into(), check_kind: "top_level_conservation".into(), disposition: "repair".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "target_cardinality".into(), check_kind: "target_cardinality".into(), disposition: "repair".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "rename_identifier_delta".into(), check_kind: "rename_identifier_delta".into(), disposition: "repair".into() },
-        ProofObligation { protocol: PROOF_PROTOCOL.into(), id: "rename_syntactic_closure".into(), check_kind: "rename_global_closure".into(), disposition: "rescout".into() },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "changed_file_set".into(),
+            check_kind: "changed_file_set".into(),
+            disposition: "fatal".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "replay_exact".into(),
+            check_kind: "replay_exact".into(),
+            disposition: "fatal".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "ast_parse".into(),
+            check_kind: "ast_parse".into(),
+            disposition: "fatal".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "candidate_validity_barrier".into(),
+            check_kind: "candidate_validity_barrier".into(),
+            disposition: "fatal".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "top_level_conservation".into(),
+            check_kind: "top_level_conservation".into(),
+            disposition: "repair".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "target_cardinality".into(),
+            check_kind: "target_cardinality".into(),
+            disposition: "repair".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "rename_identifier_delta".into(),
+            check_kind: "rename_identifier_delta".into(),
+            disposition: "repair".into(),
+        },
+        ProofObligation {
+            protocol: PROOF_PROTOCOL.into(),
+            id: "rename_syntactic_closure".into(),
+            check_kind: "rename_global_closure".into(),
+            disposition: "rescout".into(),
+        },
     ]
 }
 
@@ -250,7 +293,8 @@ fn canonical_action_commit(commit: &ActionCommit) -> Result<String, ()> {
         edit_capsule_path: &commit.edit_capsule_path,
         edit_capsule_sha256: &commit.edit_capsule_sha256,
         dispatch_origin: &commit.dispatch_origin,
-    }).map_err(|_| ())
+    })
+    .map_err(|_| ())
 }
 
 fn validate_task_and_action(request: &Request) -> Result<(String, String, String), &'static str> {
@@ -300,7 +344,11 @@ fn validate_task_and_action(request: &Request) -> Result<(String, String, String
         return Err("action_commit_hash_invalid");
     }
 
-    Ok((old_name.to_string(), new_name.to_string(), task_sha.to_string()))
+    Ok((
+        old_name.to_string(),
+        new_name.to_string(),
+        task_sha.to_string(),
+    ))
 }
 
 fn validate_proof(assessment: &ProofAssessment) -> Result<String, &'static str> {
@@ -329,17 +377,19 @@ fn validate_receipts(
         return Err("receipt_budget_or_path_invalid");
     }
 
-    let patch: Value = serde_json::from_str(&request.patch_receipt_body)
-        .map_err(|_| "patch_receipt_invalid")?;
+    let patch: Value =
+        serde_json::from_str(&request.patch_receipt_body).map_err(|_| "patch_receipt_invalid")?;
     let verification: Value = serde_json::from_str(&request.verification_receipt_body)
         .map_err(|_| "verification_receipt_invalid")?;
 
     if value_str(&patch, "protocol") != Some(PATCH_RECEIPT_PROTOCOL)
         || value_str(&patch, "verification_protocol") != Some(VERIFICATION_RECEIPT_PROTOCOL)
-        || value_str(&patch, "verification_receipt") != Some(request.verification_receipt_path.as_str())
+        || value_str(&patch, "verification_receipt")
+            != Some(request.verification_receipt_path.as_str())
         || value_str(&patch, "mutation_dispatch_origin") != Some(ACTION_COMMIT_ORIGIN)
         || value_str(&patch, "action_commit_protocol") != Some(ACTION_COMMIT_PROTOCOL)
-        || value_str(&patch, "action_commit_sha256") != Some(request.action_commit.commit_sha256.as_str())
+        || value_str(&patch, "action_commit_sha256")
+            != Some(request.action_commit.commit_sha256.as_str())
         || value_str(&patch, "mutation_tool") != Some(RENAME_TOOL)
         || value_str(&patch, "proof_obligation_protocol") != Some(PROOF_PROTOCOL)
         || value_str(&patch, "proof_disposition") != Some("pass")
@@ -354,16 +404,23 @@ fn validate_receipts(
         return Err("patch_receipt_identity_invalid");
     }
 
-    let patch_total = value_u64(&patch, "invariants_total").ok_or("patch_receipt_verifier_summary_invalid")?;
-    let patch_passed = value_u64(&patch, "invariants_passed").ok_or("patch_receipt_verifier_summary_invalid")?;
-    let patch_failed = value_u64(&patch, "invariants_failed").ok_or("patch_receipt_verifier_summary_invalid")?;
+    let patch_total =
+        value_u64(&patch, "invariants_total").ok_or("patch_receipt_verifier_summary_invalid")?;
+    let patch_passed =
+        value_u64(&patch, "invariants_passed").ok_or("patch_receipt_verifier_summary_invalid")?;
+    let patch_failed =
+        value_u64(&patch, "invariants_failed").ok_or("patch_receipt_verifier_summary_invalid")?;
     if patch_total == 0 || patch_total != patch_passed || patch_failed != 0 {
         return Err("patch_receipt_verifier_summary_invalid");
     }
 
     let patch_obligations: Vec<ProofObligation> = serde_json::from_value(
-        patch.get("proof_obligations").cloned().ok_or("patch_receipt_proof_invalid")?
-    ).map_err(|_| "patch_receipt_proof_invalid")?;
+        patch
+            .get("proof_obligations")
+            .cloned()
+            .ok_or("patch_receipt_proof_invalid")?,
+    )
+    .map_err(|_| "patch_receipt_proof_invalid")?;
     if patch_obligations != expected_obligations() {
         return Err("patch_receipt_proof_invalid");
     }
@@ -377,8 +434,12 @@ fn validate_receipts(
     }
 
     let persisted_proof: ProofAssessment = serde_json::from_value(
-        verification.get("proof_assessment").cloned().ok_or("verification_receipt_proof_invalid")?
-    ).map_err(|_| "verification_receipt_proof_invalid")?;
+        verification
+            .get("proof_assessment")
+            .cloned()
+            .ok_or("verification_receipt_proof_invalid")?,
+    )
+    .map_err(|_| "verification_receipt_proof_invalid")?;
     if &persisted_proof != &request.proof_assessment {
         return Err("verification_receipt_proof_mismatch");
     }
@@ -388,7 +449,9 @@ fn validate_receipts(
         return Err("verification_receipt_proof_hash_mismatch");
     }
 
-    let verifier = verification.get("verifier").ok_or("verifier_evidence_missing")?;
+    let verifier = verification
+        .get("verifier")
+        .ok_or("verifier_evidence_missing")?;
     if value_str(verifier, "protocol") != Some(VERIFIER_PROTOCOL)
         || value_bool(verifier, "ok") != Some(true)
         || value_str(verifier, "verdict") != Some("PASS")
@@ -409,8 +472,10 @@ fn validate_receipts(
         return Err("verifier_completion_evidence_invalid");
     }
 
-    let total = value_u64(verifier, "invariants_total").ok_or("verifier_completion_evidence_invalid")?;
-    let passed = value_u64(verifier, "invariants_passed").ok_or("verifier_completion_evidence_invalid")?;
+    let total =
+        value_u64(verifier, "invariants_total").ok_or("verifier_completion_evidence_invalid")?;
+    let passed =
+        value_u64(verifier, "invariants_passed").ok_or("verifier_completion_evidence_invalid")?;
     if total == 0 || total != passed {
         return Err("verifier_completion_evidence_invalid");
     }
@@ -515,7 +580,9 @@ fn authorize(request: &Request) -> Response {
 
 fn read_request() -> Result<Request, String> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|e| e.to_string())?;
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| e.to_string())?;
     if input.len() > (2 * MAX_RECEIPT_BYTES + 256 * 1024) {
         return Err("request_too_large".into());
     }
@@ -543,16 +610,31 @@ mod tests {
 
     #[test]
     fn sha256_matches_known_vector() {
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
     fn exact_obligation_set_is_stable() {
-        let ids = expected_obligations().into_iter().map(|x| x.id).collect::<Vec<_>>();
-        assert_eq!(ids, vec![
-            "changed_file_set", "replay_exact", "ast_parse", "candidate_validity_barrier",
-            "top_level_conservation", "target_cardinality", "rename_identifier_delta", "rename_syntactic_closure",
-        ]);
+        let ids = expected_obligations()
+            .into_iter()
+            .map(|x| x.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "changed_file_set",
+                "replay_exact",
+                "ast_parse",
+                "candidate_validity_barrier",
+                "top_level_conservation",
+                "target_cardinality",
+                "rename_identifier_delta",
+                "rename_syntactic_closure",
+            ]
+        );
     }
 
     #[test]

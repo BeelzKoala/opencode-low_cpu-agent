@@ -210,30 +210,75 @@ export function resolveExecutionReadiness({
   const renameReady = availableOperations.includes("rename_symbol")
   const additiveReady = availableOperations.includes("additive_surface")
 
+  /*
+   * Operation Capability Proof Lattice
+   *
+   * ExecutionReadiness selects between already-proven executable
+   * capabilities. It must not force every operation through the
+   * generic replace-node capsule contract.
+   *
+   * replace_node:
+   *   local capability + bounded candidate + mutation-ready capsule.
+   *
+   * rename_symbol:
+   *   first-class global rename capability. Target identity/source
+   *   freshness remain independently checked by ActionCommit and the
+   *   mutation materializer.
+   *
+   * additive_surface:
+   *   sealed additive capability carrying explicit mutation authority.
+   *
+   * This reducer still grants no mutation authority itself.
+   */
+  const operationProofs = Object.freeze({
+    replace_node: Object.freeze({
+      available: replaceReady,
+      execution_ready:
+        replaceReady &&
+        editCapsule?.mutationReady === true,
+      proof_source: "local_capability_and_edit_capsule",
+    }),
+
+    rename_symbol: Object.freeze({
+      available: renameReady,
+      execution_ready: renameReady,
+      proof_source: "global_rename_capability",
+    }),
+
+    additive_surface: Object.freeze({
+      available: additiveReady,
+      execution_ready: additiveReady,
+      proof_source: "sealed_additive_capability",
+    }),
+  })
+
+  /*
+   * Preserve the existing compatibility ordering while making the
+   * proof required for each operation explicit.
+   *
+   * An additive task prefers additive execution, then the existing
+   * bounded replace fallback.
+   *
+   * An exact rename prefers rename, while retaining the historical
+   * replace fallback rather than changing routing semantics in this
+   * defect fix.
+   */
+  const operationPreference =
+    requiredShape === EXECUTION_MUTATION_SHAPE.ADDITIVE_SURFACE
+      ? ["additive_surface", "replace_node"]
+      : requiredShape === EXECUTION_MUTATION_SHAPE.RENAME_SYMBOL
+        ? ["rename_symbol", "replace_node"]
+        : ["replace_node"]
+
   let selectedOperation = null
 
-  // Canonical operation selection belongs here, not in the downstream FSM.
-  // Prefer a task-complete additive capability when it exists, but preserve
-  // the already-proven bounded replace/rename paths as compatibility fallbacks.
-  if (
-    evidence.sufficient &&
-    requiredShape === EXECUTION_MUTATION_SHAPE.ADDITIVE_SURFACE &&
-    additiveReady
-  ) {
-    selectedOperation = "additive_surface"
-  } else if (
-    evidence.sufficient &&
-    editCapsule?.mutationReady === true &&
-    requiredShape === EXECUTION_MUTATION_SHAPE.RENAME_SYMBOL &&
-    renameReady
-  ) {
-    selectedOperation = "rename_symbol"
-  } else if (
-    evidence.sufficient &&
-    editCapsule?.mutationReady === true &&
-    replaceReady
-  ) {
-    selectedOperation = "replace_node"
+  if (evidence.sufficient) {
+    for (const operation of operationPreference) {
+      if (operationProofs[operation]?.execution_ready === true) {
+        selectedOperation = operation
+        break
+      }
+    }
   }
 
   if (selectedOperation) {

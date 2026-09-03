@@ -94,11 +94,25 @@ const renameReady = resolveExecutionReadiness({
   },
   mutationIntent: "rename_symbol",
   scoutHandoff: { status: "ready" },
-  evidenceClosure: { status: "not_applicable", localization_authority: false },
-  editCapsule: {
-    mutationReady: true,
-    readinessBlockers: [],
+  evidenceClosure: {
+    status: "not_applicable",
+    localization_authority: false,
   },
+
+  // Regression: the generic edit capsule can legitimately be
+  // non-mutation-ready for a first-class rename operation.
+  //
+  // These blockers belong to the replace-node candidate path and
+  // must not revoke a separately proven global rename capability.
+  editCapsule: {
+    mutationReady: false,
+    readinessBlockers: [
+      "localization_required_role_evidence_missing",
+      "mutation_scope_unavailable",
+      "mutation_candidate_set_unavailable",
+    ],
+  },
+
   renameMutationCapability: {
     ok: true,
     ready: true,
@@ -106,9 +120,102 @@ const renameReady = resolveExecutionReadiness({
     operation: "rename_symbol",
   },
 })
-assert.equal(renameReady.status, EXECUTION_READINESS_STATUS.READY_TO_MUTATE)
-assert.equal(renameReady.required_mutation_shape, EXECUTION_MUTATION_SHAPE.RENAME_SYMBOL)
-assert.deepEqual(renameReady.available_mutation_operations, ["rename_symbol"])
+
+assert.equal(
+  renameReady.status,
+  EXECUTION_READINESS_STATUS.READY_TO_MUTATE,
+)
+assert.equal(
+  renameReady.reason,
+  "rename_capability_ready",
+)
+assert.equal(
+  renameReady.required_mutation_shape,
+  EXECUTION_MUTATION_SHAPE.RENAME_SYMBOL,
+)
+assert.equal(
+  renameReady.selected_mutation_operation,
+  "rename_symbol",
+)
+assert.deepEqual(
+  renameReady.available_mutation_operations,
+  ["rename_symbol"],
+)
+assert.equal(
+  renameReady.edit_capsule_ready,
+  false,
+)
+assert.equal(
+  renameReady.mutation_authority,
+  false,
+)
+
+
+// Negative control:
+// removing the first-class rename capability must still fail closed.
+const renameUnavailable = resolveExecutionReadiness({
+  taskAction: {
+    status: "exact",
+    operation: "rename_symbol",
+  },
+  mutationIntent: "rename_symbol",
+  scoutHandoff: { status: "ready" },
+  evidenceClosure: {
+    status: "not_applicable",
+    localization_authority: false,
+  },
+  editCapsule: genericCapsuleBlocked,
+  renameMutationCapability: {
+    ok: false,
+    ready: false,
+    globalReady: false,
+    operation: "rename_symbol",
+  },
+})
+
+assert.equal(
+  renameUnavailable.status,
+  EXECUTION_READINESS_STATUS.SAFE_FAIL,
+)
+assert.equal(
+  renameUnavailable.reason,
+  "mutation_capability_unavailable",
+)
+assert.deepEqual(
+  renameUnavailable.available_mutation_operations,
+  [],
+)
+
+
+// Negative control:
+// replace_node still requires the generic mutation-ready capsule.
+// This change must not broaden replace authority.
+const replaceWithoutCapsuleAuthority =
+  resolveExecutionReadiness({
+    mutationIntent: "generic_edit",
+    scoutHandoff: { status: "ready" },
+    editCapsule: genericCapsuleBlocked,
+    localMutationCapability: {
+      ok: true,
+      replaceNodeReady: true,
+    },
+    localMutationCandidates: [
+      { file: "routes/a.py" },
+    ],
+  })
+
+assert.equal(
+  replaceWithoutCapsuleAuthority.status,
+  EXECUTION_READINESS_STATUS.SAFE_FAIL,
+)
+assert.equal(
+  replaceWithoutCapsuleAuthority.reason,
+  "mutation_capability_unavailable",
+)
+assert.deepEqual(
+  replaceWithoutCapsuleAuthority.available_mutation_operations,
+  ["replace_node"],
+)
 
 const exhausted = resolveExecutionReadiness({
   taskShape: additiveTaskShape,

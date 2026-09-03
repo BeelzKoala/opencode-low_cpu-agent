@@ -6,6 +6,9 @@ export const TERMINAL_OUTCOME = "VERIFIED"
 const PATCH_RECEIPT_PROTOCOL = "patch-receipt-v1"
 const VERIFICATION_RECEIPT_PROTOCOL = "verification-receipt-v1"
 const SHA256_RE = /^[0-9a-f]{64}$/
+const TASK_PROOF_EVALUATOR_PROTOCOL = "task-proof-evaluator-v1"
+const TASK_PROOF_TERMINAL_POLICY = "additive-task-proof-v1"
+const NATIVE_TERMINAL_POLICY = "exact-rename-v1"
 
 function reject(reason) {
   return {
@@ -51,10 +54,31 @@ function validProofAssessment(value) {
   )
 }
 
+function validTaskProofAssessment(value) {
+  return (
+    value?.protocol ===
+      TASK_PROOF_EVALUATOR_PROTOCOL &&
+    value?.ok === true &&
+    value?.verdict === "PASS" &&
+    Number.isInteger(value?.checks_total) &&
+    value.checks_total > 0 &&
+    value?.checks_passed ===
+      value.checks_total &&
+    value?.checks_failed === 0 &&
+    value?.baseline_clean_before === true &&
+    value?.baseline_clean_after === true &&
+    value?.proof_authority ===
+      "deterministic_candidate_analysis" &&
+    value?.mutation_authority === false
+  )
+}
+
 export function deriveTerminalCommit({
   state,
   persisted,
   proofAssessment,
+  terminalPolicy = NATIVE_TERMINAL_POLICY,
+  taskProofAssessment = null,
 }) {
   if (
     !state ||
@@ -130,6 +154,67 @@ export function deriveTerminalCommit({
     return reject("terminal_commit_patch_identity_mismatch")
   }
 
+  const additiveTaskProofPolicy =
+    terminalPolicy ===
+    TASK_PROOF_TERMINAL_POLICY
+
+  if (
+    terminalPolicy !==
+      NATIVE_TERMINAL_POLICY &&
+    !additiveTaskProofPolicy
+  ) {
+    return reject(
+      "terminal_commit_policy_invalid",
+    )
+  }
+
+  let taskProofSha256 = null
+
+  if (additiveTaskProofPolicy) {
+    const persistedTaskProof =
+      persisted?.verificationReceipt
+        ?.task_proof
+
+    if (
+      !validTaskProofAssessment(
+        taskProofAssessment,
+      ) ||
+      !validTaskProofAssessment(
+        persistedTaskProof,
+      )
+    ) {
+      return reject(
+        "terminal_commit_task_proof_not_pass",
+      )
+    }
+
+    const suppliedSha256 =
+      sha256(
+        JSON.stringify(
+          taskProofAssessment,
+        ),
+      )
+
+    const persistedSha256 =
+      sha256(
+        JSON.stringify(
+          persistedTaskProof,
+        ),
+      )
+
+    if (
+      suppliedSha256 !==
+      persistedSha256
+    ) {
+      return reject(
+        "terminal_commit_task_proof_mismatch",
+      )
+    }
+
+    taskProofSha256 =
+      suppliedSha256
+  }
+
   const canonical = {
     protocol: TERMINAL_COMMIT_PROTOCOL,
     outcome: TERMINAL_OUTCOME,
@@ -143,6 +228,13 @@ export function deriveTerminalCommit({
     patch_sha256: persisted.receipt.patch_sha256,
     proof_disposition: "pass",
     terminal_reason: "verification_passed",
+  }
+
+  if (additiveTaskProofPolicy) {
+    canonical.terminal_policy =
+      TASK_PROOF_TERMINAL_POLICY
+    canonical.task_proof_sha256 =
+      taskProofSha256
   }
 
   return {

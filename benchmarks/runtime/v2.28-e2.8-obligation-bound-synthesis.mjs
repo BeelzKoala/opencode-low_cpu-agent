@@ -259,11 +259,20 @@ const fragment09 = await readFile(
   "opencode/plugins/cpu-search.fragments/09.part.ts",
   "utf8",
 )
-assert.match(fragment06, /materializeObligationBoundAdditiveRequest/u)
-assert.match(fragment06, /obligationBoundRequest\.request/u)
+// The obligation-bound helper remains directly unit-tested above. Runtime
+// integration has since moved to the canonical semantic-obligation bridge,
+// source-slot frontend, and deterministic semantic materializer.
 assert.match(fragment08, /renderObligationBoundSynthesisContract/u)
-assert.match(fragment09, /bindObligationBoundToolSchema/u)
-assert.match(fragment09, /repair_dispatched: false/u)
+assert.match(fragment09, /deriveObligationBoundSynthesisContract/u)
+assert.match(fragment09, /bindSemanticContentToolSchemaToCapability/u)
+assert.match(fragment09, /bindSemanticObligationContract/u)
+assert.match(fragment09, /bindSourceSlotToolSchema/u)
+assert.match(fragment09, /validateSemanticObligationRequest/u)
+assert.match(fragment09, /sourceSlotRehydration\.request/u)
+assert.match(fragment09, /materializeSemanticAdditiveRequest/u)
+assert.match(fragment09, /repair_context_projection_status/u)
+assert.match(fragment09, /repair_context_projection_reason/u)
+assert.doesNotMatch(fragment09, /bindObligationBoundToolSchema/u)
 
 console.log(
   "PASS E2.8 obligation-bound synthesis: immutable required operations + content-only authority + compact constraints + causal repair telemetry",

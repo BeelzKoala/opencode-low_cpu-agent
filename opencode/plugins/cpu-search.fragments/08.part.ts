@@ -1714,16 +1714,34 @@
             additiveMutationCapability?.ready === true &&
             additiveMutationContext?.ok === true
 
+          const additiveCapabilityText =
+            additiveMutationReady
+              ? renderAdditiveMutationCapability(additiveMutationCapability)
+              : ""
+          const additiveSynthesisText =
+            additiveMutationReady
+              ? renderObligationBoundSynthesisContract(
+                  additiveMutationCapability,
+                  state.taskRequirements,
+                )
+              : ""
+          const additiveCapsuleProjection =
+            additiveMutationReady
+              ? projectObligationBoundMutationContext({
+                  capabilityText: additiveCapabilityText,
+                  synthesisText: additiveSynthesisText,
+                  contextText: additiveMutationContext.content,
+                })
+              : null
           const additiveCapsuleContent =
             additiveMutationReady
-              ? [
-                  renderAdditiveMutationCapability(additiveMutationCapability),
-                  renderObligationBoundSynthesisContract(
-                    additiveMutationCapability,
-                    state.taskRequirements,
-                  ),
-                  additiveMutationContext.content,
-                ].filter(Boolean).join("\n\n")
+              ? additiveCapsuleProjection?.ok === true
+                ? additiveCapsuleProjection.content
+                : [
+                    additiveCapabilityText,
+                    additiveSynthesisText,
+                    additiveMutationContext.content,
+                  ].filter(Boolean).join("\n\n")
               : null
 
           const baseActionContent =
@@ -1752,6 +1770,22 @@
               turn_model_calls: state?.modelCalls ?? null,
               turn_executed_searches: state?.executedSearches ?? null,
               turn_evidence_bytes: state?.evidenceBytes ?? null,
+              mutation_context_projection_protocol:
+                additiveCapsuleProjection?.protocol ?? null,
+              mutation_context_projection_reason:
+                additiveCapsuleProjection?.reason ?? null,
+              mutation_context_projection_source_bytes:
+                additiveCapsuleProjection?.source_bytes ?? null,
+              mutation_context_projection_projected_bytes:
+                additiveCapsuleProjection?.projected_bytes ?? null,
+              mutation_context_projection_reduction_bytes:
+                additiveCapsuleProjection?.reduction_bytes ?? null,
+              mutation_context_projection_sections:
+                additiveCapsuleProjection?.projected_sections ?? null,
+              mutation_context_projection_anchor_radius:
+                additiveCapsuleProjection?.anchor_radius ?? null,
+              mutation_context_projection_sha256:
+                additiveCapsuleProjection?.projection_sha256 ?? null,
               representation,
               source_representation: sourceRepresentation,
               requested_glob: requestedGlob ?? null,

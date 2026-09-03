@@ -2768,7 +2768,7 @@ function canonicalMutationFile(root, value) {
   return normalizeMutationFile(rel)
 }
 
-async function readAuthorizedEditCapsule(root, state) {
+async function readEditCapsuleEnvelope(root, state) {
   const rel = state?.editCapsulePath
 
   if (
@@ -2848,13 +2848,46 @@ async function readAuthorizedEditCapsule(root, state) {
     }
   }
 
+  // Common content-addressed capsule envelope.
+  //
+  // This proves only that the persisted execution context is the exact
+  // capsule produced by Scout and has the expected representation.
+  // Operation-specific mutation authority is checked separately.
   if (
     capsule?.protocol !== EDIT_CAPSULE_PROTOCOL ||
     capsule?.render_contract !== EDIT_CAPSULE_RENDER_CONTRACT ||
+    !Array.isArray(capsule?.scopes)
+  ) {
+    return {
+      ok: false,
+      reason: "edit_capsule_envelope_invalid",
+    }
+  }
+
+  return {
+    ok: true,
+    capsule,
+  }
+}
+
+async function readAuthorizedEditCapsule(root, state) {
+  const loaded =
+    await readEditCapsuleEnvelope(root, state)
+
+  if (!loaded.ok) {
+    return loaded
+  }
+
+  const capsule = loaded.capsule
+
+  // Generic bounded replace-node authority contract.
+  //
+  // Keep this strict: rename_symbol and other first-class capability
+  // paths must not weaken replace-node scope/candidate confinement.
+  if (
     capsule?.mutation_ready !== true ||
     capsule?.mutation_scope_complete !== true ||
-    capsule?.mutation_capable_scopes !== 1 ||
-    !Array.isArray(capsule?.scopes)
+    capsule?.mutation_capable_scopes !== 1
   ) {
     return {
       ok: false,

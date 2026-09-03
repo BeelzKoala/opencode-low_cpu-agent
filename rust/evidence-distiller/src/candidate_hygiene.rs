@@ -421,11 +421,9 @@ mod tests {
         assert!(git(&["commit", "--allow-empty", "-qm", "baseline"]));
         std::fs::write(candidate_root.join("new.html"), b"<html>ok</html>\n").unwrap();
         assert!(git(&["add", "-N", "--", "new.html"]));
-        let report = audit_candidate_hygiene(
-            &baseline_root,
-            &candidate_root,
-            &["new.html".to_string()],
-        ).unwrap();
+        let report =
+            audit_candidate_hygiene(&baseline_root, &candidate_root, &["new.html".to_string()])
+                .unwrap();
         assert!(report.ok, "{report:?}");
         let _ = std::fs::remove_dir_all(parent);
     }
